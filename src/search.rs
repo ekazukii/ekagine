@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, thread};
 use std::time::{Duration, Instant};
-use chess::{Board, BoardStatus, ChessMove, Color, MoveGen};
+use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
 use crate::{board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN};
 use crate::eval::eval_board;
 
@@ -19,6 +19,38 @@ enum SearchScore {
     CANCELLED,
     //MATE(u8),
     EVAL(i32)
+}
+
+// ----------------------------------------------------------------------------
+// Mate distance scoring helpers
+// ----------------------------------------------------------------------------
+// A large value to represent mate; must be >> any centipawn eval
+pub const MATE_VALUE: i32 = 1_000_000;
+// Threshold to detect mate-encoded scores
+pub const MATE_THRESHOLD: i32 = 999_000;
+
+#[inline]
+fn is_mate_score(score: i32) -> bool { score.abs() >= MATE_THRESHOLD }
+
+#[inline]
+fn mate_in_plies(ply: i32) -> i32 { MATE_VALUE - ply }
+
+#[inline]
+fn mated_in_plies(ply: i32) -> i32 { -MATE_VALUE + ply }
+
+/// Format a score for UCI output ("cp X" or "mate N").
+/// `side` is the side to move in the root position.
+pub fn uci_score_string(score: i32, side: Color) -> String {
+    let color = if side == Color::White { 1 } else { -1 };
+    if is_mate_score(score) {
+        let ply_to_mate = MATE_VALUE - score.abs();
+        // Convert plies to moves (ceil(ply/2))
+        let moves = (ply_to_mate + 1) / 2;
+        let signed_moves = if score * color > 0 { moves } else { -moves };
+        format!("mate {}", signed_moves)
+    } else {
+        format!("cp {}", score * color)
+    }
 }
 
 #[inline(always)]
@@ -37,9 +69,10 @@ fn quiesce_negamax_it(
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
     color: i32, // +1 if White to move in this node, −1 otherwise
+    ply_from_root: i32,
 ) -> i32 {
     match board.status() {
-        BoardStatus::Checkmate => return NEG_INFINITY,
+        BoardStatus::Checkmate => return mated_in_plies(ply_from_root),
         BoardStatus::Stalemate => return 0,
         BoardStatus::Ongoing => {}
     }
@@ -53,7 +86,7 @@ fn quiesce_negamax_it(
     if stand_pat > alpha { alpha = stand_pat; }
 
     for mv in sort_moves(board) {
-        if board.piece_on(mv.get_dest()).is_none() { continue; }
+        if board.piece_on(mv.get_dest()).is_none() && !is_en_passant_capture(board, mv) { continue; }
         let new_board = board_do_move(board, mv, repetition_table);
         let score = -quiesce_negamax_it(
             &new_board,
@@ -63,6 +96,7 @@ fn quiesce_negamax_it(
             transpo_table,
             repetition_table,
             -color,
+            ply_from_root + 1,
         );
         board_pop(&new_board, repetition_table);
 
@@ -123,6 +157,19 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     [ 0,  0,  0,  0,  0,  0],
 ];
 
+#[inline]
+fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
+    // En passant is a pawn move to the ep square capturing a pawn that isn't on dest.
+    // chess::Board exposes the en-passant target square via `en_passant()` in recent versions.
+    // We conservatively detect: moving piece is a pawn, destination equals ep square.
+    if let Some(Piece::Pawn) = board.piece_on(mv.get_source()) {
+        if let Some(ep_sq) = board.en_passant() {
+            return mv.get_dest() == ep_sq;
+        }
+    }
+    false
+}
+
 fn sort_moves(board: &Board) -> Vec<ChessMove> {
     let mut scored_moves: Vec<(ChessMove, u8)> = Vec::new();
 
@@ -136,9 +183,7 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
             } else {
                 0
             }
-        } else {
-            0
-        };
+        } else if is_en_passant_capture(board, mv) { 25 } else { 0 };
 
         let board_after = board.make_move_new(mv);
 
@@ -170,18 +215,18 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
 //   • Copies the usual MVV‑LVA ordering from `sort_moves`.
 //   • Promote the principal variation
 // ---------------------------------------------------------------------------
-fn ordered_moves(board: &Board, pv_table: &PVTable, depth: usize) -> Vec<ChessMove> {
+fn ordered_moves(board: &Board, pv_table: &PVTable, _depth: usize) -> Vec<ChessMove> {
     let mut moves = sort_moves(board);
-    let mut ordered: Vec<ChessMove> = Vec::with_capacity(moves.len());
-
-    // First, add PV move if any
-    if let Some(pvs) = pv_table.get(&board.get_hash()) {
-        ordered.push(pvs.clone());
+    if let Some(pv_mv) = pv_table.get(&board.get_hash()) {
+        if let Some(pos) = moves.iter().position(|m| m == pv_mv) {
+            let pv = moves.remove(pos);
+            let mut ordered = Vec::with_capacity(moves.len() + 1);
+            ordered.push(pv);
+            ordered.extend(moves);
+            return ordered;
+        }
     }
-
-    // Add remaining moves
-    ordered.extend(moves);
-    ordered
+    moves
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +243,7 @@ fn negamax_it(
     pv_table: &mut PVTable,
     color: i32,
     stop: &StopFlag,
+    ply_from_root: i32,
 ) -> SearchScore {
     if should_stop(stop) {
         let mut out = io::stdout();
@@ -209,7 +255,7 @@ fn negamax_it(
     if is_in_threefold_scenario(&board, repetition_table) { return SearchScore::EVAL(0); }
 
     match board.status() {
-        BoardStatus::Checkmate => return SearchScore::EVAL(NEG_INFINITY),
+        BoardStatus::Checkmate => return SearchScore::EVAL(mated_in_plies(ply_from_root)),
         BoardStatus::Stalemate => return SearchScore::EVAL(0),
         BoardStatus::Ongoing => {}
     }
@@ -224,6 +270,7 @@ fn negamax_it(
             transpo_table,
             repetition_table,
             color,
+            ply_from_root,
         ));
     }
 
@@ -242,9 +289,12 @@ fn negamax_it(
             repetition_table,
             pv_table,
             -color,
-            stop
+            stop,
+            ply_from_root + 1,
         ) {
             SearchScore::CANCELLED => {
+                // Ensure we revert repetition count when aborting
+                board_pop(&new_board, repetition_table);
                 return SearchScore::CANCELLED
             },
             SearchScore::EVAL(v) => {
@@ -322,9 +372,12 @@ fn root_search(
             repetition_table,
             pv_table,
             -color,
-            stop
+            stop,
+            1, // one ply from root after making mv
         ) {
             SearchScore::CANCELLED => {
+                // Ensure we revert repetition count when aborting
+                board_pop(&new_board, repetition_table);
                 break;
             },
             SearchScore::EVAL(v) => {
@@ -419,7 +472,6 @@ pub fn best_move_interruptible(
     let mut transpo_table = TranspositionTable::new();
     let mut pv_table = PVTable::default();
 
-    let color = if board.side_to_move() == Color::White { 1 } else { -1 };
     let t0 = Instant::now();
     let mut depth = 1;
     let mut best_move = None;
@@ -456,11 +508,7 @@ pub fn best_move_interruptible(
             let pv_txt_opt = pv_table.get(&board.get_hash());
 
             if let Some(pv_txt) = pv_txt_opt {
-                let score_str = if best_score.abs() >= 100_000 {
-                    format!("mate {}", if best_score > 0 { 0 } else { -0 })
-                } else {
-                    format!("cp {}", best_score * color)
-                };
+                let score_str = uci_score_string(best_score, board.side_to_move());
 
                 let info_line = format!(
                     "info depth {} score {} nodes {} nps {} time {} pv {}",
@@ -477,4 +525,3 @@ pub fn best_move_interruptible(
 
     (best_move, best_score)
 }
-

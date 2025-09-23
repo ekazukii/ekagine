@@ -19,7 +19,7 @@ use serde::Deserialize;
 use std::fs::{File, OpenOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::search::{best_move_interruptible, best_move_using_iterative_deepening};
+use crate::search::{best_move_interruptible, best_move_using_iterative_deepening, uci_score_string};
 
 static EVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CACHE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -456,7 +456,11 @@ fn main() {
                 .unwrap_or(6);
 
             match compute_best_from_fen(fen, max_depth) {
-                Ok((Some(mv), score)) => println!("bestmove {} (score={})", mv, score),
+                Ok((Some(mv), score)) => {
+                    let board_disp = Board::from_str(fen).unwrap();
+                    let score_str = uci_score_string(score, board_disp.side_to_move());
+                    println!("bestmove {} (score {})", mv, score_str)
+                },
                 Ok((None, _)) => println!("No legal move available"),
                 Err(msg) => {
                     eprintln!("Error: {}", msg);
