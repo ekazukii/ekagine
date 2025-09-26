@@ -1,4 +1,5 @@
 use std::collections::{HashMap, hash_map::Entry};
+use std::str::FromStr;
 use std::io::Stdout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,6 +166,26 @@ fn cache_eval(
     val
 }
 
+#[inline]
+fn has_non_pawn_material(board: &Board, side: Color) -> bool {
+    let bb = board.color_combined(side);
+    let non_pawns = (*board.pieces(Piece::Knight)
+        | *board.pieces(Piece::Bishop)
+        | *board.pieces(Piece::Rook)
+        | *board.pieces(Piece::Queen)) & bb;
+    non_pawns.popcnt() > 0
+}
+
+/// Create a new board representing a null move using Board::null_move(),
+/// then update the repetition table for that new position.
+fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> Option<Board> {
+    // Use the chess crate's built-in null move generator
+    let new_board = board.null_move()?;
+    let zob = new_board.get_hash();
+    *repetition_table.entry(zob).or_insert(0) += 1;
+    Some(new_board)
+}
+
 const CHECK_BONUS: u8 = 60;
 const CHECKMATE_BONUS: u8 = 100;
 const MVV_LVA_TABLE: [[u8; 6]; 6] = [
@@ -298,8 +319,8 @@ fn negamax_it(
         BoardStatus::Ongoing => {}
     }
 
-    // Start quiesce search to not eval when still having hanging pieces
-    if depth == max_depth {
+    // Start quiesce search if we reached or exceeded the depth limit
+    if depth >= max_depth {
         return SearchScore::EVAL(quiesce_negamax_it(
             &board,
             alpha,
@@ -313,7 +334,7 @@ fn negamax_it(
     }
 
     // Probe TT for cutoff
-    let rem_depth: i16 = (max_depth - depth) as i16;
+    let rem_depth: i16 = max_depth.saturating_sub(depth) as i16;
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.get(&zob) {
         // Only keep if entry depth is same or higher to avoid pruning from not fully search position
@@ -323,6 +344,41 @@ fn negamax_it(
                 TTFlag::Exact => return SearchScore::EVAL(tt_score),
                 TTFlag::Lower => if tt_score >= beta { return SearchScore::EVAL(tt_score) },
                 TTFlag::Upper => if tt_score <= alpha { return SearchScore::EVAL(tt_score) },
+            }
+        }
+    }
+
+    // Null-move pruning: if not in check and enough depth, try a null move with reduction.
+    // Guard against zugzwang: require some non-pawn material for the side to move.
+    let in_check = board.checkers().popcnt() > 0;
+    if !in_check && rem_depth >= 2 && has_non_pawn_material(&board, board.side_to_move()) {
+        let r = if rem_depth >= 6 { 3 } else { 2 } as usize;
+        if let Some(nboard) = board_do_null_move(&board, repetition_table) {
+            // null-window search (fail-high test)
+            match negamax_it(
+                nboard,
+                depth + 1 + r,
+                max_depth,
+                -beta,
+                -beta + 1,
+                transpo_table,
+                repetition_table,
+                pv_table,
+                -color,
+                stop,
+                ply_from_root + 1,
+            ) {
+                SearchScore::CANCELLED => {
+                    board_pop(&nboard, repetition_table);
+                    return SearchScore::CANCELLED;
+                }
+                SearchScore::EVAL(v) => {
+                    let value = -v;
+                    board_pop(&nboard, repetition_table);
+                    if value >= beta {
+                        return SearchScore::EVAL(value);
+                    }
+                }
             }
         }
     }

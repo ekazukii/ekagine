@@ -174,7 +174,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekaginev0.9");
+                send_message(&mut stdout, "id name Ekagine-v1.10");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }
