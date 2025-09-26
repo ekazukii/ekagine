@@ -388,43 +388,108 @@ fn negamax_it(
     let alpha_orig = alpha;
 
     // Start the main search
+    let mut move_idx: usize = 0;
     for mv in ordered_moves(&board, pv_table, transpo_table, depth) {
         let new_board = board_do_move(&board, mv, repetition_table);
-        match negamax_it(
-            new_board,
-            depth + 1,
-            max_depth,
-            -beta,
-            -alpha,
-            transpo_table,
-            repetition_table,
-            pv_table,
-            -color,
-            stop,
-            ply_from_root + 1,
-        ) {
-            SearchScore::CANCELLED => {
-                // Revert repetition count when aborting
-                board_pop(&new_board, repetition_table);
-                return SearchScore::CANCELLED
-            },
-            SearchScore::EVAL(v) => {
-                let value = -v;
 
-                // Revert repetition to not compute threefolds repetition over move that have not
-                // by played in the current search
-                board_pop(&new_board, repetition_table);
+        // Determine properties for LMR conditions
+        let is_capture = board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(&board, mv);
+        let gives_check = new_board.checkers().popcnt() > 0;
+        let is_pv_move = move_idx == 0; // treat first move as PV
 
-                if value > best_value {
-                    best_value = value;
-                    best_move_opt = Some(mv);
+        let mut value: i32;
+
+        // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
+        let apply_lmr = rem_depth >= 3 && move_idx >= 3 && !is_pv_move && !is_capture && !gives_check;
+        if apply_lmr {
+            let r = if rem_depth >= 6 { 2 } else { 1 } as usize;
+            // Reduced-depth null-window search first
+            match negamax_it(
+                new_board,
+                depth + 1 + r,
+                max_depth,
+                -beta,
+                -alpha,
+                transpo_table,
+                repetition_table,
+                pv_table,
+                -color,
+                stop,
+                ply_from_root + 1,
+            ) {
+                SearchScore::CANCELLED => {
+                    board_pop(&new_board, repetition_table);
+                    return SearchScore::CANCELLED
                 }
-                if value > alpha { alpha = value; }
-                if alpha >= beta {
-                    break;
+                SearchScore::EVAL(vr) => {
+                    let mut vred = -vr;
+                    // If reduced search raises alpha, re-search at full depth
+                    if vred > alpha {
+                        match negamax_it(
+                            new_board,
+                            depth + 1,
+                            max_depth,
+                            -beta,
+                            -alpha,
+                            transpo_table,
+                            repetition_table,
+                            pv_table,
+                            -color,
+                            stop,
+                            ply_from_root + 1,
+                        ) {
+                            SearchScore::CANCELLED => {
+                                board_pop(&new_board, repetition_table);
+                                return SearchScore::CANCELLED
+                            }
+                            SearchScore::EVAL(vf) => {
+                                value = -vf;
+                            }
+                        }
+                    } else {
+                        value = vred;
+                    }
+                }
+            }
+        } else {
+            // Normal full-depth search
+            match negamax_it(
+                new_board,
+                depth + 1,
+                max_depth,
+                -beta,
+                -alpha,
+                transpo_table,
+                repetition_table,
+                pv_table,
+                -color,
+                stop,
+                ply_from_root + 1,
+            ) {
+                SearchScore::CANCELLED => {
+                    board_pop(&new_board, repetition_table);
+                    return SearchScore::CANCELLED
+                }
+                SearchScore::EVAL(v) => {
+                    value = -v;
                 }
             }
         }
+
+        // Done exploring this move — revert repetition
+        board_pop(&new_board, repetition_table);
+
+        // Update best / alpha-beta
+        if value > best_value {
+            best_value = value;
+            best_move_opt = Some(mv);
+        }
+        if value > alpha { alpha = value; }
+        if alpha >= beta {
+            break;
+        }
+
+        move_idx += 1;
     }
 
 
