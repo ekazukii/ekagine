@@ -36,7 +36,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Search Tables keyed by the built‐in Zobrist hash (u64).
 // ─────────────────────────────────────────────────────────────────────────────
 
-type TranspositionTable = HashMap<u64, i32>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TTFlag { Exact, Lower, Upper }
+
+#[derive(Clone, Debug)]
+pub struct TTEntry {
+    pub depth: i16,                 // remaining depth at store time
+    pub score: i32,                 // score (mate scores are ply-adjusted)
+    pub flag: TTFlag,               // Exact / Lower / Upper bound
+    pub best_move: Option<ChessMove>, // best move from this node
+    pub eval: Option<i32>,          // cached static eval (for stand-pat)
+}
+
+type TranspositionTable = HashMap<u64, TTEntry>;
 type RepetitionTable    = HashMap<u64, usize>;
 type PVTable = HashMap<u64, ChessMove>;
 
@@ -210,7 +222,7 @@ fn uci_loop() {
 
                 let max_ply = 100;
                 let (best_mv, _best_score) =
-                    best_move_interruptible(&board, time_budget, 99, repetition_table.clone(),  Some(&mut stdout));
+                    best_move_interruptible(&board, time_budget, 99, repetition_table.clone(), &mut transpo_table,  Some(&mut stdout));
                 if let Some(mv) = best_mv {
                     send_message(&mut stdout, format!("bestmove {}", mv).as_str());
                 } else {
@@ -347,9 +359,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         let (res, duration) = time_fn(|| {
             let mut repetition_table: RepetitionTable = HashMap::new();
             let mut transpo_table: TranspositionTable = HashMap::new();
-            let mut pv_table: PVTable = HashMap::new();
-            //root_search(key, max_depth, &mut transpo_table, &mut repetition_table, &mut pv_table, &stop)
-            best_move_interruptible(key, Duration::from_millis(100), 1000, RepetitionTable::new(), None)
+            best_move_interruptible(key, Duration::from_millis(100), 1000, RepetitionTable::new(), &mut transpo_table, None)
         });
 
         times.push(duration);
@@ -405,7 +415,7 @@ pub fn compute_best_from_fen(
     let board = Board::from_str(fen)
         .map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
-    let mut transpo_table: HashMap<u64, i32> = HashMap::new();
+    let mut transpo_table: TranspositionTable = HashMap::new();
     let mut repetition_table: HashMap<u64, usize> = HashMap::new();
     repetition_table.insert(board.get_hash(), 1);
 

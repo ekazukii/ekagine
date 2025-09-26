@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::io::Stdout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, thread};
 use std::time::{Duration, Instant};
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
-use crate::{board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN};
+use crate::{board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TranspositionTable, TTEntry, TTFlag, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN};
 use crate::eval::eval_board;
 
 /* For reference
@@ -38,6 +38,21 @@ fn mate_in_plies(ply: i32) -> i32 { MATE_VALUE - ply }
 #[inline]
 fn mated_in_plies(ply: i32) -> i32 { -MATE_VALUE + ply }
 
+// Adjust mate scores when storing/loading from TT to remain comparable
+#[inline]
+fn tt_score_on_store(score: i32, ply_from_root: i32) -> i32 {
+    if is_mate_score(score) {
+        if score > 0 { score + ply_from_root } else { score - ply_from_root }
+    } else { score }
+}
+
+#[inline]
+fn tt_score_on_load(score: i32, ply_from_root: i32) -> i32 {
+    if is_mate_score(score) {
+        if score > 0 { score - ply_from_root } else { score + ply_from_root }
+    } else { score }
+}
+
 /// Format a score for UCI output ("cp X" or "mate N").
 /// `side` is the side to move in the root position.
 pub fn uci_score_string(score: i32, side: Color) -> String {
@@ -61,6 +76,9 @@ fn should_stop(flag: &StopFlag) -> bool {
 // ---------------------------------------------------------------------------
 // Quiescence search (captures‑only) — negamax style
 // ---------------------------------------------------------------------------
+/// Quiesce search, this function perform an negamax w/ alpha beta pruning but only analysing the
+/// capture and checks to deeper in the tree while still being a performant search. This search
+/// is meant to be run after the classic search to avoid evaluating when pieces are hanging
 fn quiesce_negamax_it(
     board: &Board,
     mut alpha: i32,
@@ -109,9 +127,9 @@ fn quiesce_negamax_it(
 
 
 /// Check if this position's hash has occurred more than once already.
-/// (i.e. `> 1` means third occurrence => threefold draw).
-///
-///
+/// For simplicity we'll make so that repeating once is the same as repeating twice.
+/// This should not impact the evaluation of engine since repeating a move once or twice ends up anyway
+/// in the same position
 fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
     let zob = board.get_hash();
     repetition_table.get(&zob).cloned().unwrap_or(0) > 1
@@ -119,8 +137,6 @@ fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
 /// If not found, compute via `eval_board`, insert into the table, and return.
-///
-///
 fn cache_eval(
     board: &Board,
     transpo_table: &mut TranspositionTable,
@@ -130,14 +146,23 @@ fn cache_eval(
         return 0;
     }
     let zob = board.get_hash();
-    if let Some(&cached) = transpo_table.get(&zob) {
-        CACHE_COUNT.fetch_add(1, Ordering::Relaxed);
-        cached
-    } else {
-        let val = eval_board(board);
-        transpo_table.insert(zob, val);
-        val
+    if let Some(entry) = transpo_table.get(&zob) {
+        if let Some(cached) = entry.eval {
+            CACHE_COUNT.fetch_add(1, Ordering::Relaxed);
+            return cached;
+        }
     }
+    let val = eval_board(board);
+    match transpo_table.entry(zob) {
+        Entry::Occupied(mut occ) => {
+            let e = occ.get_mut();
+            if e.eval.is_none() { e.eval = Some(val); }
+        }
+        Entry::Vacant(v) => {
+            v.insert(TTEntry { depth: -1, score: 0, flag: TTFlag::Exact, best_move: None, eval: Some(val) });
+        }
+    }
+    val
 }
 
 const CHECK_BONUS: u8 = 60;
@@ -170,6 +195,10 @@ fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
     false
 }
 
+/// This functions orders the move over multiple criteria so that the best probable moves are ordered
+/// on top of the search list.
+/// This function is meant to be the base sorter used by the quiesce search and the base of the ordering
+/// for the "classic search"
 fn sort_moves(board: &Board) -> Vec<ChessMove> {
     let mut scored_moves: Vec<(ChessMove, u8)> = Vec::new();
 
@@ -210,28 +239,36 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
 }
 
 
-// ---------------------------------------------------------------------------
-// Move‑ordering helper:
-//   • Copies the usual MVV‑LVA ordering from `sort_moves`.
-//   • Promote the principal variation
-// ---------------------------------------------------------------------------
-fn ordered_moves(board: &Board, pv_table: &PVTable, _depth: usize) -> Vec<ChessMove> {
+/// This functions orders to move based on the first sort of `sort_moves` but adds specific order
+/// criteria for the non-quiesce search.
+/// Such as taking moves from the transposition table and principal variation
+fn ordered_moves(board: &Board, pv_table: &PVTable, tt: &TranspositionTable, _depth: usize) -> Vec<ChessMove> {
     let mut moves = sort_moves(board);
-    if let Some(pv_mv) = pv_table.get(&board.get_hash()) {
-        if let Some(pos) = moves.iter().position(|m| m == pv_mv) {
-            let pv = moves.remove(pos);
-            let mut ordered = Vec::with_capacity(moves.len() + 1);
-            ordered.push(pv);
-            ordered.extend(moves);
-            return ordered;
+
+    let zob = board.get_hash();
+    // Promote TT move first if present
+    if let Some(tt_mv) = tt.get(&zob).and_then(|e| e.best_move.as_ref().cloned()) {
+        if let Some(pos) = moves.iter().position(|m| *m == tt_mv) {
+            let mv = moves.remove(pos);
+            moves.insert(0, mv);
         }
     }
+    // Then promote PV move (if different from TT move)
+    if let Some(pv_mv) = pv_table.get(&zob) {
+        if let Some(pos) = moves.iter().position(|m| m == pv_mv) {
+            let mv = moves.remove(pos);
+            moves.insert(0, mv);
+        }
+    }
+
     moves
 }
 
 // ---------------------------------------------------------------------------
 // Core Negamax with α/β pruning + PV maintenance — renamed `negamax_it`.
 // ---------------------------------------------------------------------------
+/// This is the core of the move search, it perform a negamax styled search with alpha/beta pruning
+/// Usage of quiesce search at end of search and tt/pv cutoff
 fn negamax_it(
     board: Board,
     depth: usize,
@@ -245,6 +282,7 @@ fn negamax_it(
     stop: &StopFlag,
     ply_from_root: i32,
 ) -> SearchScore {
+    // If time budget expired
     if should_stop(stop) {
         let mut out = io::stdout();
         let info_line = format!("info string break stop");
@@ -252,15 +290,15 @@ fn negamax_it(
         return SearchScore::CANCELLED;
     }
 
+    // If game is over
     if is_in_threefold_scenario(&board, repetition_table) { return SearchScore::EVAL(0); }
-
     match board.status() {
         BoardStatus::Checkmate => return SearchScore::EVAL(mated_in_plies(ply_from_root)),
         BoardStatus::Stalemate => return SearchScore::EVAL(0),
         BoardStatus::Ongoing => {}
     }
 
-    // Leaf depth → quiescence
+    // Start quiesce search to not eval when still having hanging pieces
     if depth == max_depth {
         return SearchScore::EVAL(quiesce_negamax_it(
             &board,
@@ -274,10 +312,27 @@ fn negamax_it(
         ));
     }
 
+    // Probe TT for cutoff
+    let rem_depth: i16 = (max_depth - depth) as i16;
+    let zob = board.get_hash();
+    if let Some(entry) = transpo_table.get(&zob) {
+        // Only keep if entry depth is same or higher to avoid pruning from not fully search position
+        if entry.depth >= rem_depth {
+            let tt_score = tt_score_on_load(entry.score, ply_from_root);
+            match entry.flag {
+                TTFlag::Exact => return SearchScore::EVAL(tt_score),
+                TTFlag::Lower => if tt_score >= beta { return SearchScore::EVAL(tt_score) },
+                TTFlag::Upper => if tt_score <= alpha { return SearchScore::EVAL(tt_score) },
+            }
+        }
+    }
+
     let mut best_value = NEG_INFINITY;
     let mut best_move_opt: Option<ChessMove> = None;
+    let alpha_orig = alpha;
 
-    for mv in ordered_moves(&board, pv_table, depth) {
+    // Start the main search
+    for mv in ordered_moves(&board, pv_table, transpo_table, depth) {
         let new_board = board_do_move(&board, mv, repetition_table);
         match negamax_it(
             new_board,
@@ -293,13 +348,15 @@ fn negamax_it(
             ply_from_root + 1,
         ) {
             SearchScore::CANCELLED => {
-                // Ensure we revert repetition count when aborting
+                // Revert repetition count when aborting
                 board_pop(&new_board, repetition_table);
                 return SearchScore::CANCELLED
             },
             SearchScore::EVAL(v) => {
                 let value = -v;
 
+                // Revert repetition to not compute threefolds repetition over move that have not
+                // by played in the current search
                 board_pop(&new_board, repetition_table);
 
                 if value > best_value {
@@ -321,12 +378,17 @@ fn negamax_it(
         return SearchScore::CANCELLED;
     }
 
+    // If it would have cause an alpha beta pruning store the information in the TT table
+    let bound = if best_value <= alpha_orig { TTFlag::Upper } else if best_value >= beta { TTFlag::Lower } else { TTFlag::Exact };
+    let stored = tt_score_on_store(best_value, ply_from_root);
+    let prev_eval = transpo_table.get(&zob).and_then(|e| e.eval);
+    transpo_table.insert(zob, TTEntry { depth: rem_depth, score: stored, flag: bound, best_move: best_move_opt, eval: prev_eval });
+
     SearchScore::EVAL(best_value)
 }
 
-// ---------------------------------------------------------------------------
-// Depth‑limited root search (uses `negamax_it`)
-// ---------------------------------------------------------------------------
+/// This function must be called at the beginning of a search, it is a wrapper over negamax_it that
+/// handle the printing the PV to the UCI at each depth.
 fn root_search(
     board: &Board,
     max_depth: usize,
@@ -343,7 +405,7 @@ fn root_search(
 
     let mut out = io::stdout();
 
-    for mv in ordered_moves(board, pv_table, 0) {
+    for mv in ordered_moves(board, pv_table, transpo_table, 0) {
         if should_stop(stop) { break; }
 
         if best_move.is_some() {
@@ -409,9 +471,7 @@ fn root_search(
     (best_move, best_value)
 }
 
-// ---------------------------------------------------------------------------
-// Public interface: iterative deepening — renamed `best_move_using_iterative_deepening`.
-// ---------------------------------------------------------------------------
+/// Compute the best move of a board from a depth limit
 #[allow(clippy::too_many_arguments)]
 pub fn best_move_using_iterative_deepening(
     board: &Board,
@@ -458,6 +518,7 @@ pub fn best_move_interruptible(
     time_budget: Duration,
     max_depth_cap: usize,
     mut repetition_table: RepetitionTable,
+    transpo_table: &mut TranspositionTable,
     mut stdout_opt: Option<&mut Stdout>,
 ) -> (Option<ChessMove>, i32) {
     let stop = Arc::new(AtomicBool::new(false));
@@ -469,7 +530,6 @@ pub fn best_move_interruptible(
         });
     }
 
-    let mut transpo_table = TranspositionTable::new();
     let mut pv_table = PVTable::default();
 
     let t0 = Instant::now();
@@ -484,7 +544,7 @@ pub fn best_move_interruptible(
         let (bm, score) = root_search(
             board,
             depth,
-            &mut transpo_table,
+            transpo_table,
             &mut repetition_table,
             &mut pv_table,
             &stop,

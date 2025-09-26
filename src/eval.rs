@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, Piece, Square};
 use chess::Color::{Black, White};
-use crate::{TranspositionTable, EVAL_COUNT, NEG_INFINITY, POS_INFINITY};
+use crate::{EVAL_COUNT, NEG_INFINITY, POS_INFINITY};
 
 
 /// Evaluate a set of bitboard squares using a piece‐square table + base value.
@@ -154,7 +154,9 @@ const BISHOP_PAIR_VAL: i32 = 30;
 const STARTING_MATERIALS: i32 = (PAWN_BASE_VAL * 8 + KNIGHT_BASE_VAL * 2 + BISHOP_BASE_VAL * 2 + ROOK_BASE_VAL * 2 + QUEEN_BASE_VAL) * 2;
 
 
-
+/// This function compute a percentage of progress of the current game based on the remaining
+/// pieces in the board, the progress is weighted so that if more important pieces are missing
+/// it advance more into the game
 fn endgame_progress(board: &Board) -> i32 {
     let white_pawns = (*board.pieces(Piece::Pawn) & board.color_combined(Color::White)).into_iter().count() as i32;
     let white_knights = (*board.pieces(Piece::Knight) & board.color_combined(Color::White)).into_iter().count() as i32;
@@ -299,8 +301,10 @@ pub fn eval_board(board: &Board) -> i32 {
 
             let prog = endgame_progress(board);
 
+            // The evaluation of the kings is different since we want to weight the change the evaluation
+            // based on the progress of the game, the more advance in the game the less the king safety is important
+            // and the more we need the king advanced on the board
             for sq in white_king {
-                // Mapping weightet on endgame_progress
                 let idx = sq.to_index();
                 let start_val = KING_START_VALUE_MAPPING_WHITE[idx];
                 let end_val = KING_END_VALUE_MAPPING_WHITE[idx];
