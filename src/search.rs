@@ -1,13 +1,17 @@
-use std::collections::{HashMap, hash_map::Entry};
-use std::str::FromStr;
-use std::io::Stdout;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{io, thread};
-use std::time::{Duration, Instant};
-use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
-use crate::{board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TranspositionTable, TTEntry, TTFlag, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN};
 use crate::eval::eval_board;
+use crate::{
+    board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTEntry, TTFlag,
+    TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY,
+    QUIESCE_REMAIN,
+};
+use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
+use std::collections::{hash_map::Entry, HashMap};
+use std::io::Stdout;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{io, thread};
 
 /* For reference
 type TranspositionTable = HashMap<u64, i32>;
@@ -15,11 +19,10 @@ type RepetitionTable    = HashMap<u64, usize>;
 type PVTable = HashMap<u64, ChessMove>;
  */
 
-
 enum SearchScore {
     CANCELLED,
     //MATE(u8),
-    EVAL(i32)
+    EVAL(i32),
 }
 
 // ----------------------------------------------------------------------------
@@ -31,27 +34,45 @@ pub const MATE_VALUE: i32 = 1_000_000;
 pub const MATE_THRESHOLD: i32 = 999_000;
 
 #[inline]
-fn is_mate_score(score: i32) -> bool { score.abs() >= MATE_THRESHOLD }
+fn is_mate_score(score: i32) -> bool {
+    score.abs() >= MATE_THRESHOLD
+}
 
 #[inline]
-fn mate_in_plies(ply: i32) -> i32 { MATE_VALUE - ply }
+fn mate_in_plies(ply: i32) -> i32 {
+    MATE_VALUE - ply
+}
 
 #[inline]
-fn mated_in_plies(ply: i32) -> i32 { -MATE_VALUE + ply }
+fn mated_in_plies(ply: i32) -> i32 {
+    -MATE_VALUE + ply
+}
 
 // Adjust mate scores when storing/loading from TT to remain comparable
 #[inline]
 fn tt_score_on_store(score: i32, ply_from_root: i32) -> i32 {
     if is_mate_score(score) {
-        if score > 0 { score + ply_from_root } else { score - ply_from_root }
-    } else { score }
+        if score > 0 {
+            score + ply_from_root
+        } else {
+            score - ply_from_root
+        }
+    } else {
+        score
+    }
 }
 
 #[inline]
 fn tt_score_on_load(score: i32, ply_from_root: i32) -> i32 {
     if is_mate_score(score) {
-        if score > 0 { score - ply_from_root } else { score + ply_from_root }
-    } else { score }
+        if score > 0 {
+            score - ply_from_root
+        } else {
+            score + ply_from_root
+        }
+    } else {
+        score
+    }
 }
 
 /// Format a score for UCI output ("cp X" or "mate N").
@@ -101,11 +122,17 @@ fn quiesce_negamax_it(
     }
 
     let stand_pat = color * cache_eval(board, transpo_table, repetition_table);
-    if stand_pat >= beta { return stand_pat; }
-    if stand_pat > alpha { alpha = stand_pat; }
+    if stand_pat >= beta {
+        return stand_pat;
+    }
+    if stand_pat > alpha {
+        alpha = stand_pat;
+    }
 
     for mv in sort_moves(board) {
-        if board.piece_on(mv.get_dest()).is_none() && !is_en_passant_capture(board, mv) { continue; }
+        if board.piece_on(mv.get_dest()).is_none() && !is_en_passant_capture(board, mv) {
+            continue;
+        }
         let new_board = board_do_move(board, mv, repetition_table);
         let score = -quiesce_negamax_it(
             &new_board,
@@ -119,13 +146,16 @@ fn quiesce_negamax_it(
         );
         board_pop(&new_board, repetition_table);
 
-        if score >= beta { return score; }
-        if score > alpha { alpha = score; }
+        if score >= beta {
+            return score;
+        }
+        if score > alpha {
+            alpha = score;
+        }
     }
 
     alpha
 }
-
 
 /// Check if this position's hash has occurred more than once already.
 /// For simplicity we'll make so that repeating once is the same as repeating twice.
@@ -157,10 +187,18 @@ fn cache_eval(
     match transpo_table.entry(zob) {
         Entry::Occupied(mut occ) => {
             let e = occ.get_mut();
-            if e.eval.is_none() { e.eval = Some(val); }
+            if e.eval.is_none() {
+                e.eval = Some(val);
+            }
         }
         Entry::Vacant(v) => {
-            v.insert(TTEntry { depth: -1, score: 0, flag: TTFlag::Exact, best_move: None, eval: Some(val) });
+            v.insert(TTEntry {
+                depth: -1,
+                score: 0,
+                flag: TTFlag::Exact,
+                best_move: None,
+                eval: Some(val),
+            });
         }
     }
     val
@@ -172,7 +210,8 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
     let non_pawns = (*board.pieces(Piece::Knight)
         | *board.pieces(Piece::Bishop)
         | *board.pieces(Piece::Rook)
-        | *board.pieces(Piece::Queen)) & bb;
+        | *board.pieces(Piece::Queen))
+        & bb;
     non_pawns.popcnt() > 0
 }
 
@@ -200,7 +239,7 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     // Victim = Queen
     [55, 54, 53, 52, 51, 50],
     // Victim = King (we never actually capture kings in legal move generation)
-    [ 0,  0,  0,  0,  0,  0],
+    [0, 0, 0, 0, 0, 0],
 ];
 
 #[inline]
@@ -233,7 +272,11 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
             } else {
                 0
             }
-        } else if is_en_passant_capture(board, mv) { 25 } else { 0 };
+        } else if is_en_passant_capture(board, mv) {
+            25
+        } else {
+            0
+        };
 
         let board_after = board.make_move_new(mv);
 
@@ -249,7 +292,6 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
             0
         };
 
-
         scored_moves.push((mv, score + check_bonus));
 
         //scored_moves.push((mv, score));
@@ -259,11 +301,15 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
 
-
 /// This functions orders to move based on the first sort of `sort_moves` but adds specific order
 /// criteria for the non-quiesce search.
 /// Such as taking moves from the transposition table and principal variation
-fn ordered_moves(board: &Board, pv_table: &PVTable, tt: &TranspositionTable, _depth: usize) -> Vec<ChessMove> {
+fn ordered_moves(
+    board: &Board,
+    pv_table: &PVTable,
+    tt: &TranspositionTable,
+    _depth: usize,
+) -> Vec<ChessMove> {
     let mut moves = sort_moves(board);
 
     let zob = board.get_hash();
@@ -312,7 +358,9 @@ fn negamax_it(
     }
 
     // If game is over
-    if is_in_threefold_scenario(&board, repetition_table) { return SearchScore::EVAL(0); }
+    if is_in_threefold_scenario(&board, repetition_table) {
+        return SearchScore::EVAL(0);
+    }
     match board.status() {
         BoardStatus::Checkmate => return SearchScore::EVAL(mated_in_plies(ply_from_root)),
         BoardStatus::Stalemate => return SearchScore::EVAL(0),
@@ -342,8 +390,16 @@ fn negamax_it(
             let tt_score = tt_score_on_load(entry.score, ply_from_root);
             match entry.flag {
                 TTFlag::Exact => return SearchScore::EVAL(tt_score),
-                TTFlag::Lower => if tt_score >= beta { return SearchScore::EVAL(tt_score) },
-                TTFlag::Upper => if tt_score <= alpha { return SearchScore::EVAL(tt_score) },
+                TTFlag::Lower => {
+                    if tt_score >= beta {
+                        return SearchScore::EVAL(tt_score);
+                    }
+                }
+                TTFlag::Upper => {
+                    if tt_score <= alpha {
+                        return SearchScore::EVAL(tt_score);
+                    }
+                }
             }
         }
     }
@@ -393,14 +449,16 @@ fn negamax_it(
         let new_board = board_do_move(&board, mv, repetition_table);
 
         // Determine properties for LMR conditions
-        let is_capture = board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(&board, mv);
+        let is_capture =
+            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(&board, mv);
         let gives_check = new_board.checkers().popcnt() > 0;
         let is_pv_move = move_idx == 0; // treat first move as PV
 
         let mut value: i32;
 
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
-        let apply_lmr = rem_depth >= 3 && move_idx >= 3 && !is_pv_move && !is_capture && !gives_check;
+        let apply_lmr =
+            rem_depth >= 3 && move_idx >= 3 && !is_pv_move && !is_capture && !gives_check;
         if apply_lmr {
             let r = if rem_depth >= 6 { 2 } else { 1 } as usize;
             // Reduced-depth null-window search first
@@ -419,7 +477,7 @@ fn negamax_it(
             ) {
                 SearchScore::CANCELLED => {
                     board_pop(&new_board, repetition_table);
-                    return SearchScore::CANCELLED
+                    return SearchScore::CANCELLED;
                 }
                 SearchScore::EVAL(vr) => {
                     let mut vred = -vr;
@@ -440,7 +498,7 @@ fn negamax_it(
                         ) {
                             SearchScore::CANCELLED => {
                                 board_pop(&new_board, repetition_table);
-                                return SearchScore::CANCELLED
+                                return SearchScore::CANCELLED;
                             }
                             SearchScore::EVAL(vf) => {
                                 value = -vf;
@@ -468,7 +526,7 @@ fn negamax_it(
             ) {
                 SearchScore::CANCELLED => {
                     board_pop(&new_board, repetition_table);
-                    return SearchScore::CANCELLED
+                    return SearchScore::CANCELLED;
                 }
                 SearchScore::EVAL(v) => {
                     value = -v;
@@ -484,14 +542,15 @@ fn negamax_it(
             best_value = value;
             best_move_opt = Some(mv);
         }
-        if value > alpha { alpha = value; }
+        if value > alpha {
+            alpha = value;
+        }
         if alpha >= beta {
             break;
         }
 
         move_idx += 1;
     }
-
 
     if best_move_opt.is_some() {
         pv_table.insert(board.get_hash(), best_move_opt.unwrap());
@@ -500,10 +559,25 @@ fn negamax_it(
     }
 
     // If it would have cause an alpha beta pruning store the information in the TT table
-    let bound = if best_value <= alpha_orig { TTFlag::Upper } else if best_value >= beta { TTFlag::Lower } else { TTFlag::Exact };
+    let bound = if best_value <= alpha_orig {
+        TTFlag::Upper
+    } else if best_value >= beta {
+        TTFlag::Lower
+    } else {
+        TTFlag::Exact
+    };
     let stored = tt_score_on_store(best_value, ply_from_root);
     let prev_eval = transpo_table.get(&zob).and_then(|e| e.eval);
-    transpo_table.insert(zob, TTEntry { depth: rem_depth, score: stored, flag: bound, best_move: best_move_opt, eval: prev_eval });
+    transpo_table.insert(
+        zob,
+        TTEntry {
+            depth: rem_depth,
+            score: stored,
+            flag: bound,
+            best_move: best_move_opt,
+            eval: prev_eval,
+        },
+    );
 
     SearchScore::EVAL(best_value)
 }
@@ -522,24 +596,34 @@ fn root_search(
     let mut beta = POS_INFINITY;
     let mut best_value = NEG_INFINITY;
     let mut best_move = None;
-    let color = if board.side_to_move() == Color::White { 1 } else { -1 };
+    let color = if board.side_to_move() == Color::White {
+        1
+    } else {
+        -1
+    };
 
     let mut out = io::stdout();
 
     for mv in ordered_moves(board, pv_table, transpo_table, 0) {
-        if should_stop(stop) { break; }
+        if should_stop(stop) {
+            break;
+        }
 
         if best_move.is_some() {
             let bm: ChessMove = best_move.unwrap();
             let info_line = format!(
                 "info string [{}] evaluating move : {}, curr best is {:?} ({})",
-                max_depth, mv.to_string(), bm.to_string(), best_value
+                max_depth,
+                mv.to_string(),
+                bm.to_string(),
+                best_value
             );
             send_message(&mut out, &info_line);
         } else {
             let info_line = format!(
                 "info string [{}] evaluating move : {}",
-                max_depth, mv.to_string()
+                max_depth,
+                mv.to_string()
             );
             send_message(&mut out, &info_line);
         }
@@ -562,7 +646,7 @@ fn root_search(
                 // Ensure we revert repetition count when aborting
                 board_pop(&new_board, repetition_table);
                 break;
-            },
+            }
             SearchScore::EVAL(v) => {
                 let value = -v;
                 board_pop(&new_board, repetition_table);
@@ -574,12 +658,19 @@ fn root_search(
                     let bm: ChessMove = best_move.unwrap();
                     let info_line = format!(
                         "info string [{}] replacing best move with {}, {} > {}",
-                        max_depth, mv.to_string(), value, best_value
+                        max_depth,
+                        mv.to_string(),
+                        value,
+                        best_value
                     );
                     send_message(&mut out, &info_line);
                 }
-                if value > alpha { alpha = value; }
-                if alpha >= beta { break; }
+                if value > alpha {
+                    alpha = value;
+                }
+                if alpha >= beta {
+                    break;
+                }
             }
         }
     }
@@ -603,7 +694,7 @@ pub fn best_move_using_iterative_deepening(
     let mut pv_table: PVTable = HashMap::new();
     let mut final_best_move = None;
     let mut final_best_score = 0;
-    let stop      = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
 
     for depth in 1..=max_depth {
         let (bm, score) = root_search(
@@ -677,14 +768,20 @@ pub fn best_move_interruptible(
         }
         DEPTH_COUNT.store(depth, Ordering::Relaxed);
 
-        if should_stop(&stop) { break; }
+        if should_stop(&stop) {
+            break;
+        }
 
         //if should_stop(&stop) { break; }
 
         if let Some(out) = stdout_opt.as_mut() {
             let nodes = EVAL_COUNT.load(Ordering::Relaxed) as u64;
             let time_ms = t0.elapsed().as_millis() as u64;
-            let nps = if time_ms > 0 { nodes * 1_000 / time_ms } else { 0 };
+            let nps = if time_ms > 0 {
+                nodes * 1_000 / time_ms
+            } else {
+                0
+            };
 
             let pv_txt_opt = pv_table.get(&board.get_hash());
 
@@ -697,7 +794,6 @@ pub fn best_move_interruptible(
                 );
                 send_message(&mut **out, &info_line);
             }
-
         }
 
         depth += 1;

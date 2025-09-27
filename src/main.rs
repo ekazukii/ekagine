@@ -3,55 +3,57 @@
 // chess = "3.2.0"
 // once_cell = "1.18.0"    # for lazy_static
 
-mod search;
 mod eval;
+mod search;
 
+use crate::search::{
+    best_move_interruptible, best_move_using_iterative_deepening, uci_score_string,
+};
+use chess::Color::{Black, White};
+use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
+use lazy_static::lazy_static;
+use serde::Deserialize;
 use std::collections::{hash_map, HashMap};
-use std::{env, thread};
 use std::fmt::format;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use chess::{Board, MoveGen, ChessMove, Color, Piece, BoardStatus, Square, BitBoard};
-use lazy_static::lazy_static;
-use std::io::{self, BufRead, Write, BufReader, Stdout};
-use chess::Color::{Black, White};
-use serde::Deserialize;
-use std::fs::{File, OpenOptions};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::search::{best_move_interruptible, best_move_using_iterative_deepening, uci_score_string};
+use std::{env, thread};
 
 static EVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CACHE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEPTH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-
-
 type StopFlag = Arc<AtomicBool>;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Search Tables keyed by the built‐in Zobrist hash (u64).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TTFlag { Exact, Lower, Upper }
+pub enum TTFlag {
+    Exact,
+    Lower,
+    Upper,
+}
 
 #[derive(Clone, Debug)]
 pub struct TTEntry {
-    pub depth: i16,                 // remaining depth at store time
-    pub score: i32,                 // score (mate scores are ply-adjusted)
-    pub flag: TTFlag,               // Exact / Lower / Upper bound
+    pub depth: i16,                   // remaining depth at store time
+    pub score: i32,                   // score (mate scores are ply-adjusted)
+    pub flag: TTFlag,                 // Exact / Lower / Upper bound
     pub best_move: Option<ChessMove>, // best move from this node
-    pub eval: Option<i32>,          // cached static eval (for stand-pat)
+    pub eval: Option<i32>,            // cached static eval (for stand-pat)
 }
 
 type TranspositionTable = HashMap<u64, TTEntry>;
-type RepetitionTable    = HashMap<u64, usize>;
+type RepetitionTable = HashMap<u64, usize>;
 type PVTable = HashMap<u64, ChessMove>;
-
 
 /// Apply a move and update `repetition_table` by incrementing the count
 /// for the new position's Zobrist hash. Returns the new Board.
@@ -59,11 +61,7 @@ type PVTable = HashMap<u64, ChessMove>;
 /// Uses `Board::get_hash()` (which is the polyglot Zobrist) instead of FEN.
 ///
 ///
-fn board_do_move(
-    board: &Board,
-    mv: ChessMove,
-    repetition_table: &mut RepetitionTable,
-) -> Board {
+fn board_do_move(board: &Board, mv: ChessMove, repetition_table: &mut RepetitionTable) -> Board {
     let new_board = board.make_move_new(mv);
     let zob = new_board.get_hash();
     let counter = repetition_table.entry(zob).or_insert(0);
@@ -88,7 +86,8 @@ fn get_log_file() -> File {
     OpenOptions::new()
         .append(true)
         .create(true)
-        .open("/Users/ekazuki/RustroverProjects/untitled1/uci2.log").unwrap()
+        .open("/Users/ekazuki/RustroverProjects/untitled1/uci2.log")
+        .unwrap()
 }
 
 fn log_gui_command(command: &str) {
@@ -117,22 +116,43 @@ fn send_message(stdout: &mut Stdout, message: &str) {
 ///   with a small safety margin so you don't flag.
 pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
     // Defaults
-    let mut wtime: u64      = 0;
-    let mut btime: u64      = 0;
-    let mut winc:  u64      = 0;
-    let mut binc:  u64      = 0;
-    let mut movestogo: u64  = 30;   // assume 30 moves left if not specified
+    let mut wtime: u64 = 0;
+    let mut btime: u64 = 0;
+    let mut winc: u64 = 0;
+    let mut binc: u64 = 0;
+    let mut movestogo: u64 = 30; // assume 30 moves left if not specified
     let mut movetime: Option<u64> = None;
 
     let mut i = 1; // skip the "go" token itself
     while i < tokens.len() {
         match tokens[i] {
-            "movetime"   => { i += 1; movetime   = tokens.get(i).and_then(|v| v.parse().ok()); }
-            "wtime"      => { i += 1; wtime      = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            "btime"      => { i += 1; btime      = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            "winc"       => { i += 1; winc       = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            "binc"       => { i += 1; binc       = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            "movestogo"  => { i += 1; movestogo  = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(movestogo); }
+            "movetime" => {
+                i += 1;
+                movetime = tokens.get(i).and_then(|v| v.parse().ok());
+            }
+            "wtime" => {
+                i += 1;
+                wtime = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "btime" => {
+                i += 1;
+                btime = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "winc" => {
+                i += 1;
+                winc = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "binc" => {
+                i += 1;
+                binc = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "movestogo" => {
+                i += 1;
+                movestogo = tokens
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(movestogo);
+            }
             _ => {}
         }
         i += 1;
@@ -149,12 +169,11 @@ pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
 
     const SAFETY_MS: u64 = 50;
 
-    let base    = time_left.saturating_sub(SAFETY_MS) / movestogo.max(1);
-    let budget  = base + increment / 2;
+    let base = time_left.saturating_sub(SAFETY_MS) / movestogo.max(1);
+    let budget = base + increment / 2;
 
     Duration::from_millis(budget.max(10))
 }
-
 
 fn uci_loop() {
     let stdin = io::stdin();
@@ -174,7 +193,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.11");
+                send_message(&mut stdout, "id name Ekagine-v1.12");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }
@@ -218,11 +237,20 @@ fn uci_loop() {
                 EVAL_COUNT.store(0, Ordering::Relaxed);
                 CACHE_COUNT.store(0, Ordering::Relaxed);
                 let zob_start = board.get_hash();
-                repetition_table.insert(zob_start, repetition_table.get(&zob_start).cloned().unwrap_or(0) + 1);
+                repetition_table.insert(
+                    zob_start,
+                    repetition_table.get(&zob_start).cloned().unwrap_or(0) + 1,
+                );
 
                 let max_ply = 100;
-                let (best_mv, _best_score) =
-                    best_move_interruptible(&board, time_budget, 99, repetition_table.clone(), &mut transpo_table,  Some(&mut stdout));
+                let (best_mv, _best_score) = best_move_interruptible(
+                    &board,
+                    time_budget,
+                    99,
+                    repetition_table.clone(),
+                    &mut transpo_table,
+                    Some(&mut stdout),
+                );
                 if let Some(mv) = best_mv {
                     send_message(&mut stdout, format!("bestmove {}", mv).as_str());
                 } else {
@@ -237,7 +265,6 @@ fn uci_loop() {
         stdout.flush().unwrap();
     }
 }
-
 
 #[derive(Deserialize, Debug)]
 struct PV {
@@ -280,11 +307,14 @@ fn process_file(filepath: &str) -> io::Result<HashMap<Board, i32>> {
                 if let Some(best_eval) = position_eval.evals.iter().max_by_key(|e| e.depth) {
                     if let Some(first_pv) = best_eval.pvs.get(0) {
                         if let Some(cp_value) = first_pv.cp {
-                            match  Board::from_str(position_eval.fen.as_str()) {
+                            match Board::from_str(position_eval.fen.as_str()) {
                                 Ok(board) => {
                                     result.insert(board, cp_value);
-                                },
-                                Err(err) => eprintln!("Failed to parse board {} Error: {})", position_eval.fen, err)
+                                }
+                                Err(err) => eprintln!(
+                                    "Failed to parse board {} Error: {})",
+                                    position_eval.fen, err
+                                ),
                             }
                         } else {
                             eprintln!(
@@ -349,7 +379,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
     let mut eval_counts: Vec<usize> = Vec::new();
     let mut cache_counts: Vec<usize> = Vec::new();
     let mut depth_counts: Vec<usize> = Vec::new();
-    let stop      = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
 
     let max_depth = 5;
     for (key, val) in fen_to_stockfish.iter() {
@@ -359,7 +389,14 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         let (res, duration) = time_fn(|| {
             let mut repetition_table: RepetitionTable = HashMap::new();
             let mut transpo_table: TranspositionTable = HashMap::new();
-            best_move_interruptible(key, Duration::from_millis(100), 1000, RepetitionTable::new(), &mut transpo_table, None)
+            best_move_interruptible(
+                key,
+                Duration::from_millis(100),
+                1000,
+                RepetitionTable::new(),
+                &mut transpo_table,
+                None,
+            )
         });
 
         times.push(duration);
@@ -379,7 +416,8 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
     let diffs: Vec<f64> = scores.iter().map(|(a, b)| (*a - *b) as f64).collect();
     let depths_f64: Vec<f64> = depth_counts.iter().map(|&d| d as f64).collect();
 
-    let (avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time) = compute_stats(&time_ms);
+    let (avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time) =
+        compute_stats(&time_ms);
     let (avg_e, med_e, min_e, max_e, std_e, p5_e, p95_e) = compute_stats(&evals_f64);
     let (avg_c, med_c, min_c, max_c, std_c, p5_c, p95_c) = compute_stats(&caches_f64);
     let (avg_d, med_d, min_d, max_d, std_d, p5_d, p95_d) = compute_stats(&diffs);
@@ -399,21 +437,16 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
 }
 
 const NEG_INFINITY: i32 = -100_000_000;
-const POS_INFINITY: i32 =  100_000_000;
+const POS_INFINITY: i32 = 100_000_000;
 const PV_WIDTH: usize = 1; // keep up to X moves per position for ordering
 
 const QUIESCE_REMAIN: usize = 15;
-
-
-
-
 
 pub fn compute_best_from_fen(
     fen: &str,
     max_depth: usize,
 ) -> Result<(Option<ChessMove>, i32), String> {
-    let board = Board::from_str(fen)
-        .map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
+    let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
     let mut transpo_table: TranspositionTable = HashMap::new();
     let mut repetition_table: HashMap<u64, usize> = HashMap::new();
@@ -432,7 +465,10 @@ pub fn compute_best_from_fen(
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} [--uci] [--benchmark [FILE]] [--best <FEN> [DEPTH]]", args[0]);
+        eprintln!(
+            "Usage: {} [--uci] [--benchmark [FILE]] [--best <FEN> [DEPTH]]",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -446,7 +482,8 @@ fn main() {
         }
 
         "--benchmark" => {
-            let filepath = args.get(2)
+            let filepath = args
+                .get(2)
                 .map(|s| s.as_str())
                 .unwrap_or("/Users/ekazuki/Downloads/lichess_db_eval_1000.jsonl");
             match process_file(filepath) {
@@ -461,16 +498,14 @@ fn main() {
                 std::process::exit(1);
             }
             let fen = &args[2];
-            let max_depth: usize = args.get(3)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6);
+            let max_depth: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
 
             match compute_best_from_fen(fen, max_depth) {
                 Ok((Some(mv), score)) => {
                     let board_disp = Board::from_str(fen).unwrap();
                     let score_str = uci_score_string(score, board_disp.side_to_move());
                     println!("bestmove {} (score {})", mv, score_str)
-                },
+                }
                 Ok((None, _)) => println!("No legal move available"),
                 Err(msg) => {
                     eprintln!("Error: {}", msg);
@@ -493,13 +528,8 @@ fn main() {
 // 1rbqkb1r/pppp1ppp/2n1p3/8/3PP1n1/4BN1P/PPP2PP1/RN1QKB1R w KQk - 0 5
 // Coup de tour bizarre
 
-
-
-
 // WTF Is that ?
 //1rbqkb1r/pppp1ppp/2n1p3/6N1/3PP1n1/4B2P/PPP2PP1/RN1QKB1R b KQk - 0 6
-
-
 
 //[Event "*"]
 // [Site "*"]
