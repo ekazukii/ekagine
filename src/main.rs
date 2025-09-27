@@ -67,27 +67,9 @@ fn board_pop(board: &Board, repetition_table: &mut RepetitionTable) {
     }
 }
 
-fn get_log_file() -> File {
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("/Users/ekazuki/RustroverProjects/untitled1/uci2.log")
-        .unwrap()
-}
-
-fn log_gui_command(command: &str) {
-    let mut file: File = get_log_file();
-    writeln!(file, "{}", "[GUI] ".to_owned() + command.clone()).unwrap();
-
-    file.flush().unwrap();
-}
 
 fn send_message(stdout: &mut Stdout, message: &str) {
-    let mut file: File = get_log_file();
-    writeln!(file, "{}", "[ENGINE] ".to_owned() + message.clone()).unwrap();
     writeln!(stdout, "{}", message.clone()).unwrap();
-
-    file.flush().unwrap();
 }
 
 /// Decide how long to think for this move.
@@ -169,7 +151,6 @@ fn uci_loop() {
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
-        log_gui_command(input.trim());
         let tokens: Vec<&str> = input.trim().split_whitespace().collect();
 
         if tokens.is_empty() {
@@ -178,7 +159,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.16.1");
+                send_message(&mut stdout, "id name Ekagine-v1.17.1");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }

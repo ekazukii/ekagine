@@ -327,8 +327,6 @@ impl<'a> Drop for AppliedBoard<'a> {
     }
 }
 
-const CHECK_BONUS: u8 = 60;
-const CHECKMATE_BONUS: u8 = 100;
 const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     // Victim = Pawn
     [15, 14, 13, 12, 11, 10],
@@ -445,23 +443,7 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
             0
         };
 
-        let board_after = board.make_move_new(mv);
-
-        let check_bonus = if board_after.checkers().popcnt() > 0 {
-            // match board_after.status() {
-            //    BoardStatus::Checkmate => {
-            //        CHECKMATE_BONUS
-            //    }
-            //    _ => CHECK_BONUS,
-            //}
-            CHECK_BONUS
-        } else {
-            0
-        };
-
-        scored_moves.push((mv, score + check_bonus));
-
-        //scored_moves.push((mv, score));
+        scored_moves.push((mv, score));
     }
 
     scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
