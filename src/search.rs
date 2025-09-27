@@ -350,6 +350,9 @@ const FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const FUTILITY_MARGIN_BASE: i32 = 200;
 const FUTILITY_MARGIN_PER_DEPTH: i32 = 150;
 
+const CHECK_EXTENSION: usize = 1;
+const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
+
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
@@ -587,6 +590,12 @@ fn negamax_it(
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let gives_check = applied.board().checkers().popcnt() > 0;
         let is_pv_move = move_idx == 0; // treat first move as PV
+        let extension = if gives_check && rem_depth <= CHECK_EXTENSION_DEPTH_LIMIT && rem_depth > 0
+        {
+            CHECK_EXTENSION
+        } else {
+            0
+        };
 
         if let Some(stand_pat) = static_eval_for_futility {
             if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH
@@ -616,7 +625,7 @@ fn negamax_it(
             match negamax_it(
                 child_board_view,
                 depth + 1 + r,
-                max_depth,
+                max_depth + extension,
                 -beta,
                 -alpha,
                 transpo_table,
@@ -637,7 +646,7 @@ fn negamax_it(
                         match negamax_it(
                             child_board_view,
                             depth + 1,
-                            max_depth,
+                            max_depth + extension,
                             -beta,
                             -alpha,
                             transpo_table,
@@ -662,7 +671,7 @@ fn negamax_it(
             match negamax_it(
                 child_board_view,
                 depth + 1,
-                max_depth,
+                max_depth + extension,
                 -beta,
                 -alpha,
                 transpo_table,
