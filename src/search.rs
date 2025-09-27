@@ -7,6 +7,7 @@ use crate::{
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
 use std::collections::{hash_map::Entry, HashMap};
 use std::io::Stdout;
+use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -225,6 +226,50 @@ fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> 
     Some(new_board)
 }
 
+struct AppliedBoard<'a> {
+    board: Board,
+    repetition_table: *mut RepetitionTable,
+    popped: bool,
+    _marker: PhantomData<&'a mut RepetitionTable>,
+}
+
+impl<'a> AppliedBoard<'a> {
+    fn new(parent: &Board, mv: ChessMove, repetition_table: &'a mut RepetitionTable) -> Self {
+        let board = board_do_move(parent, mv, repetition_table);
+        Self {
+            board,
+            repetition_table,
+            popped: false,
+            _marker: PhantomData,
+        }
+    }
+
+    fn board(&self) -> &Board {
+        &self.board
+    }
+
+    fn split(&mut self) -> (&Board, &mut RepetitionTable) {
+        let board_ptr: *const Board = &self.board;
+        let rep_ptr = self.repetition_table;
+        unsafe { (&*board_ptr, &mut *rep_ptr) }
+    }
+
+    fn mark_popped(&mut self) {
+        if !self.popped {
+            unsafe {
+                board_pop(&self.board, &mut *self.repetition_table);
+            }
+            self.popped = true;
+        }
+    }
+}
+
+impl<'a> Drop for AppliedBoard<'a> {
+    fn drop(&mut self) {
+        self.mark_popped();
+    }
+}
+
 const CHECK_BONUS: u8 = 60;
 const CHECKMATE_BONUS: u8 = 100;
 const MVV_LVA_TABLE: [[u8; 6]; 6] = [
@@ -339,7 +384,7 @@ fn ordered_moves(
 /// This is the core of the move search, it perform a negamax styled search with alpha/beta pruning
 /// Usage of quiesce search at end of search and tt/pv cutoff
 fn negamax_it(
-    board: Board,
+    board: &Board,
     depth: usize,
     max_depth: usize,
     mut alpha: i32,
@@ -360,7 +405,7 @@ fn negamax_it(
     }
 
     // If game is over
-    if is_in_threefold_scenario(&board, repetition_table) {
+    if is_in_threefold_scenario(board, repetition_table) {
         return SearchScore::EVAL(0);
     }
     match board.status() {
@@ -372,7 +417,7 @@ fn negamax_it(
     // Start quiesce search if we reached or exceeded the depth limit
     if depth >= max_depth {
         return SearchScore::EVAL(quiesce_negamax_it(
-            &board,
+            board,
             alpha,
             beta,
             QUIESCE_REMAIN,
@@ -409,12 +454,12 @@ fn negamax_it(
     // Null-move pruning: if not in check and enough depth, try a null move with reduction.
     // Guard against zugzwang: require some non-pawn material for the side to move.
     let in_check = board.checkers().popcnt() > 0;
-    if !in_check && rem_depth >= 2 && has_non_pawn_material(&board, board.side_to_move()) {
+    if !in_check && rem_depth >= 2 && has_non_pawn_material(board, board.side_to_move()) {
         let r = if rem_depth >= 6 { 3 } else { 2 } as usize;
-        if let Some(nboard) = board_do_null_move(&board, repetition_table) {
+        if let Some(nboard) = board_do_null_move(board, repetition_table) {
             // null-window search (fail-high test)
             match negamax_it(
-                nboard,
+                &nboard,
                 depth + 1 + r,
                 max_depth,
                 -beta,
@@ -447,97 +492,82 @@ fn negamax_it(
 
     // Start the main search
     let mut move_idx: usize = 0;
-    for mv in ordered_moves(&board, pv_table, transpo_table, depth) {
-        let new_board = board_do_move(&board, mv, repetition_table);
+    for mv in ordered_moves(board, pv_table, transpo_table, depth) {
+        let mut applied = AppliedBoard::new(board, mv, repetition_table);
 
         // Determine properties for LMR conditions
         let is_capture =
-            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(&board, mv);
-        let gives_check = new_board.checkers().popcnt() > 0;
+            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
+        let gives_check = applied.board().checkers().popcnt() > 0;
         let is_pv_move = move_idx == 0; // treat first move as PV
-
-        let mut value: i32;
 
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
         let apply_lmr =
             rem_depth >= 3 && move_idx >= 3 && !is_pv_move && !is_capture && !gives_check;
-        if apply_lmr {
+        let value = if apply_lmr {
             let r = if rem_depth >= 6 { 2 } else { 1 } as usize;
             // Reduced-depth null-window search first
+            let (child_board_view, rep_table) = applied.split();
             match negamax_it(
-                new_board,
+                child_board_view,
                 depth + 1 + r,
                 max_depth,
                 -beta,
                 -alpha,
                 transpo_table,
-                repetition_table,
+                rep_table,
                 pv_table,
                 -color,
                 stop,
                 ply_from_root + 1,
             ) {
-                SearchScore::CANCELLED => {
-                    board_pop(&new_board, repetition_table);
-                    return SearchScore::CANCELLED;
-                }
+                SearchScore::CANCELLED => return SearchScore::CANCELLED,
                 SearchScore::EVAL(vr) => {
-                    let mut vred = -vr;
+                    let vred = -vr;
                     // If reduced search raises alpha, re-search at full depth
                     if vred > alpha {
+                        let (child_board_view, rep_table) = applied.split();
                         match negamax_it(
-                            new_board,
+                            child_board_view,
                             depth + 1,
                             max_depth,
                             -beta,
                             -alpha,
                             transpo_table,
-                            repetition_table,
+                            rep_table,
                             pv_table,
                             -color,
                             stop,
                             ply_from_root + 1,
                         ) {
-                            SearchScore::CANCELLED => {
-                                board_pop(&new_board, repetition_table);
-                                return SearchScore::CANCELLED;
-                            }
-                            SearchScore::EVAL(vf) => {
-                                value = -vf;
-                            }
+                            SearchScore::CANCELLED => return SearchScore::CANCELLED,
+                            SearchScore::EVAL(vf) => -vf,
                         }
                     } else {
-                        value = vred;
+                        vred
                     }
                 }
             }
         } else {
             // Normal full-depth search
+            let (child_board_view, rep_table) = applied.split();
             match negamax_it(
-                new_board,
+                child_board_view,
                 depth + 1,
                 max_depth,
                 -beta,
                 -alpha,
                 transpo_table,
-                repetition_table,
+                rep_table,
                 pv_table,
                 -color,
                 stop,
                 ply_from_root + 1,
             ) {
-                SearchScore::CANCELLED => {
-                    board_pop(&new_board, repetition_table);
-                    return SearchScore::CANCELLED;
-                }
-                SearchScore::EVAL(v) => {
-                    value = -v;
-                }
+                SearchScore::CANCELLED => return SearchScore::CANCELLED,
+                SearchScore::EVAL(v) => -v,
             }
-        }
-
-        // Done exploring this move — revert repetition
-        board_pop(&new_board, repetition_table);
+        };
 
         // Update best / alpha-beta
         if value > best_value {
@@ -582,6 +612,44 @@ fn negamax_it(
     );
 
     SearchScore::EVAL(best_value)
+}
+
+fn log_root_move_start(
+    out: &mut Stdout,
+    depth: usize,
+    mv: &ChessMove,
+    current_best: Option<(ChessMove, i32)>,
+) {
+    let info_line = if let Some((best_move, best_score)) = current_best {
+        format!(
+            "info string [{}] evaluating move : {}, curr best is {} ({})",
+            depth, mv, best_move, best_score
+        )
+    } else {
+        format!("info string [{}] evaluating move : {}", depth, mv)
+    };
+    send_message(out, &info_line);
+}
+
+fn log_root_best_update(
+    out: &mut Stdout,
+    depth: usize,
+    mv: &ChessMove,
+    new_score: i32,
+    previous_best: Option<(ChessMove, i32)>,
+) {
+    let info_line = if let Some((prev_move, prev_score)) = previous_best {
+        format!(
+            "info string [{}] replacing best move {} with {}, {} > {}",
+            depth, prev_move, mv, new_score, prev_score
+        )
+    } else {
+        format!(
+            "info string [{}] setting initial best move to {}, score {}",
+            depth, mv, new_score
+        )
+    };
+    send_message(out, &info_line);
 }
 
 struct RootSearchResult {
@@ -632,62 +700,35 @@ fn root_search_with_window(
             break;
         }
 
-        if best_move.is_some() {
-            let bm: ChessMove = best_move.unwrap();
-            let info_line = format!(
-                "info string [{}] evaluating move : {}, curr best is {:?} ({})",
-                max_depth,
-                mv.to_string(),
-                bm.to_string(),
-                best_value
-            );
-            send_message(&mut out, &info_line);
-        } else {
-            let info_line = format!(
-                "info string [{}] evaluating move : {}",
-                max_depth,
-                mv.to_string()
-            );
-            send_message(&mut out, &info_line);
-        }
+        let current_best = best_move.map(|bm| (bm, best_value));
+        log_root_move_start(&mut out, max_depth, &mv, current_best);
 
-        let new_board = board_do_move(board, mv, repetition_table);
+        let mut applied = AppliedBoard::new(board, mv, repetition_table);
+        let (child_board, rep_table) = applied.split();
         match negamax_it(
-            new_board,
+            child_board,
             1,
             max_depth,
             -beta,
             -alpha,
             transpo_table,
-            repetition_table,
+            rep_table,
             pv_table,
             -color,
             stop,
             1, // one ply from root after making mv
         ) {
             SearchScore::CANCELLED => {
-                // Ensure we revert repetition count when aborting
-                board_pop(&new_board, repetition_table);
                 aborted = true;
                 break;
             }
             SearchScore::EVAL(v) => {
                 let value = -v;
-                board_pop(&new_board, repetition_table);
 
                 if value > best_value {
+                    log_root_best_update(&mut out, max_depth, &mv, value, current_best);
                     best_value = value;
                     best_move = Some(mv);
-
-                    let bm: ChessMove = best_move.unwrap();
-                    let info_line = format!(
-                        "info string [{}] replacing best move with {}, {} > {}",
-                        max_depth,
-                        mv.to_string(),
-                        value,
-                        best_value
-                    );
-                    send_message(&mut out, &info_line);
                 }
                 if value > alpha {
                     alpha = value;
@@ -781,6 +822,68 @@ fn aspiration_root_search(
     }
 }
 
+struct IterationReport {
+    depth: usize,
+    result: RootSearchResult,
+    #[allow(dead_code)]
+    best_move: Option<ChessMove>,
+    best_score: i32,
+}
+
+fn iterative_deepening_loop<F>(
+    board: &Board,
+    max_depth: usize,
+    transpo_table: &mut TranspositionTable,
+    repetition_table: &mut RepetitionTable,
+    pv_table: &mut PVTable,
+    stop: &StopFlag,
+    mut on_iteration: F,
+) -> (Option<ChessMove>, i32)
+where
+    F: FnMut(&IterationReport, &PVTable),
+{
+    let mut best_move = None;
+    let mut best_score = 0;
+    let mut prev_score: Option<i32> = None;
+
+    for depth in 1..=max_depth {
+        if should_stop(stop) {
+            break;
+        }
+
+        let result = aspiration_root_search(
+            board,
+            depth,
+            transpo_table,
+            repetition_table,
+            pv_table,
+            stop,
+            prev_score,
+        );
+
+        if let Some(bm) = result.best_move {
+            best_move = Some(bm);
+            best_score = result.score;
+            prev_score = Some(result.score);
+        }
+
+        let report = IterationReport {
+            depth,
+            result,
+            best_move,
+            best_score,
+        };
+
+        on_iteration(&report, &*pv_table);
+
+        if report.result.aborted {
+            break;
+        }
+    }
+
+    (best_move, best_score)
+}
+
 /// Compute the best move of a board from a depth limit
 #[allow(clippy::too_many_arguments)]
 pub fn best_move_using_iterative_deepening(
@@ -790,32 +893,17 @@ pub fn best_move_using_iterative_deepening(
     repetition_table: &mut RepetitionTable,
 ) -> (Option<ChessMove>, i32) {
     let mut pv_table: PVTable = HashMap::new();
-    let mut final_best_move = None;
-    let mut final_best_score = 0;
     let stop = Arc::new(AtomicBool::new(false));
-    let mut prev_score: Option<i32> = None;
 
-    for depth in 1..=max_depth {
-        let result = aspiration_root_search(
-            board,
-            depth,
-            transpo_table,
-            repetition_table,
-            &mut pv_table,
-            &stop,
-            prev_score,
-        );
-        if result.aborted {
-            break;
-        }
-        if let Some(bm) = result.best_move {
-            final_best_move = Some(bm);
-            final_best_score = result.score;
-            prev_score = Some(result.score);
-        }
-    }
-
-    (final_best_move, final_best_score)
+    iterative_deepening_loop(
+        board,
+        max_depth,
+        transpo_table,
+        repetition_table,
+        &mut pv_table,
+        &stop,
+        |_, _| {},
+    )
 }
 
 /// Iterative-deepening search that can be stopped by a time budget.
@@ -849,66 +937,43 @@ pub fn best_move_interruptible(
     let mut pv_table = PVTable::default();
 
     let t0 = Instant::now();
-    let mut depth = 1;
-    let mut best_move = None;
-    let mut best_score = 0;
-    let mut prev_score: Option<i32> = None;
-
     EVAL_COUNT.store(0, Ordering::Relaxed);
     DEPTH_COUNT.store(0, Ordering::Relaxed);
 
-    while depth <= max_depth_cap && !should_stop(&stop) {
-        let result = aspiration_root_search(
-            board,
-            depth,
-            transpo_table,
-            &mut repetition_table,
-            &mut pv_table,
-            &stop,
-            prev_score,
-        );
-        if let Some(bm) = result.best_move {
-            best_move = Some(bm);
-            best_score = result.score;
-            prev_score = Some(result.score);
-        }
-        DEPTH_COUNT.store(depth, Ordering::Relaxed);
-
-        if result.aborted {
-            break;
-        }
-
-        if should_stop(&stop) {
-            break;
-        }
-
-        //if should_stop(&stop) { break; }
-
-        if let Some(out) = stdout_opt.as_mut() {
-            let nodes = EVAL_COUNT.load(Ordering::Relaxed) as u64;
-            let time_ms = t0.elapsed().as_millis() as u64;
-            let nps = if time_ms > 0 {
-                nodes * 1_000 / time_ms
-            } else {
-                0
-            };
-
-            let pv_txt_opt = pv_table.get(&board.get_hash());
-
-            if let Some(pv_txt) = pv_txt_opt {
-                let score_str = uci_score_string(best_score, board.side_to_move());
-
-                let info_line = format!(
-                    "info depth {} score {} nodes {} nps {} time {} pv {}",
-                    depth, score_str, nodes, nps, time_ms, pv_txt
-                );
-                send_message(&mut **out, &info_line);
+    iterative_deepening_loop(
+        board,
+        max_depth_cap,
+        transpo_table,
+        &mut repetition_table,
+        &mut pv_table,
+        &stop,
+        |report, pv_view| {
+            if report.result.aborted {
+                return;
             }
-        }
 
-        depth += 1;
-        EVAL_COUNT.store(0, Ordering::Relaxed);
-    }
+            DEPTH_COUNT.store(report.depth, Ordering::Relaxed);
 
-    (best_move, best_score)
+            if let Some(out) = stdout_opt.as_mut() {
+                let nodes = EVAL_COUNT.load(Ordering::Relaxed) as u64;
+                let time_ms = t0.elapsed().as_millis() as u64;
+                let nps = if time_ms > 0 {
+                    nodes * 1_000 / time_ms
+                } else {
+                    0
+                };
+
+                if let Some(pv_mv) = pv_view.get(&board.get_hash()) {
+                    let score_str = uci_score_string(report.best_score, board.side_to_move());
+                    let info_line = format!(
+                        "info depth {} score {} nodes {} nps {} time {} pv {}",
+                        report.depth, score_str, nodes, nps, time_ms, pv_mv
+                    );
+                    send_message(&mut **out, &info_line);
+                }
+            }
+
+            EVAL_COUNT.store(0, Ordering::Relaxed);
+        },
+    )
 }
