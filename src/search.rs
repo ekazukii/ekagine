@@ -271,6 +271,16 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 
 const ASPIRATION_START_WINDOW: i32 = 50;
 
+const FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
+const FUTILITY_MARGIN_BASE: i32 = 200;
+const FUTILITY_MARGIN_PER_DEPTH: i32 = 150;
+
+#[inline]
+fn futility_margin(depth: i16) -> i32 {
+    let depth = depth as i32;
+    FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth.saturating_sub(1)
+}
+
 #[inline]
 fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
     // En passant is a pawn move to the ep square capturing a pawn that isn't on dest.
@@ -472,6 +482,12 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
+    let static_eval_for_futility = if !in_check && rem_depth <= FUTILITY_PRUNE_MAX_DEPTH {
+        Some(color * cache_eval(board, transpo_table, repetition_table))
+    } else {
+        None
+    };
+
     // Start the main search
     let mut move_idx: usize = 0;
     for mv in ordered_moves(board, pv_table, transpo_table, depth) {
@@ -482,6 +498,23 @@ fn negamax_it(
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let gives_check = applied.board().checkers().popcnt() > 0;
         let is_pv_move = move_idx == 0; // treat first move as PV
+
+        if let Some(stand_pat) = static_eval_for_futility {
+            if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH
+                && !is_capture
+                && !gives_check
+                && !is_pv_move
+                && alpha != NEG_INFINITY
+                && beta != POS_INFINITY
+                && !is_mate_score(alpha)
+            {
+                let margin = futility_margin(rem_depth);
+                if stand_pat + margin <= alpha {
+                    move_idx += 1;
+                    continue;
+                }
+            }
+        }
 
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
         let apply_lmr =
