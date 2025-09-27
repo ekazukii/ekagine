@@ -178,7 +178,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.15.0");
+                send_message(&mut stdout, "id name Ekagine-v1.15.1");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }
@@ -228,7 +228,7 @@ fn uci_loop() {
                 );
 
                 let max_ply = 100;
-                let (best_mv, _best_score) = best_move_interruptible(
+                let outcome = best_move_interruptible(
                     &board,
                     time_budget,
                     99,
@@ -236,7 +236,7 @@ fn uci_loop() {
                     &mut transpo_table,
                     Some(&mut stdout),
                 );
-                if let Some(mv) = best_mv {
+                if let Some(mv) = outcome.best_move {
                     send_message(&mut stdout, format!("bestmove {}", mv).as_str());
                 } else {
                     send_message(&mut stdout, "info string move is none wtf");
@@ -371,7 +371,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         EVAL_COUNT.store(0, Ordering::Relaxed);
         CACHE_COUNT.store(0, Ordering::Relaxed);
 
-        let (res, duration) = time_fn(|| {
+        let (outcome, duration) = time_fn(|| {
             let mut repetition_table: RepetitionTable = HashMap::new();
             let mut transpo_table = TranspositionTable::new();
             best_move_interruptible(
@@ -389,8 +389,8 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         cache_counts.push(CACHE_COUNT.load(Ordering::Relaxed));
         depth_counts.push(DEPTH_COUNT.load(Ordering::Relaxed));
 
-        if let (Some(_mv), best_score) = res {
-            scores.push((best_score, *val));
+        if let Some(_mv) = outcome.best_move {
+            scores.push((outcome.score, *val));
         }
     }
 
@@ -437,14 +437,14 @@ pub fn compute_best_from_fen(
     let mut repetition_table: HashMap<u64, usize> = HashMap::new();
     repetition_table.insert(board.get_hash(), 1);
 
-    let (best_mv, score) = best_move_using_iterative_deepening(
+    let outcome = best_move_using_iterative_deepening(
         &board,
         max_depth,
         &mut transpo_table,
         &mut repetition_table,
     );
 
-    Ok((best_mv, score))
+    Ok((outcome.best_move, outcome.score))
 }
 
 fn main() {
