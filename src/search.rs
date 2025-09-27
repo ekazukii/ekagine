@@ -242,6 +242,8 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     [0, 0, 0, 0, 0, 0],
 ];
 
+const ASPIRATION_START_WINDOW: i32 = 50;
+
 #[inline]
 fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
     // En passant is a pawn move to the ep square capturing a pawn that isn't on dest.
@@ -582,20 +584,40 @@ fn negamax_it(
     SearchScore::EVAL(best_value)
 }
 
-/// This function must be called at the beginning of a search, it is a wrapper over negamax_it that
-/// handle the printing the PV to the UCI at each depth.
-fn root_search(
+struct RootSearchResult {
+    best_move: Option<ChessMove>,
+    score: i32,
+    fail_low: bool,
+    fail_high: bool,
+    aborted: bool,
+}
+
+/// Execute one root search at a fixed depth using the provided aspiration window.
+/// Returns the best move found, the score, and flags indicating fail-high/low outcomes.
+fn root_search_with_window(
     board: &Board,
     max_depth: usize,
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
     pv_table: &mut PVTable,
     stop: &StopFlag,
-) -> (Option<ChessMove>, i32) {
-    let mut alpha = NEG_INFINITY;
-    let mut beta = POS_INFINITY;
+    alpha_start: i32,
+    beta_start: i32,
+) -> RootSearchResult {
+    let mut alpha = alpha_start;
+    let mut beta = beta_start;
+
+    if alpha >= beta {
+        alpha = NEG_INFINITY;
+        beta = POS_INFINITY;
+    }
+
+    let alpha_orig = alpha_start;
+    let beta_orig = beta_start;
+
     let mut best_value = NEG_INFINITY;
     let mut best_move = None;
+    let mut aborted = false;
     let color = if board.side_to_move() == Color::White {
         1
     } else {
@@ -606,6 +628,7 @@ fn root_search(
 
     for mv in ordered_moves(board, pv_table, transpo_table, 0) {
         if should_stop(stop) {
+            aborted = true;
             break;
         }
 
@@ -645,6 +668,7 @@ fn root_search(
             SearchScore::CANCELLED => {
                 // Ensure we revert repetition count when aborting
                 board_pop(&new_board, repetition_table);
+                aborted = true;
                 break;
             }
             SearchScore::EVAL(v) => {
@@ -679,8 +703,82 @@ fn root_search(
         pv_table.insert(board.get_hash(), best_move.unwrap());
     }
 
-    //(best_move, best_value * color)
-    (best_move, best_value)
+    let fail_low = !aborted
+        && best_move.is_some()
+        && alpha_orig != NEG_INFINITY
+        && alpha_orig < beta_orig
+        && best_value <= alpha_orig;
+    let fail_high = !aborted
+        && best_move.is_some()
+        && beta_orig != POS_INFINITY
+        && alpha_orig < beta_orig
+        && best_value >= beta_orig;
+
+    RootSearchResult {
+        best_move,
+        score: best_value,
+        fail_low,
+        fail_high,
+        aborted,
+    }
+}
+
+fn aspiration_root_search(
+    board: &Board,
+    max_depth: usize,
+    transpo_table: &mut TranspositionTable,
+    repetition_table: &mut RepetitionTable,
+    pv_table: &mut PVTable,
+    stop: &StopFlag,
+    prev_score: Option<i32>,
+) -> RootSearchResult {
+    if prev_score.is_none() {
+        return root_search_with_window(
+            board,
+            max_depth,
+            transpo_table,
+            repetition_table,
+            pv_table,
+            stop,
+            NEG_INFINITY,
+            POS_INFINITY,
+        );
+    }
+
+    let mut delta = ASPIRATION_START_WINDOW;
+    let guess = prev_score.unwrap();
+
+    loop {
+        let alpha = guess.saturating_sub(delta).max(NEG_INFINITY);
+        let beta = guess.saturating_add(delta).min(POS_INFINITY);
+
+        let result = root_search_with_window(
+            board,
+            max_depth,
+            transpo_table,
+            repetition_table,
+            pv_table,
+            stop,
+            alpha,
+            beta,
+        );
+
+        if result.aborted {
+            return result;
+        }
+
+        if result.fail_low && alpha > NEG_INFINITY {
+            delta = delta.saturating_mul(2);
+            continue;
+        }
+
+        if result.fail_high && beta < POS_INFINITY {
+            delta = delta.saturating_mul(2);
+            continue;
+        }
+
+        return result;
+    }
 }
 
 /// Compute the best move of a board from a depth limit
@@ -695,19 +793,25 @@ pub fn best_move_using_iterative_deepening(
     let mut final_best_move = None;
     let mut final_best_score = 0;
     let stop = Arc::new(AtomicBool::new(false));
+    let mut prev_score: Option<i32> = None;
 
     for depth in 1..=max_depth {
-        let (bm, score) = root_search(
+        let result = aspiration_root_search(
             board,
             depth,
             transpo_table,
             repetition_table,
             &mut pv_table,
             &stop,
+            prev_score,
         );
-        if bm.is_some() {
-            final_best_move = bm;
-            final_best_score = score;
+        if result.aborted {
+            break;
+        }
+        if let Some(bm) = result.best_move {
+            final_best_move = Some(bm);
+            final_best_score = result.score;
+            prev_score = Some(result.score);
         }
     }
 
@@ -748,25 +852,31 @@ pub fn best_move_interruptible(
     let mut depth = 1;
     let mut best_move = None;
     let mut best_score = 0;
+    let mut prev_score: Option<i32> = None;
 
     EVAL_COUNT.store(0, Ordering::Relaxed);
     DEPTH_COUNT.store(0, Ordering::Relaxed);
 
     while depth <= max_depth_cap && !should_stop(&stop) {
-        let (bm, score) = root_search(
+        let result = aspiration_root_search(
             board,
             depth,
             transpo_table,
             &mut repetition_table,
             &mut pv_table,
             &stop,
+            prev_score,
         );
-
-        if bm.is_some() {
-            best_move = bm;
-            best_score = score;
+        if let Some(bm) = result.best_move {
+            best_move = Some(bm);
+            best_score = result.score;
+            prev_score = Some(result.score);
         }
         DEPTH_COUNT.store(depth, Ordering::Relaxed);
+
+        if result.aborted {
+            break;
+        }
 
         if should_stop(&stop) {
             break;
