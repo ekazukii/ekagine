@@ -1,14 +1,12 @@
 use crate::eval::eval_board;
 use crate::{
-    board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTEntry, TTFlag,
+    board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTFlag,
     TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY,
     QUIESCE_REMAIN,
 };
 use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
-use std::collections::{hash_map::Entry, HashMap};
 use std::io::Stdout;
 use std::marker::PhantomData;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -178,30 +176,14 @@ fn cache_eval(
         return 0;
     }
     let zob = board.get_hash();
-    if let Some(entry) = transpo_table.get(&zob) {
+    if let Some(entry) = transpo_table.probe(zob) {
         if let Some(cached) = entry.eval {
             CACHE_COUNT.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
     }
     let val = eval_board(board);
-    match transpo_table.entry(zob) {
-        Entry::Occupied(mut occ) => {
-            let e = occ.get_mut();
-            if e.eval.is_none() {
-                e.eval = Some(val);
-            }
-        }
-        Entry::Vacant(v) => {
-            v.insert(TTEntry {
-                depth: -1,
-                score: 0,
-                flag: TTFlag::Exact,
-                best_move: None,
-                eval: Some(val),
-            });
-        }
-    }
+    transpo_table.store_eval(zob, val);
     val
 }
 
@@ -361,7 +343,7 @@ fn ordered_moves(
 
     let zob = board.get_hash();
     // Promote TT move first if present
-    if let Some(tt_mv) = tt.get(&zob).and_then(|e| e.best_move.as_ref().cloned()) {
+    if let Some(tt_mv) = tt.probe(zob).and_then(|e| e.best_move) {
         if let Some(pos) = moves.iter().position(|m| *m == tt_mv) {
             let mv = moves.remove(pos);
             moves.insert(0, mv);
@@ -431,7 +413,7 @@ fn negamax_it(
     // Probe TT for cutoff
     let rem_depth: i16 = max_depth.saturating_sub(depth) as i16;
     let zob = board.get_hash();
-    if let Some(entry) = transpo_table.get(&zob) {
+    if let Some(entry) = transpo_table.probe(zob) {
         // Only keep if entry depth is same or higher to avoid pruning from not fully search position
         if entry.depth >= rem_depth {
             let tt_score = tt_score_on_load(entry.score, ply_from_root);
@@ -599,17 +581,8 @@ fn negamax_it(
         TTFlag::Exact
     };
     let stored = tt_score_on_store(best_value, ply_from_root);
-    let prev_eval = transpo_table.get(&zob).and_then(|e| e.eval);
-    transpo_table.insert(
-        zob,
-        TTEntry {
-            depth: rem_depth,
-            score: stored,
-            flag: bound,
-            best_move: best_move_opt,
-            eval: prev_eval,
-        },
-    );
+    let prev_eval = transpo_table.probe(zob).and_then(|e| e.eval);
+    transpo_table.store(zob, rem_depth, stored, bound, best_move_opt, prev_eval);
 
     SearchScore::EVAL(best_value)
 }
@@ -851,6 +824,8 @@ where
             break;
         }
 
+        transpo_table.bump_generation();
+
         let result = aspiration_root_search(
             board,
             depth,
@@ -892,7 +867,7 @@ pub fn best_move_using_iterative_deepening(
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
 ) -> (Option<ChessMove>, i32) {
-    let mut pv_table: PVTable = HashMap::new();
+    let mut pv_table: PVTable = PVTable::default();
     let stop = Arc::new(AtomicBool::new(false));
 
     iterative_deepening_loop(

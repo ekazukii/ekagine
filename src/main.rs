@@ -42,7 +42,13 @@ pub enum TTFlag {
     Upper,
 }
 
-#[derive(Clone, Debug)]
+impl Default for TTFlag {
+    fn default() -> Self {
+        TTFlag::Exact
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TTEntry {
     pub depth: i16,                   // remaining depth at store time
     pub score: i32,                   // score (mate scores are ply-adjusted)
@@ -51,7 +57,207 @@ pub struct TTEntry {
     pub eval: Option<i32>,            // cached static eval (for stand-pat)
 }
 
-type TranspositionTable = HashMap<u64, TTEntry>;
+const TT_BUCKET_SIZE: usize = 4;
+const TT_DEFAULT_MB: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TTSlot {
+    key: u64,
+    entry: TTEntry,
+    generation: u8,
+    is_pv: bool,
+    used: bool,
+}
+
+/// We use a transposition table with a bucket in an attempt to making an hashmap that would
+/// Hash a second time the unique zobrist key
+///
+/// To avoid that we implement the table making sure that
+pub struct TranspositionTable {
+    buckets: Vec<[TTSlot; TT_BUCKET_SIZE]>,
+    mask: usize,
+    generation: u8,
+}
+
+impl TranspositionTable {
+    pub fn new() -> Self {
+        Self::with_mb(TT_DEFAULT_MB)
+    }
+
+    pub fn with_mb(size_mb: usize) -> Self {
+        let bytes_per_bucket = TT_BUCKET_SIZE * std::mem::size_of::<TTSlot>();
+        let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_bucket);
+
+        let mut buckets = 1usize;
+        while buckets * bytes_per_bucket < requested_bytes {
+            buckets <<= 1;
+            if buckets == 0 {
+                buckets = 1;
+                break;
+            }
+        }
+
+        let mask = buckets - 1;
+        let mut table = Vec::with_capacity(buckets);
+        for _ in 0..buckets {
+            table.push([TTSlot::default(); TT_BUCKET_SIZE]);
+        }
+
+        Self {
+            buckets: table,
+            mask,
+            generation: 0,
+        }
+    }
+
+    #[inline]
+    fn bucket_index(&self, key: u64) -> usize {
+        (key as usize) & self.mask
+    }
+
+    #[inline]
+    fn bucket(&self, key: u64) -> &[TTSlot; TT_BUCKET_SIZE] {
+        &self.buckets[self.bucket_index(key)]
+    }
+
+    #[inline]
+    fn bucket_mut(&mut self, key: u64) -> &mut [TTSlot; TT_BUCKET_SIZE] {
+        let idx = self.bucket_index(key);
+        &mut self.buckets[idx]
+    }
+
+    pub fn probe(&self, key: u64) -> Option<TTEntry> {
+        for slot in self.bucket(key) {
+            if slot.used && slot.key == key {
+                return Some(slot.entry);
+            }
+        }
+        None
+    }
+
+    pub fn store(
+        &mut self,
+        key: u64,
+        depth: i16,
+        score: i32,
+        flag: TTFlag,
+        best_move: Option<ChessMove>,
+        eval: Option<i32>,
+    ) {
+        let is_pv = flag == TTFlag::Exact;
+        let generation = self.generation;
+        let bucket = self.bucket_mut(key);
+
+        if let Some(slot) = bucket.iter_mut().find(|slot| slot.used && slot.key == key) {
+            let should_replace = depth > slot.entry.depth
+                || (flag == TTFlag::Exact && slot.entry.flag != TTFlag::Exact)
+                || (depth == slot.entry.depth && flag == TTFlag::Exact);
+
+            if should_replace {
+                slot.entry.depth = depth;
+                slot.entry.score = score;
+                slot.entry.flag = flag;
+            }
+
+            if let Some(mv) = best_move {
+                slot.entry.best_move = Some(mv);
+            }
+
+            if let Some(eval_val) = eval {
+                slot.entry.eval = Some(eval_val);
+            }
+
+            slot.generation = generation;
+            slot.is_pv |= is_pv;
+            return;
+        }
+
+        let target_idx = TranspositionTable::select_replacement(bucket, generation, is_pv);
+        let slot = &mut bucket[target_idx];
+        slot.used = true;
+        slot.key = key;
+        slot.entry = TTEntry {
+            depth,
+            score,
+            flag,
+            best_move,
+            eval,
+        };
+        slot.generation = generation;
+        slot.is_pv = is_pv;
+    }
+
+    pub fn store_eval(&mut self, key: u64, eval: i32) {
+        let generation = self.generation;
+        let bucket = self.bucket_mut(key);
+        if let Some(slot) = bucket.iter_mut().find(|slot| slot.used && slot.key == key) {
+            slot.entry.eval = Some(eval);
+            slot.generation = generation;
+            return;
+        }
+
+        let target_idx = TranspositionTable::select_replacement(bucket, generation, false);
+        let slot = &mut bucket[target_idx];
+        slot.used = true;
+        slot.key = key;
+        slot.entry = TTEntry {
+            depth: -1,
+            score: 0,
+            flag: TTFlag::Exact,
+            best_move: None,
+            eval: Some(eval),
+        };
+        slot.generation = generation;
+        slot.is_pv = false;
+    }
+
+    fn select_replacement(
+        bucket: &[TTSlot; TT_BUCKET_SIZE],
+        generation: u8,
+        prefer_pv: bool,
+    ) -> usize {
+        let mut target_idx = 0;
+        let mut best_score = i32::MIN;
+
+        for (i, slot) in bucket.iter().enumerate() {
+            if !slot.used {
+                return i;
+            }
+
+            let age = generation.wrapping_sub(slot.generation) as i32;
+            let depth_penalty = slot.entry.depth.max(0) as i32;
+            let pv_penalty = if slot.is_pv { 48 } else { 0 };
+            let mut score = age * 64 - depth_penalty - pv_penalty;
+
+            if prefer_pv && slot.is_pv {
+                score -= 64;
+            }
+
+            if score > best_score {
+                best_score = score;
+                target_idx = i;
+            }
+        }
+
+        target_idx
+    }
+
+    pub fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            *bucket = [TTSlot::default(); TT_BUCKET_SIZE];
+        }
+    }
+}
+
+impl Default for TranspositionTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 type RepetitionTable = HashMap<u64, usize>;
 type PVTable = HashMap<u64, ChessMove>;
 
@@ -179,7 +385,7 @@ fn uci_loop() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut board = Board::default();
-    let mut transpo_table: TranspositionTable = HashMap::new();
+    let mut transpo_table = TranspositionTable::new();
     let mut repetition_table: RepetitionTable = HashMap::new();
 
     for line in stdin.lock().lines() {
@@ -193,7 +399,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.13.1");
+                send_message(&mut stdout, "id name Ekagine-v1.14.0");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }
@@ -388,7 +594,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
 
         let (res, duration) = time_fn(|| {
             let mut repetition_table: RepetitionTable = HashMap::new();
-            let mut transpo_table: TranspositionTable = HashMap::new();
+            let mut transpo_table = TranspositionTable::new();
             best_move_interruptible(
                 key,
                 Duration::from_millis(100),
@@ -448,7 +654,7 @@ pub fn compute_best_from_fen(
 ) -> Result<(Option<ChessMove>, i32), String> {
     let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
-    let mut transpo_table: TranspositionTable = HashMap::new();
+    let mut transpo_table = TranspositionTable::new();
     let mut repetition_table: HashMap<u64, usize> = HashMap::new();
     repetition_table.insert(board.get_hash(), 1);
 
