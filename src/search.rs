@@ -4,7 +4,7 @@ use crate::{
     TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY,
     QUIESCE_REMAIN,
 };
-use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece};
+use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use std::io::Stdout;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -350,8 +350,8 @@ const FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const FUTILITY_MARGIN_BASE: i32 = 200;
 const FUTILITY_MARGIN_PER_DEPTH: i32 = 150;
 
-const CHECK_EXTENSION: usize = 1;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
+const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
 
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
@@ -370,6 +370,56 @@ fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
         }
     }
     false
+}
+
+#[inline]
+fn is_passed_pawn(board: &Board, square: Square, color: Color) -> bool {
+    let enemy_color = match color {
+        Color::White => Color::Black,
+        Color::Black => Color::White,
+    };
+    let enemy_pawns = *board.pieces(Piece::Pawn) & board.color_combined(enemy_color);
+    let file_idx = square.get_file().to_index() as i32;
+    let rank_idx = square.get_rank().to_index() as i32;
+
+    let mut iter = enemy_pawns;
+    for enemy_sq in &mut iter {
+        let df = enemy_sq.get_file().to_index() as i32 - file_idx;
+        if df.abs() <= 1 {
+            let enemy_rank = enemy_sq.get_rank().to_index() as i32;
+            match color {
+                Color::White if enemy_rank > rank_idx => return false,
+                Color::Black if enemy_rank < rank_idx => return false,
+                _ => {}
+            }
+        }
+    }
+
+    true
+}
+
+#[inline]
+fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
+    if parent.piece_on(mv.get_source()) != Some(Piece::Pawn) {
+        return false;
+    }
+
+    let color_to_move = parent.side_to_move();
+    let dest = mv.get_dest();
+
+    if child.piece_on(dest) != Some(Piece::Pawn) {
+        return false;
+    }
+
+    let target_rank = match color_to_move {
+        Color::White => 6,
+        Color::Black => 1,
+    };
+    if dest.get_rank().to_index() != target_rank {
+        return false;
+    }
+
+    is_passed_pawn(child, dest, color_to_move)
 }
 
 /// This functions orders the move over multiple criteria so that the best probable moves are ordered
@@ -590,12 +640,18 @@ fn negamax_it(
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let gives_check = applied.board().checkers().popcnt() > 0;
         let is_pv_move = move_idx == 0; // treat first move as PV
-        let extension = if gives_check && rem_depth <= CHECK_EXTENSION_DEPTH_LIMIT && rem_depth > 0
+
+        // Search extension
+        let mut extension = 0;
+        if gives_check && rem_depth <= CHECK_EXTENSION_DEPTH_LIMIT && rem_depth > 0 {
+            extension = 1;
+        } else if rem_depth <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
+            && rem_depth > 0
+            //TODO: Maybe add an endgame closeness to trigger the is_passed_pawn_push call (can be computed at the root and just be passed bellow)
+            && is_passed_pawn_push(board, applied.board(), mv)
         {
-            CHECK_EXTENSION
-        } else {
-            0
-        };
+            extension = 1;
+        }
 
         if let Some(stand_pat) = static_eval_for_futility {
             if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH
