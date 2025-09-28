@@ -4,7 +4,11 @@ use crate::{
     TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY,
     QUIESCE_REMAIN,
 };
-use chess::{Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
+use chess::{
+    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
+    BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
+};
+use std::cmp;
 use std::io::Stdout;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,6 +214,9 @@ fn quiesce_negamax_it(
         if board.piece_on(mv.get_dest()).is_none() && !is_en_passant_capture(board, mv) {
             continue;
         }
+        if static_exchange_eval(board, mv) < 0 {
+            continue;
+        }
         let new_board = board_do_move(board, mv, repetition_table);
         let score = -quiesce_negamax_it(
             &new_board,
@@ -367,6 +374,226 @@ fn futility_margin(depth: i16) -> i32 {
 fn reverse_futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
     FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth
+}
+
+const PIECE_ORDER: [Piece; 6] = [
+    Piece::Pawn,
+    Piece::Knight,
+    Piece::Bishop,
+    Piece::Rook,
+    Piece::Queen,
+    Piece::King,
+];
+
+#[inline]
+fn opposite_color(color: Color) -> Color {
+    match color {
+        Color::White => Color::Black,
+        Color::Black => Color::White,
+    }
+}
+
+#[inline]
+fn piece_value(piece: Piece) -> i32 {
+    match piece {
+        Piece::Pawn => 100,
+        Piece::Knight => 300,
+        Piece::Bishop => 300,
+        Piece::Rook => 500,
+        Piece::Queen => 900,
+        Piece::King => 10_000,
+    }
+}
+
+#[inline]
+fn pawn_attackers_to(square: Square, pawns: BitBoard, color: Color) -> BitBoard {
+    let mut attackers = BitBoard::new(0);
+    match color {
+        Color::White => {
+            if let Some(down) = square.down() {
+                if let Some(left) = down.left() {
+                    let bb = BitBoard::from_square(left);
+                    if (pawns & bb).0 != 0 {
+                        attackers |= bb;
+                    }
+                }
+                if let Some(right) = down.right() {
+                    let bb = BitBoard::from_square(right);
+                    if (pawns & bb).0 != 0 {
+                        attackers |= bb;
+                    }
+                }
+            }
+        }
+        Color::Black => {
+            if let Some(up) = square.up() {
+                if let Some(left) = up.left() {
+                    let bb = BitBoard::from_square(left);
+                    if (pawns & bb).0 != 0 {
+                        attackers |= bb;
+                    }
+                }
+                if let Some(right) = up.right() {
+                    let bb = BitBoard::from_square(right);
+                    if (pawns & bb).0 != 0 {
+                        attackers |= bb;
+                    }
+                }
+            }
+        }
+    }
+    attackers
+}
+
+fn compute_attackers_to(
+    square: Square,
+    occ: BitBoard,
+    piece_bb: &[[BitBoard; 6]; 2],
+) -> [BitBoard; 2] {
+    let mut attackers = [BitBoard::new(0); 2];
+
+    for color in [Color::White, Color::Black] {
+        let idx = color.to_index();
+        let pawns = piece_bb[idx][Piece::Pawn.to_index() as usize];
+        let knights = piece_bb[idx][Piece::Knight.to_index() as usize];
+        let bishops = piece_bb[idx][Piece::Bishop.to_index() as usize];
+        let rooks = piece_bb[idx][Piece::Rook.to_index() as usize];
+        let queens = piece_bb[idx][Piece::Queen.to_index() as usize];
+        let kings = piece_bb[idx][Piece::King.to_index() as usize];
+
+        let mut attack = BitBoard::new(0);
+        attack |= pawn_attackers_to(square, pawns, color);
+        attack |= get_knight_moves(square) & knights;
+        attack |= get_bishop_moves(square, occ) & (bishops | queens);
+        attack |= get_rook_moves(square, occ) & (rooks | queens);
+        attack |= get_king_moves(square) & kings;
+        attackers[idx] = attack;
+    }
+
+    attackers
+}
+
+fn select_least_valuable_attacker(
+    color_idx: usize,
+    attack_mask: BitBoard,
+    piece_bb: &[[BitBoard; 6]; 2],
+) -> Option<(Piece, Square)> {
+    for piece in PIECE_ORDER.iter() {
+        let idx = piece.to_index() as usize;
+        let candidates = piece_bb[color_idx][idx] & attack_mask;
+        if candidates.0 != 0 {
+            let sq = candidates.to_square();
+            return Some((*piece, sq));
+        }
+    }
+    None
+}
+
+fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
+    let from = mv.get_source();
+    let to = mv.get_dest();
+
+    let moving_piece = match board.piece_on(from) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let captured_piece = if is_en_passant_capture(board, mv) {
+        Some(Piece::Pawn)
+    } else {
+        board.piece_on(to)
+    };
+    if captured_piece.is_none() {
+        return 0;
+    }
+    let captured_piece = captured_piece.unwrap();
+
+    let mut occ = *board.combined();
+    let mut piece_bb = [[BitBoard::new(0); 6]; 2];
+    for piece in PIECE_ORDER.iter() {
+        let idx = piece.to_index() as usize;
+        let bb = *board.pieces(*piece);
+        piece_bb[Color::White.to_index()][idx] = bb & *board.color_combined(Color::White);
+        piece_bb[Color::Black.to_index()][idx] = bb & *board.color_combined(Color::Black);
+    }
+
+    let us = board.side_to_move();
+    let them = opposite_color(us);
+    let us_idx = us.to_index();
+    let them_idx = them.to_index();
+
+    let from_bb = BitBoard::from_square(from);
+    let to_bb = BitBoard::from_square(to);
+
+    // Remove moving piece from its origin square
+    piece_bb[us_idx][moving_piece.to_index() as usize] &= !from_bb;
+    occ &= !from_bb;
+
+    // Remove captured piece
+    if is_en_passant_capture(board, mv) {
+        if let Some(capture_sq) = to.backward(us) {
+            let cap_bb = BitBoard::from_square(capture_sq);
+            piece_bb[them_idx][Piece::Pawn.to_index() as usize] &= !cap_bb;
+            occ &= !cap_bb;
+        }
+    } else {
+        piece_bb[them_idx][captured_piece.to_index() as usize] &= !to_bb;
+        occ &= !to_bb;
+    }
+
+    // Place moving piece on the destination square (handle promotion)
+    let mut current_piece = mv.get_promotion().unwrap_or(moving_piece);
+    piece_bb[us_idx][current_piece.to_index() as usize] |= to_bb;
+    occ |= to_bb;
+
+    let mut gain = [0i32; 32];
+    gain[0] = piece_value(captured_piece);
+
+    let mut attackers = compute_attackers_to(to, occ, &piece_bb);
+    let mut depth = 0usize;
+    let mut side_idx = them_idx;
+
+    while depth < gain.len() - 1 {
+        let attack_mask = attackers[side_idx] & occ;
+        if attack_mask.0 == 0 {
+            break;
+        }
+
+        depth += 1;
+        let captured_value = piece_value(current_piece);
+
+        let (att_piece, att_square) =
+            match select_least_valuable_attacker(side_idx, attack_mask, &piece_bb) {
+                Some(v) => v,
+                None => break,
+            };
+
+        gain[depth] = captured_value - gain[depth - 1];
+        if gain[depth] < 0 {
+            break;
+        }
+
+        let captured_side_idx = 1 - side_idx;
+        piece_bb[captured_side_idx][current_piece.to_index() as usize] &= !to_bb;
+        occ &= !to_bb;
+
+        let att_bb = BitBoard::from_square(att_square);
+        piece_bb[side_idx][att_piece.to_index() as usize] &= !att_bb;
+        occ &= !att_bb;
+
+        piece_bb[side_idx][att_piece.to_index() as usize] |= to_bb;
+        occ |= to_bb;
+
+        current_piece = att_piece;
+        attackers = compute_attackers_to(to, occ, &piece_bb);
+        side_idx ^= 1;
+    }
+
+    while depth > 0 {
+        gain[depth - 1] = -cmp::max(-gain[depth - 1], gain[depth]);
+        depth -= 1;
+    }
+
+    gain[0]
 }
 
 #[inline]
@@ -1184,4 +1411,25 @@ pub fn best_move_interruptible(
     }
 
     SearchOutcome::new(best_move, best_score, stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn see_favorable_capture() {
+        let board = Board::from_str("k7/3p4/8/8/8/8/3R4/7K w - - 0 1").expect("valid FEN");
+        let mv = ChessMove::new(Square::D2, Square::D7, None);
+        assert!(static_exchange_eval(&board, mv) > 0);
+    }
+
+    #[test]
+    fn see_unfavorable_capture() {
+        let board = Board::from_str("k7/8/4p3/3p4/8/8/8/3Q3K w - - 0 1").expect("valid FEN");
+        let mv = ChessMove::new(Square::D1, Square::D5, None);
+        let see = static_exchange_eval(&board, mv);
+        assert!(see < 0, "expected SEE < 0, got {}", see);
+    }
 }
