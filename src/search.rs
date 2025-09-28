@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
+use smallvec::SmallVec;
+
 
 /* For reference
 type TranspositionTable = HashMap<u64, i32>;
@@ -664,7 +666,7 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
 /// This function is meant to be the base sorter used by the quiesce search and the base of the ordering
 /// for the "classic search"
 fn sort_moves(board: &Board) -> Vec<ChessMove> {
-    let mut scored_moves: Vec<(ChessMove, u8)> = Vec::new();
+    let mut scored_moves: SmallVec<[(ChessMove, u8); 64]> = SmallVec::new();
 
     for mv in MoveGen::new_legal(board) {
         let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
