@@ -6,6 +6,7 @@
 mod eval;
 mod search;
 mod tt;
+mod movegen;
 
 use crate::search::{
     best_move_interruptible, best_move_using_iterative_deepening, uci_score_string,
@@ -158,7 +159,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.19.1");
+                send_message(&mut stdout, "id name Ekagine-v1.19.2");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }

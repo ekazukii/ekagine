@@ -16,8 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
 use smallvec::SmallVec;
-
-
+use crate::movegen::IncrementalMoveGen;
 /* For reference
 type TranspositionTable = HashMap<u64, i32>;
 type RepetitionTable    = HashMap<u64, usize>;
@@ -700,25 +699,39 @@ fn ordered_moves(
     tt: &TranspositionTable,
     _depth: usize,
 ) -> Vec<ChessMove> {
-    let mut moves = sort_moves(board);
+    let mut scored_moves: SmallVec<[(ChessMove, i32); 64]> = SmallVec::new();
 
     let zob = board.get_hash();
-    // Promote TT move first if present
-    if let Some(tt_mv) = tt.probe(zob).and_then(|e| e.best_move) {
-        if let Some(pos) = moves.iter().position(|m| *m == tt_mv) {
-            let mv = moves.remove(pos);
-            moves.insert(0, mv);
-        }
-    }
-    // Then promote PV move (if different from TT move)
-    if let Some(pv_mv) = pv_table.get(&zob) {
-        if let Some(pos) = moves.iter().position(|m| m == pv_mv) {
-            let mv = moves.remove(pos);
-            moves.insert(0, mv);
-        }
+    let mut tt_mv= tt.probe(zob).and_then(|e| e.best_move);
+    let mut pv_mv = pv_table.get(&zob);
+
+    for mv in MoveGen::new_legal(board) {
+        let score = if pv_mv.is_some() && pv_mv == Some(&mv) {
+            pv_mv = None;
+            70
+        } else if tt_mv.is_some() && tt_mv == Some(mv) {
+            tt_mv = None;
+            65
+        } else if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
+            // It's a capture; find the attacker piece type
+            if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+                let victim_idx = victim_piece.to_index() as usize;
+                let attacker_idx = attacker_piece.to_index() as usize;
+                MVV_LVA_TABLE[victim_idx][attacker_idx] as i32
+            } else {
+                0
+            }
+        } else if is_en_passant_capture(board, mv) {
+            25
+        } else {
+            0
+        };
+
+        scored_moves.push((mv, score));
     }
 
-    moves
+    scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -873,9 +886,11 @@ fn negamax_it(
         None
     };
 
+    let incremental_move_gen = IncrementalMoveGen::new(board, pv_table, transpo_table);
+
     // Start the main search
     let mut move_idx: usize = 0;
-    for mv in ordered_moves(board, pv_table, transpo_table, depth) {
+    for mv in incremental_move_gen {
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
 
         // Determine properties for LMR conditions
