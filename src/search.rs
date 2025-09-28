@@ -36,6 +36,7 @@ pub struct SearchStats {
     pub beta_cutoffs_quiescence: u64,
     pub null_move_prunes: u64,
     pub futility_prunes: u64,
+    pub reverse_futility_prunes: u64,
     pub lmr_researches: u64,
 }
 
@@ -54,13 +55,16 @@ impl SearchStats {
                 .saturating_sub(other.beta_cutoffs_quiescence),
             null_move_prunes: self.null_move_prunes.saturating_sub(other.null_move_prunes),
             futility_prunes: self.futility_prunes.saturating_sub(other.futility_prunes),
+            reverse_futility_prunes: self
+                .reverse_futility_prunes
+                .saturating_sub(other.reverse_futility_prunes),
             lmr_researches: self.lmr_researches.saturating_sub(other.lmr_researches),
         }
     }
 
     fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} lmr_retry={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -71,6 +75,7 @@ impl SearchStats {
             self.beta_cutoffs_quiescence,
             self.null_move_prunes,
             self.futility_prunes,
+            self.reverse_futility_prunes,
             self.lmr_researches,
         )
     }
@@ -347,6 +352,7 @@ const ASPIRATION_START_WINDOW: i32 = 50;
 const FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const FUTILITY_MARGIN_BASE: i32 = 200;
 const FUTILITY_MARGIN_PER_DEPTH: i32 = 150;
+const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
@@ -355,6 +361,12 @@ const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
 fn futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
     FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth.saturating_sub(1)
+}
+
+#[inline]
+fn reverse_futility_margin(depth: i16) -> i32 {
+    let depth = depth as i32;
+    FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth
 }
 
 #[inline]
@@ -606,8 +618,28 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
-    let static_eval_for_futility = if !in_check && rem_depth <= FUTILITY_PRUNE_MAX_DEPTH {
+    let static_eval = if !in_check && rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
         Some(color * cache_eval(board, transpo_table, repetition_table))
+    } else {
+        None
+    };
+
+    if let Some(stand_pat) = static_eval {
+        if rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
+            && alpha != NEG_INFINITY
+            && beta != POS_INFINITY
+            && beta <= alpha.saturating_add(1)
+            && !is_mate_score(beta)
+            && !is_mate_score(stand_pat)
+            && stand_pat.saturating_sub(reverse_futility_margin(rem_depth)) >= beta
+        {
+            stats.reverse_futility_prunes += 1;
+            return SearchScore::EVAL(beta);
+        }
+    }
+
+    let static_eval_for_futility = if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH {
+        static_eval
     } else {
         None
     };
