@@ -67,7 +67,6 @@ fn board_pop(board: &Board, repetition_table: &mut RepetitionTable) {
     }
 }
 
-
 fn send_message(stdout: &mut Stdout, message: &str) {
     writeln!(stdout, "{}", message.clone()).unwrap();
 }
@@ -159,7 +158,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.17.1");
+                send_message(&mut stdout, "id name Ekagine-v1.17.2");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }

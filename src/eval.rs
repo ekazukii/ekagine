@@ -138,37 +138,27 @@ const KING_MOBILITY_WEIGHT: i32 = 2;
 /// pieces in the board, the progress is weighted so that if more important pieces are missing
 /// it advance more into the game
 fn endgame_progress(board: &Board) -> i32 {
-    let white_pawns = (*board.pieces(Piece::Pawn) & board.color_combined(Color::White))
-        .into_iter()
-        .count() as i32;
-    let white_knights = (*board.pieces(Piece::Knight) & board.color_combined(Color::White))
-        .into_iter()
-        .count() as i32;
-    let white_bishops = (*board.pieces(Piece::Bishop) & board.color_combined(Color::White))
-        .into_iter()
-        .count() as i32;
-    let white_rooks = (*board.pieces(Piece::Rook) & board.color_combined(Color::White))
-        .into_iter()
-        .count() as i32;
-    let white_queens = (*board.pieces(Piece::Queen) & board.color_combined(Color::White))
-        .into_iter()
-        .count() as i32;
+    let white_pawns =
+        (*board.pieces(Piece::Pawn) & board.color_combined(Color::White)).popcnt() as i32;
+    let white_knights =
+        (*board.pieces(Piece::Knight) & board.color_combined(Color::White)).popcnt() as i32;
+    let white_bishops =
+        (*board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() as i32;
+    let white_rooks =
+        (*board.pieces(Piece::Rook) & board.color_combined(Color::White)).popcnt() as i32;
+    let white_queens =
+        (*board.pieces(Piece::Queen) & board.color_combined(Color::White)).popcnt() as i32;
 
-    let black_pawns = (*board.pieces(Piece::Pawn) & board.color_combined(Color::Black))
-        .into_iter()
-        .count() as i32;
-    let black_knights = (*board.pieces(Piece::Knight) & board.color_combined(Color::Black))
-        .into_iter()
-        .count() as i32;
-    let black_bishops = (*board.pieces(Piece::Bishop) & board.color_combined(Color::Black))
-        .into_iter()
-        .count() as i32;
-    let black_rooks = (*board.pieces(Piece::Rook) & board.color_combined(Color::Black))
-        .into_iter()
-        .count() as i32;
-    let black_queens = (*board.pieces(Piece::Queen) & board.color_combined(Color::Black))
-        .into_iter()
-        .count() as i32;
+    let black_pawns =
+        (*board.pieces(Piece::Pawn) & board.color_combined(Color::Black)).popcnt() as i32;
+    let black_knights =
+        (*board.pieces(Piece::Knight) & board.color_combined(Color::Black)).popcnt() as i32;
+    let black_bishops =
+        (*board.pieces(Piece::Bishop) & board.color_combined(Color::Black)).popcnt() as i32;
+    let black_rooks =
+        (*board.pieces(Piece::Rook) & board.color_combined(Color::Black)).popcnt() as i32;
+    let black_queens =
+        (*board.pieces(Piece::Queen) & board.color_combined(Color::Black)).popcnt() as i32;
 
     let white_material = white_pawns * PAWN_BASE_VAL
         + white_knights * KNIGHT_BASE_VAL
@@ -306,18 +296,42 @@ fn forward_squares_mask(sq: Square, color: Color, file: File) -> BitBoard {
     mask
 }
 
+fn build_passed_masks(color: Color) -> [BitBoard; 64] {
+    let mut masks = [BitBoard::new(0); 64];
+
+    for rank_idx in 0..8 {
+        for file_idx in 0..8 {
+            let square =
+                Square::make_square(Rank::from_index(rank_idx), File::from_index(file_idx));
+            let mut mask = BitBoard::new(0);
+            for df in -1..=1 {
+                let target_file = file_idx as i32 + df;
+                if (0..8).contains(&target_file) {
+                    mask |=
+                        forward_squares_mask(square, color, File::from_index(target_file as usize));
+                }
+            }
+            masks[square.to_index()] = mask;
+        }
+    }
+
+    masks
+}
+
+lazy_static::lazy_static! {
+    static ref PASSED_MASK_WHITE: [BitBoard; 64] = build_passed_masks(Color::White);
+    static ref PASSED_MASK_BLACK: [BitBoard; 64] = build_passed_masks(Color::Black);
+}
+
 fn passed_pawn_eval(pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
     let mut score = 0;
     let mut pawns_iter = pawns;
     for sq in &mut pawns_iter {
-        let file_idx = sq.get_file().to_index() as i8;
-        let mut mask = BitBoard::new(0);
-        for df in -1..=1 {
-            let target_file_idx = file_idx + df;
-            if (0..8).contains(&target_file_idx) {
-                mask |= forward_squares_mask(sq, color, File::from_index(target_file_idx as usize));
-            }
-        }
+        let mask = match color {
+            Color::White => PASSED_MASK_WHITE[sq.to_index()],
+            Color::Black => PASSED_MASK_BLACK[sq.to_index()],
+        };
+
         if (mask & enemy_pawns).popcnt() == 0 {
             let advancement = match color {
                 Color::White => sq.get_rank().to_index() as i32,
