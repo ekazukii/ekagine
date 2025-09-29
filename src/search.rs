@@ -43,6 +43,8 @@ pub struct SearchStats {
     pub futility_prunes: u64,
     pub reverse_futility_prunes: u64,
     pub lmr_researches: u64,
+    pub incremental_move_gen_inits: u64,
+    pub incremental_move_gen_capture_lists: u64,
 }
 
 impl SearchStats {
@@ -64,12 +66,18 @@ impl SearchStats {
                 .reverse_futility_prunes
                 .saturating_sub(other.reverse_futility_prunes),
             lmr_researches: self.lmr_researches.saturating_sub(other.lmr_researches),
+            incremental_move_gen_inits: self
+                .incremental_move_gen_inits
+                .saturating_sub(other.incremental_move_gen_inits),
+            incremental_move_gen_capture_lists: self
+                .incremental_move_gen_capture_lists
+                .saturating_sub(other.incremental_move_gen_capture_lists),
         }
     }
 
     fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -82,6 +90,8 @@ impl SearchStats {
             self.futility_prunes,
             self.reverse_futility_prunes,
             self.lmr_researches,
+            self.incremental_move_gen_inits,
+            self.incremental_move_gen_capture_lists,
         )
     }
 }
@@ -886,11 +896,15 @@ fn negamax_it(
         None
     };
 
-    let incremental_move_gen = IncrementalMoveGen::new(board, pv_table, transpo_table);
+    stats.incremental_move_gen_inits += 1;
+    let mut incremental_move_gen = IncrementalMoveGen::new(board, pv_table, transpo_table);
 
     // Start the main search
     let mut move_idx: usize = 0;
-    for mv in incremental_move_gen {
+    while let Some(mv) = incremental_move_gen.next() {
+        if incremental_move_gen.take_capture_generation_event() {
+            stats.incremental_move_gen_capture_lists += 1;
+        }
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
 
         // Determine properties for LMR conditions

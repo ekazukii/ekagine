@@ -34,6 +34,7 @@ pub struct IncrementalMoveGen<'a> {
     tt_move: Option<ChessMove>,
     move_buff: SmallVec<[ChessMove; 64]>,
     capt_idx: Option<usize>,
+    capture_gen_pending: bool,
 }
 
 impl<'a> IncrementalMoveGen<'a> {
@@ -46,7 +47,17 @@ impl<'a> IncrementalMoveGen<'a> {
             pv_move: pv_table.get(&zob).copied(),
             tt_move: tt.probe(zob).and_then(|e| e.best_move),
             move_buff: SmallVec::new(),
-            capt_idx: None
+            capt_idx: None,
+            capture_gen_pending: false,
+        }
+    }
+
+    pub fn take_capture_generation_event(&mut self) -> bool {
+        if self.capture_gen_pending {
+            self.capture_gen_pending = false;
+            true
+        } else {
+            false
         }
     }
 }
@@ -97,6 +108,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                 scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 self.move_buff.extend(scored_moves.into_iter().map(|(m, _)| m));
                 self.capt_idx = Some(0);
+                self.capture_gen_pending = true;
             }
 
             if (self.capt_idx.unwrap()) < self.move_buff.len() {
