@@ -1,0 +1,28 @@
+name: Run Curl on PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]  # runs when a PR is created or updated
+
+jobs:
+  run-curl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run curl with secret token
+        run: |
+          curl -X POST "https://api-ssprt.ekazuki.fr/api/tests" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
+            -d "{
+              \"sourceType\": \"PR\",
+              \"repoOwner\": \"ekazukii\",
+              \"repoName\": \"ekagine\",
+              \"baseSha\": \"${{ github.event.pull_request.base.sha }}\",
+              \"headSha\": \"${{ github.event.pull_request.head.sha }}\",
+              \"prNumber\": ${{ github.event.pull_request.number }},
+              \"timeControl\": \"mtime/100\",
+              \"openingsUrl\": \"https://github.com/official-stockfish/books/raw/refs/heads/master/8moves_v3.pgn.zip\",
+              \"targetNGames\": 1200,
+              \"batchSize\": 40,
+              \"sprt\": { \"h0Elo\": 0, \"h1Elo\": 5, \"alpha\": 0.35, \"beta\": 0.35 }
+            }"
