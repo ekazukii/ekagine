@@ -22,8 +22,8 @@ pub const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 enum MoveGenState {
     PrincipalVariation,
     TTStep,
-    Killers,
     Captures,
+    Killers,
     Remaining,
 }
 
@@ -85,10 +85,10 @@ impl Iterator for IncrementalMoveGen<'_> {
 
         if self.state == TTStep {
             if self.tt_move.is_some() && self.tt_move != self.pv_move {
-                self.state = Killers;
+                self.state = Captures;
                 return self.tt_move;
             }
-            self.state = Killers;
+            self.state = Captures;
         }
 
         if self.state == Killers {
@@ -107,7 +107,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                     }
                 }
             }
-            self.state = Captures;
+            self.state = Remaining;
         }
 
         let mut iter = self
@@ -147,7 +147,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                 self.capt_idx = Some(self.capt_idx.unwrap() + 1);
                 return Some(mv);
             } else {
-                self.state = Remaining;
+                self.state = Killers;
                 iter.set_iterator_mask(!EMPTY);
             }
         }
