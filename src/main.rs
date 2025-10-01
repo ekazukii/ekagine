@@ -4,9 +4,9 @@
 // once_cell = "1.18.0"    # for lazy_static
 
 mod eval;
+mod movegen;
 mod search;
 mod tt;
-mod movegen;
 
 use crate::search::{
     best_move_interruptible, best_move_using_iterative_deepening, uci_score_string,

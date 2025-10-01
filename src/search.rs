@@ -1,4 +1,5 @@
 use crate::eval::eval_board;
+use crate::movegen::IncrementalMoveGen;
 use crate::{
     board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTFlag,
     TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY,
@@ -8,6 +9,7 @@ use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
     BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
 };
+use smallvec::SmallVec;
 use std::cmp;
 use std::io::Stdout;
 use std::marker::PhantomData;
@@ -15,8 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
-use smallvec::SmallVec;
-use crate::movegen::IncrementalMoveGen;
 /* For reference
 type TranspositionTable = HashMap<u64, i32>;
 type RepetitionTable    = HashMap<u64, usize>;
@@ -111,6 +111,46 @@ impl SearchOutcome {
             score,
             stats,
         }
+    }
+}
+
+const MAX_KILLER_MOVES: usize = 2;
+
+#[derive(Debug, Clone)]
+struct KillerTable {
+    moves: Vec<[Option<ChessMove>; MAX_KILLER_MOVES]>,
+}
+
+impl KillerTable {
+    fn new(initial_depth: usize) -> Self {
+        let depth = initial_depth.max(1);
+        KillerTable {
+            moves: vec![[None; MAX_KILLER_MOVES]; depth],
+        }
+    }
+
+    fn ensure_capacity(&mut self, ply: usize) {
+        if ply >= self.moves.len() {
+            self.moves.resize(ply + 1, [None; MAX_KILLER_MOVES]);
+        }
+    }
+
+    fn killers_for(&mut self, ply: usize) -> [Option<ChessMove>; MAX_KILLER_MOVES] {
+        self.ensure_capacity(ply);
+        self.moves[ply]
+    }
+
+    fn record(&mut self, ply: usize, mv: ChessMove) {
+        self.ensure_capacity(ply);
+        let entry = &mut self.moves[ply];
+        if entry.iter().any(|existing| *existing == Some(mv)) {
+            if entry[1] == Some(mv) {
+                entry.swap(0, 1);
+            }
+            return;
+        }
+        entry[1] = entry[0];
+        entry[0] = Some(mv);
     }
 }
 
@@ -712,7 +752,7 @@ fn ordered_moves(
     let mut scored_moves: SmallVec<[(ChessMove, i32); 64]> = SmallVec::new();
 
     let zob = board.get_hash();
-    let mut tt_mv= tt.probe(zob).and_then(|e| e.best_move);
+    let mut tt_mv = tt.probe(zob).and_then(|e| e.best_move);
     let mut pv_mv = pv_table.get(&zob);
 
     for mv in MoveGen::new_legal(board) {
@@ -758,6 +798,7 @@ fn negamax_it(
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
     pv_table: &mut PVTable,
+    killers: &mut KillerTable,
     color: i32,
     stop: &StopFlag,
     ply_from_root: i32,
@@ -844,6 +885,7 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 pv_table,
+                killers,
                 -color,
                 stop,
                 ply_from_root + 1,
@@ -897,7 +939,10 @@ fn negamax_it(
     };
 
     stats.incremental_move_gen_inits += 1;
-    let mut incremental_move_gen = IncrementalMoveGen::new(board, pv_table, transpo_table);
+    let ply_index = ply_from_root.max(0) as usize;
+    let killer_moves = killers.killers_for(ply_index);
+    let mut incremental_move_gen =
+        IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves);
 
     // Start the main search
     let mut move_idx: usize = 0;
@@ -959,6 +1004,7 @@ fn negamax_it(
                 transpo_table,
                 rep_table,
                 pv_table,
+                killers,
                 -color,
                 stop,
                 ply_from_root + 1,
@@ -980,6 +1026,7 @@ fn negamax_it(
                             transpo_table,
                             rep_table,
                             pv_table,
+                            killers,
                             -color,
                             stop,
                             ply_from_root + 1,
@@ -1005,6 +1052,7 @@ fn negamax_it(
                 transpo_table,
                 rep_table,
                 pv_table,
+                killers,
                 -color,
                 stop,
                 ply_from_root + 1,
@@ -1021,6 +1069,9 @@ fn negamax_it(
             best_move_opt = Some(mv);
         }
         if value >= beta {
+            if !is_capture && !gives_check {
+                killers.record(ply_index, mv);
+            }
             stats.beta_cutoffs += 1;
             break;
         }
@@ -1131,6 +1182,7 @@ fn root_search_with_window(
         -1
     };
 
+    let mut killer_table = KillerTable::new(max_depth + 4);
     let mut out = io::stdout();
 
     for mv in ordered_moves(board, pv_table, transpo_table, 0) {
@@ -1153,6 +1205,7 @@ fn root_search_with_window(
             transpo_table,
             rep_table,
             pv_table,
+            &mut killer_table,
             -color,
             stop,
             1, // one ply from root after making mv
