@@ -45,6 +45,9 @@ pub struct SearchStats {
     pub lmr_researches: u64,
     pub incremental_move_gen_inits: u64,
     pub incremental_move_gen_capture_lists: u64,
+    pub singular_tests: u64,
+    pub singular_hits: u64,
+    pub singular_verification_nodes: u64,
 }
 
 impl SearchStats {
@@ -72,12 +75,17 @@ impl SearchStats {
             incremental_move_gen_capture_lists: self
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
+            singular_tests: self.singular_tests.saturating_sub(other.singular_tests),
+            singular_hits: self.singular_hits.saturating_sub(other.singular_hits),
+            singular_verification_nodes: self
+                .singular_verification_nodes
+                .saturating_sub(other.singular_verification_nodes),
         }
     }
 
     fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} sing_try={} sing_hit={} sing_nodes={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -92,6 +100,9 @@ impl SearchStats {
             self.lmr_researches,
             self.incremental_move_gen_inits,
             self.incremental_move_gen_capture_lists,
+            self.singular_tests,
+            self.singular_hits,
+            self.singular_verification_nodes,
         )
     }
 }
@@ -415,6 +426,12 @@ const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
 
+const SINGULAR_MIN_DEPTH: i16 = 4;
+const SINGULAR_MARGIN_BASE: i32 = 40;
+const SINGULAR_MARGIN_PER_DEPTH: i32 = 12;
+const SINGULAR_EXTENSION: usize = 1;
+const SINGULAR_REDUCTION: usize = 1;
+
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
@@ -425,6 +442,11 @@ fn futility_margin(depth: i16) -> i32 {
 fn reverse_futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
     FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth
+}
+
+#[inline]
+fn singular_margin(depth: i16) -> i32 {
+    SINGULAR_MARGIN_BASE + SINGULAR_MARGIN_PER_DEPTH * (depth as i32)
 }
 
 const PIECE_ORDER: [Piece; 6] = [
@@ -803,6 +825,9 @@ fn negamax_it(
     stop: &StopFlag,
     ply_from_root: i32,
     stats: &mut SearchStats,
+    forbidden_move: Option<ChessMove>,
+    allow_singular: bool,
+    tt_write: bool,
 ) -> SearchScore {
     // If time budget expired
     if should_stop(stop) {
@@ -842,7 +867,8 @@ fn negamax_it(
     // Probe TT for cutoff
     let rem_depth: i16 = max_depth.saturating_sub(depth) as i16;
     let zob = board.get_hash();
-    if let Some(entry) = transpo_table.probe(zob) {
+    let tt_hit = transpo_table.probe(zob);
+    if let Some(entry) = tt_hit {
         stats.tt_hits += 1;
         // Only keep if entry depth is same or higher to avoid pruning from not fully search position
         if entry.depth >= rem_depth {
@@ -890,6 +916,9 @@ fn negamax_it(
                 stop,
                 ply_from_root + 1,
                 stats,
+                None,
+                allow_singular,
+                true,
             ) {
                 SearchScore::CANCELLED => {
                     board_pop(&nboard, repetition_table);
@@ -902,6 +931,69 @@ fn negamax_it(
                         stats.null_move_prunes += 1;
                         stats.beta_cutoffs += 1;
                         return SearchScore::EVAL(value);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut singular_move: Option<ChessMove> = None;
+    let mut singular_extension_extra: usize = 0;
+    // Singular extension: when the TT best move looks like a fail-high and no other move matches it,
+    // extend its depth by one ply.
+    if allow_singular
+        && !in_check
+        && rem_depth >= SINGULAR_MIN_DEPTH
+        && beta != POS_INFINITY
+        && alpha != NEG_INFINITY
+        && !is_mate_score(beta)
+    {
+        if let Some(entry) = tt_hit {
+            if entry.flag == TTFlag::Lower
+                && entry.depth >= rem_depth.saturating_sub(1)
+                && entry.best_move.is_some()
+            {
+                let tt_score = tt_score_on_load(entry.score, ply_from_root);
+                if tt_score >= beta {
+                    if let Some(tt_mv) = entry.best_move {
+                        stats.singular_tests += 1;
+                        let margin = singular_margin(rem_depth);
+                        let verify_beta = beta - margin;
+                        if verify_beta > alpha && verify_beta > NEG_INFINITY {
+                            let verify_alpha = verify_beta - 1;
+                            let nodes_before = stats.nodes;
+                            match negamax_it(
+                                board,
+                                depth,
+                                max_depth.saturating_sub(SINGULAR_REDUCTION),
+                                verify_alpha,
+                                verify_beta,
+                                transpo_table,
+                                repetition_table,
+                                pv_table,
+                                killers,
+                                color,
+                                stop,
+                                ply_from_root,
+                                stats,
+                                Some(tt_mv),
+                                false,
+                                false,
+                            ) {
+                                SearchScore::CANCELLED => return SearchScore::CANCELLED,
+                                SearchScore::EVAL(v) => {
+                                    let delta_nodes = stats.nodes.saturating_sub(nodes_before);
+                                    stats.singular_verification_nodes = stats
+                                        .singular_verification_nodes
+                                        .saturating_add(delta_nodes);
+                                    if v <= verify_alpha {
+                                        singular_move = Some(tt_mv);
+                                        singular_extension_extra = SINGULAR_EXTENSION;
+                                        stats.singular_hits += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -950,6 +1042,9 @@ fn negamax_it(
         if incremental_move_gen.take_capture_generation_event() {
             stats.incremental_move_gen_capture_lists += 1;
         }
+        if matches!(forbidden_move, Some(fmv) if fmv == mv) {
+            continue;
+        }
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
 
         // Determine properties for LMR conditions
@@ -959,7 +1054,7 @@ fn negamax_it(
         let is_pv_move = move_idx == 0; // treat first move as PV
 
         // Search extension
-        let mut extension = 0;
+        let mut extension: usize = 0;
         if gives_check && rem_depth <= CHECK_EXTENSION_DEPTH_LIMIT && rem_depth > 0 {
             extension = 1;
         } else if rem_depth <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
@@ -968,6 +1063,10 @@ fn negamax_it(
             && is_passed_pawn_push(board, applied.board(), mv)
         {
             extension = 1;
+        }
+
+        if singular_move == Some(mv) {
+            extension = extension.saturating_add(singular_extension_extra);
         }
 
         if let Some(stand_pat) = static_eval_for_futility {
@@ -1009,6 +1108,9 @@ fn negamax_it(
                 stop,
                 ply_from_root + 1,
                 stats,
+                None,
+                allow_singular,
+                true,
             ) {
                 SearchScore::CANCELLED => return SearchScore::CANCELLED,
                 SearchScore::EVAL(vr) => {
@@ -1031,6 +1133,9 @@ fn negamax_it(
                             stop,
                             ply_from_root + 1,
                             stats,
+                            None,
+                            allow_singular,
+                            true,
                         ) {
                             SearchScore::CANCELLED => return SearchScore::CANCELLED,
                             SearchScore::EVAL(vf) => -vf,
@@ -1057,6 +1162,9 @@ fn negamax_it(
                 stop,
                 ply_from_root + 1,
                 stats,
+                None,
+                allow_singular,
+                true,
             ) {
                 SearchScore::CANCELLED => return SearchScore::CANCELLED,
                 SearchScore::EVAL(v) => -v,
@@ -1082,11 +1190,17 @@ fn negamax_it(
         move_idx += 1;
     }
 
-    if best_move_opt.is_some() {
-        pv_table.insert(board.get_hash(), best_move_opt.unwrap());
-    } else {
-        return SearchScore::CANCELLED;
-    }
+    let best_move = match best_move_opt {
+        Some(mv) => {
+            if tt_write {
+                pv_table.insert(zob, mv);
+            }
+            mv
+        }
+        None => {
+            return SearchScore::EVAL(alpha_orig);
+        }
+    };
 
     // If it would have cause an alpha beta pruning store the information in the TT table
     let bound = if best_value <= alpha_orig {
@@ -1097,8 +1211,10 @@ fn negamax_it(
         TTFlag::Exact
     };
     let stored = tt_score_on_store(best_value, ply_from_root);
-    let prev_eval = transpo_table.probe(zob).and_then(|e| e.eval);
-    transpo_table.store(zob, rem_depth, stored, bound, best_move_opt, prev_eval);
+    let prev_eval = tt_hit.and_then(|e| e.eval);
+    if tt_write {
+        transpo_table.store(zob, rem_depth, stored, bound, Some(best_move), prev_eval);
+    }
 
     SearchScore::EVAL(best_value)
 }
@@ -1210,6 +1326,9 @@ fn root_search_with_window(
             stop,
             1, // one ply from root after making mv
             stats,
+            None,
+            true,
+            true,
         ) {
             SearchScore::CANCELLED => {
                 aborted = true;
