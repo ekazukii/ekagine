@@ -126,7 +126,8 @@ pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
     }
 
     if let Some(ms) = movetime {
-        return Duration::from_millis(ms.max(10));
+        let ms_with_margin = ms - 5;
+        return Duration::from_millis(ms_with_margin.max(10));
     }
 
     let (time_left, increment) = match side {
@@ -159,7 +160,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.19.2");
+                send_message(&mut stdout, "id name Ekagine-v1.19.3");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }
