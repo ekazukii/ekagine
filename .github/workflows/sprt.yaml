@@ -25,7 +25,7 @@ jobs:
               \"prNumber\": ${{ github.event.pull_request.number }},
               \"timeControl\": \"mtime/100\",
               \"openingsUrl\": \"https://github.com/official-stockfish/books/raw/refs/heads/master/8moves_v3.pgn.zip\",
-              \"targetNGames\": 2200,
+              \"targetNGames\": 10000,
               \"batchSize\": 40,
               \"sprt\": { \"h0Elo\": 0, \"h1Elo\": 5, \"alpha\": 0.05, \"beta\": 0.05 }
             }"
