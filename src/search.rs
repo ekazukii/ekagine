@@ -426,11 +426,11 @@ const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
 
-const SINGULAR_MIN_DEPTH: i16 = 4;
-const SINGULAR_MARGIN_BASE: i32 = 40;
-const SINGULAR_MARGIN_PER_DEPTH: i32 = 12;
-const SINGULAR_EXTENSION: usize = 1;
-const SINGULAR_REDUCTION: usize = 1;
+    const SINGULAR_MIN_DEPTH: i16 = 8;
+    const SINGULAR_MARGIN_BASE: i32 = 0;
+    const SINGULAR_MARGIN_PER_DEPTH: i32 = 2;
+    const SINGULAR_EXTENSION: usize = 1;
+    const SINGULAR_REDUCTION: usize = 1;
 
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
