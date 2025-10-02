@@ -12,10 +12,9 @@ use std::time::Instant;
 
 /// Evaluate a set of bitboard squares using a piece‐square table + base value.
 fn pieces_type_eval(bitboard: &chess::BitBoard, table: &[i32; 64], base_val: i32) -> i32 {
-    let mut total = 0;
+    let mut total = base_val * bitboard.popcnt() as i32;
     for square in *bitboard {
-        let idx = square.to_index();
-        total += table[idx] + base_val;
+        total += table[square.to_index()];
     }
     total
 }
@@ -138,50 +137,31 @@ const KING_MOBILITY_WEIGHT: i32 = 2;
 /// pieces in the board, the progress is weighted so that if more important pieces are missing
 /// it advance more into the game
 fn endgame_progress(board: &Board) -> i32 {
-    let white_pawns =
-        (*board.pieces(Piece::Pawn) & board.color_combined(Color::White)).popcnt() as i32;
-    let white_knights =
-        (*board.pieces(Piece::Knight) & board.color_combined(Color::White)).popcnt() as i32;
-    let white_bishops =
-        (*board.pieces(Piece::Bishop) & board.color_combined(Color::White)).popcnt() as i32;
-    let white_rooks =
-        (*board.pieces(Piece::Rook) & board.color_combined(Color::White)).popcnt() as i32;
-    let white_queens =
-        (*board.pieces(Piece::Queen) & board.color_combined(Color::White)).popcnt() as i32;
+    let white = board.color_combined(Color::White);
+    let black = board.color_combined(Color::Black);
 
-    let black_pawns =
-        (*board.pieces(Piece::Pawn) & board.color_combined(Color::Black)).popcnt() as i32;
-    let black_knights =
-        (*board.pieces(Piece::Knight) & board.color_combined(Color::Black)).popcnt() as i32;
-    let black_bishops =
-        (*board.pieces(Piece::Bishop) & board.color_combined(Color::Black)).popcnt() as i32;
-    let black_rooks =
-        (*board.pieces(Piece::Rook) & board.color_combined(Color::Black)).popcnt() as i32;
-    let black_queens =
-        (*board.pieces(Piece::Queen) & board.color_combined(Color::Black)).popcnt() as i32;
+    let pawns = *board.pieces(Piece::Pawn);
+    let knights = *board.pieces(Piece::Knight);
+    let bishops = *board.pieces(Piece::Bishop);
+    let rooks = *board.pieces(Piece::Rook);
+    let queens = *board.pieces(Piece::Queen);
 
-    let white_material = white_pawns * PAWN_BASE_VAL
-        + white_knights * KNIGHT_BASE_VAL
-        + white_bishops * BISHOP_BASE_VAL
-        + white_rooks * ROOK_BASE_VAL
-        + white_queens * QUEEN_BASE_VAL;
-    let black_material = black_pawns * PAWN_BASE_VAL
-        + black_knights * KNIGHT_BASE_VAL
-        + black_bishops * BISHOP_BASE_VAL
-        + black_rooks * ROOK_BASE_VAL
-        + black_queens * QUEEN_BASE_VAL;
+    let white_material = ((pawns & white).popcnt() as i32) * PAWN_BASE_VAL
+        + ((knights & white).popcnt() as i32) * KNIGHT_BASE_VAL
+        + ((bishops & white).popcnt() as i32) * BISHOP_BASE_VAL
+        + ((rooks & white).popcnt() as i32) * ROOK_BASE_VAL
+        + ((queens & white).popcnt() as i32) * QUEEN_BASE_VAL;
+    let black_material = ((pawns & black).popcnt() as i32) * PAWN_BASE_VAL
+        + ((knights & black).popcnt() as i32) * KNIGHT_BASE_VAL
+        + ((bishops & black).popcnt() as i32) * BISHOP_BASE_VAL
+        + ((rooks & black).popcnt() as i32) * ROOK_BASE_VAL
+        + ((queens & black).popcnt() as i32) * QUEEN_BASE_VAL;
 
     let current_total = white_material + black_material;
     let material_exchanged = STARTING_MATERIALS - current_total;
     let progress = (material_exchanged * 100) / STARTING_MATERIALS;
 
-    if progress < 0 {
-        0
-    } else if progress > 100 {
-        100
-    } else {
-        progress
-    }
+    progress.clamp(0, 100)
 }
 
 /// Evaluate king safety for a given king on a board. This function returns

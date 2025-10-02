@@ -842,8 +842,10 @@ fn negamax_it(
     // Probe TT for cutoff
     let rem_depth: i16 = max_depth.saturating_sub(depth) as i16;
     let zob = board.get_hash();
+    let mut tt_eval_hint = None;
     if let Some(entry) = transpo_table.probe(zob) {
         stats.tt_hits += 1;
+        tt_eval_hint = entry.eval;
         // Only keep if entry depth is same or higher to avoid pruning from not fully search position
         if entry.depth >= rem_depth {
             let tt_score = tt_score_on_load(entry.score, ply_from_root);
@@ -912,11 +914,17 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
-    let static_eval = if !in_check && rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-        Some(color * cache_eval(board, transpo_table, repetition_table))
-    } else {
-        None
-    };
+    let (static_eval, static_eval_raw) =
+        if !in_check && rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
+            let raw = cache_eval(board, transpo_table, repetition_table);
+            (Some(color * raw), Some(raw))
+        } else {
+            (None, None)
+        };
+
+    if let Some(raw) = static_eval_raw {
+        tt_eval_hint = Some(raw);
+    }
 
     if let Some(stand_pat) = static_eval {
         if rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
@@ -1067,6 +1075,7 @@ fn negamax_it(
         if value > best_value {
             best_value = value;
             best_move_opt = Some(mv);
+            pv_table.insert(zob, mv);
         }
         if value >= beta {
             if !is_capture && !gives_check {
@@ -1097,8 +1106,7 @@ fn negamax_it(
         TTFlag::Exact
     };
     let stored = tt_score_on_store(best_value, ply_from_root);
-    let prev_eval = transpo_table.probe(zob).and_then(|e| e.eval);
-    transpo_table.store(zob, rem_depth, stored, bound, best_move_opt, prev_eval);
+    transpo_table.store(zob, rem_depth, stored, bound, best_move_opt, tt_eval_hint);
 
     SearchScore::EVAL(best_value)
 }
@@ -1192,7 +1200,7 @@ fn root_search_with_window(
         }
 
         let current_best = best_move.map(|bm| (bm, best_value));
-        log_root_move_start(&mut out, max_depth, &mv, current_best);
+        //log_root_move_start(&mut out, max_depth, &mv, current_best);
 
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
         let (child_board, rep_table) = applied.split();
