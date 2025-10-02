@@ -426,11 +426,11 @@ const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
 
-    const SINGULAR_MIN_DEPTH: i16 = 8;
-    const SINGULAR_MARGIN_BASE: i32 = 0;
-    const SINGULAR_MARGIN_PER_DEPTH: i32 = 2;
-    const SINGULAR_EXTENSION: usize = 1;
-    const SINGULAR_REDUCTION: usize = 1;
+const SINGULAR_MIN_DEPTH: i16 = 8;
+const SINGULAR_MARGIN_BASE: i32 = 0;
+const SINGULAR_MARGIN_PER_DEPTH: i32 = 2;
+const SINGULAR_EXTENSION: usize = 1;
+const SINGULAR_REDUCTION: usize = 1;
 
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
@@ -867,7 +867,11 @@ fn negamax_it(
     // Probe TT for cutoff
     let rem_depth: i16 = max_depth.saturating_sub(depth) as i16;
     let zob = board.get_hash();
-    let tt_hit = transpo_table.probe(zob);
+    let raw_tt_hit = transpo_table.probe(zob);
+    let tt_hit = raw_tt_hit.filter(|entry| match forbidden_move {
+        Some(fmv) => entry.best_move != Some(fmv),
+        None => true,
+    });
     if let Some(entry) = tt_hit {
         stats.tt_hits += 1;
         // Only keep if entry depth is same or higher to avoid pruning from not fully search position
@@ -948,7 +952,7 @@ fn negamax_it(
         && alpha != NEG_INFINITY
         && !is_mate_score(beta)
     {
-        if let Some(entry) = tt_hit {
+        if let Some(entry) = raw_tt_hit {
             if entry.flag == TTFlag::Lower
                 && entry.depth >= rem_depth.saturating_sub(1)
                 && entry.best_move.is_some()
@@ -1211,7 +1215,7 @@ fn negamax_it(
         TTFlag::Exact
     };
     let stored = tt_score_on_store(best_value, ply_from_root);
-    let prev_eval = tt_hit.and_then(|e| e.eval);
+    let prev_eval = raw_tt_hit.and_then(|e| e.eval);
     if tt_write {
         transpo_table.store(zob, rem_depth, stored, bound, Some(best_move), prev_eval);
     }
