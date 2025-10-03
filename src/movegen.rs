@@ -102,7 +102,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                     if self.board.piece_on(kmv.get_dest()).is_some() {
                         continue;
                     }
-                    if MoveGen::new_legal(&self.board).any(|legal_mv| legal_mv == kmv) {
+                    if self.board.legal(kmv) {
                         return Some(kmv);
                     }
                 }

@@ -69,7 +69,7 @@ fn board_pop(board: &Board, repetition_table: &mut RepetitionTable) {
 }
 
 fn send_message(stdout: &mut Stdout, message: &str) {
-    writeln!(stdout, "{}", message.clone()).unwrap();
+    writeln!(stdout, "{}", message).unwrap();
 }
 
 /// Decide how long to think for this move.
