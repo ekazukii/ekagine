@@ -424,7 +424,7 @@ fn futility_margin(depth: i16) -> i32 {
 #[inline]
 fn reverse_futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
-    FUTILITY_MARGIN_PER_DEPTH * depth
+    0 + FUTILITY_MARGIN_PER_DEPTH * depth
 }
 
 const PIECE_ORDER: [Piece; 6] = [
@@ -939,7 +939,7 @@ fn negamax_it(
             && beta != POS_INFINITY
             && !is_mate_score(beta)
             && !is_mate_score(stand_pat)
-            && stand_pat.saturating_add(reverse_futility_margin(rem_depth)) <= alpha
+            && stand_pat >= beta.saturating_add(reverse_futility_margin(rem_depth))
         {
             stats.reverse_futility_prunes += 1;
             return SearchScore::EVAL(beta);
