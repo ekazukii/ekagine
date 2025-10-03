@@ -424,7 +424,7 @@ fn futility_margin(depth: i16) -> i32 {
 #[inline]
 fn reverse_futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
-    0 + FUTILITY_MARGIN_PER_DEPTH * depth
+    FUTILITY_MARGIN_PER_DEPTH * depth
 }
 
 const PIECE_ORDER: [Piece; 6] = [
