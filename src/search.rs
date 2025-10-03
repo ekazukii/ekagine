@@ -939,7 +939,7 @@ fn negamax_it(
             && beta != POS_INFINITY
             && !is_mate_score(beta)
             && !is_mate_score(stand_pat)
-            && stand_pat.saturating_sub(reverse_futility_margin(rem_depth)) >= beta
+            && stand_pat.saturating_add(reverse_futility_margin(rem_depth)) <= alpha
         {
             stats.reverse_futility_prunes += 1;
             return SearchScore::EVAL(beta);
