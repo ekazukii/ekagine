@@ -802,6 +802,7 @@ fn negamax_it(
     color: i32,
     stop: &StopFlag,
     ply_from_root: i32,
+    is_pv_move: bool,
     stats: &mut SearchStats,
 ) -> SearchScore {
     // If time budget expired
@@ -874,7 +875,11 @@ fn negamax_it(
     // Null-move pruning: if not in check and enough depth, try a null move with reduction.
     // Guard against zugzwang: require some non-pawn material for the side to move.
     let in_check = board.checkers().popcnt() > 0;
-    if !in_check && rem_depth >= 2 && has_non_pawn_material(board, board.side_to_move()) {
+    if !is_pv_move
+        && !in_check
+        && rem_depth >= 2
+        && has_non_pawn_material(board, board.side_to_move())
+    {
         let r = if rem_depth >= 6 { 3 } else { 2 } as usize;
         if let Some(nboard) = board_do_null_move(board, repetition_table) {
             // null-window search (fail-high test)
@@ -891,6 +896,7 @@ fn negamax_it(
                 -color,
                 stop,
                 ply_from_root + 1,
+                false,
                 stats,
             ) {
                 SearchScore::CANCELLED => {
@@ -928,9 +934,9 @@ fn negamax_it(
 
     if let Some(stand_pat) = static_eval {
         if rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
+            && !is_pv_move
             && alpha != NEG_INFINITY
             && beta != POS_INFINITY
-            && beta <= alpha.saturating_add(1)
             && !is_mate_score(beta)
             && !is_mate_score(stand_pat)
             && stand_pat.saturating_sub(reverse_futility_margin(rem_depth)) >= beta
@@ -964,7 +970,8 @@ fn negamax_it(
         let is_capture =
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let gives_check = applied.board().checkers().popcnt() > 0;
-        let is_pv_move = move_idx == 0; // treat first move as PV
+        let is_first_move = move_idx == 0; // treat first move as PV
+        let child_is_pv_node = is_pv_move && is_first_move;
 
         // Search extension
         let mut extension = 0;
@@ -982,7 +989,7 @@ fn negamax_it(
             if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH
                 && !is_capture
                 && !gives_check
-                && !is_pv_move
+                && !is_first_move
                 && alpha != NEG_INFINITY
                 && beta != POS_INFINITY
                 && !is_mate_score(alpha)
@@ -998,7 +1005,7 @@ fn negamax_it(
 
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
         let apply_lmr =
-            rem_depth >= 3 && move_idx >= 3 && !is_pv_move && !is_capture && !gives_check;
+            rem_depth >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
         let reduction = if apply_lmr {
             if rem_depth >= 6 {
                 2
@@ -1010,7 +1017,7 @@ fn negamax_it(
         };
 
         let mut value;
-        let mut use_pvs = !is_pv_move;
+        let mut use_pvs = !is_first_move;
         let null_window_beta_candidate = alpha.saturating_add(1).min(beta);
         if null_window_beta_candidate <= alpha {
             use_pvs = false;
@@ -1032,6 +1039,7 @@ fn negamax_it(
                 -color,
                 stop,
                 ply_from_root + 1,
+                false,
                 stats,
             );
 
@@ -1059,6 +1067,7 @@ fn negamax_it(
                     -color,
                     stop,
                     ply_from_root + 1,
+                    is_pv_move,
                     stats,
                 ) {
                     SearchScore::CANCELLED => return SearchScore::CANCELLED,
@@ -1081,6 +1090,7 @@ fn negamax_it(
                 -color,
                 stop,
                 ply_from_root + 1,
+                child_is_pv_node,
                 stats,
             ) {
                 SearchScore::CANCELLED => return SearchScore::CANCELLED,
@@ -1221,6 +1231,7 @@ fn root_search_with_window(
 
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
         let (child_board, rep_table) = applied.split();
+        let is_pv_move = best_move.is_none();
         match negamax_it(
             child_board,
             1,
@@ -1234,6 +1245,7 @@ fn root_search_with_window(
             -color,
             stop,
             1, // one ply from root after making mv
+            is_pv_move,
             stats,
         ) {
             SearchScore::CANCELLED => {
