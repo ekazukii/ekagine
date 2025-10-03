@@ -999,15 +999,31 @@ fn negamax_it(
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
         let apply_lmr =
             rem_depth >= 3 && move_idx >= 3 && !is_pv_move && !is_capture && !gives_check;
-        let value = if apply_lmr {
-            let r = if rem_depth >= 6 { 2 } else { 1 } as usize;
-            // Reduced-depth null-window search first
+        let reduction = if apply_lmr {
+            if rem_depth >= 6 {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+
+        let mut value;
+        let mut use_pvs = !is_pv_move;
+        let null_window_beta_candidate = alpha.saturating_add(1).min(beta);
+        if null_window_beta_candidate <= alpha {
+            use_pvs = false;
+        }
+
+        if use_pvs {
+            let null_window_beta = null_window_beta_candidate;
             let (child_board_view, rep_table) = applied.split();
-            match negamax_it(
+            let first_result = negamax_it(
                 child_board_view,
-                depth + 1 + r,
+                depth + 1 + reduction,
                 max_depth + extension,
-                -beta,
+                -null_window_beta,
                 -alpha,
                 transpo_table,
                 rep_table,
@@ -1017,43 +1033,44 @@ fn negamax_it(
                 stop,
                 ply_from_root + 1,
                 stats,
-            ) {
+            );
+
+            value = match first_result {
                 SearchScore::CANCELLED => return SearchScore::CANCELLED,
-                SearchScore::EVAL(vr) => {
-                    let vred = -vr;
-                    // If reduced search raises alpha, re-search at full depth
-                    if vred > alpha {
-                        stats.lmr_researches += 1;
-                        let (child_board_view, rep_table) = applied.split();
-                        match negamax_it(
-                            child_board_view,
-                            depth + 1,
-                            max_depth + extension,
-                            -beta,
-                            -alpha,
-                            transpo_table,
-                            rep_table,
-                            pv_table,
-                            killers,
-                            -color,
-                            stop,
-                            ply_from_root + 1,
-                            stats,
-                        ) {
-                            SearchScore::CANCELLED => return SearchScore::CANCELLED,
-                            SearchScore::EVAL(vf) => -vf,
-                        }
-                    } else {
-                        vred
-                    }
+                SearchScore::EVAL(v) => -v,
+            };
+
+            if value > alpha && value < beta {
+                if reduction > 0 {
+                    stats.lmr_researches += 1;
                 }
+
+                let (child_board_view, rep_table) = applied.split();
+                value = match negamax_it(
+                    child_board_view,
+                    depth + 1,
+                    max_depth + extension,
+                    -beta,
+                    -alpha,
+                    transpo_table,
+                    rep_table,
+                    pv_table,
+                    killers,
+                    -color,
+                    stop,
+                    ply_from_root + 1,
+                    stats,
+                ) {
+                    SearchScore::CANCELLED => return SearchScore::CANCELLED,
+                    SearchScore::EVAL(v) => -v,
+                };
             }
         } else {
-            // Normal full-depth search
+            // Normal full-depth search (PV move)
             let (child_board_view, rep_table) = applied.split();
-            match negamax_it(
+            value = match negamax_it(
                 child_board_view,
-                depth + 1,
+                depth + 1 + reduction,
                 max_depth + extension,
                 -beta,
                 -alpha,
@@ -1068,8 +1085,8 @@ fn negamax_it(
             ) {
                 SearchScore::CANCELLED => return SearchScore::CANCELLED,
                 SearchScore::EVAL(v) => -v,
-            }
-        };
+            };
+        }
 
         // Update best / alpha-beta
         if value > best_value {
