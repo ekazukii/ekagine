@@ -261,7 +261,7 @@ fn quiesce_negamax_it(
         alpha = stand_pat;
     }
 
-    for mv in get_captures(board) {
+    for (mv, _val) in get_captures(board) {
         let dest_piece = board.piece_on(mv.get_dest());
         let is_en_passant = dest_piece.is_none() && is_en_passant_capture(board, mv);
         if dest_piece.is_none() && !is_en_passant {
@@ -719,7 +719,7 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
     is_passed_pawn(child, dest, color_to_move)
 }
 
-fn _get_captures(board: &Board) -> Vec<ChessMove> {
+fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
     // 1. Build the capture mask: opponent pieces + possible en passant square
     let mut mask = *board.color_combined(!board.side_to_move());
     if let Some(ep_square) = board.en_passant() {
@@ -744,7 +744,6 @@ fn _get_captures(board: &Board) -> Vec<ChessMove> {
                 0
             }
         } else if is_en_passant_capture(board, mv) {
-            // En passant capture (destination is empty)
             25 // arbitrary EP value; tune as needed
         } else {
             0
@@ -753,86 +752,8 @@ fn _get_captures(board: &Board) -> Vec<ChessMove> {
         scored_moves.push((mv, score));
     }
 
-    // 4. Sort by descending score (higher is better)
     scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
-    // 5. Return moves only
-    scored_moves.into_iter().map(|(mv, _)| mv).collect()
-}
-
-const MAX_SCORE: u8 = 55; // Highest in MVV_LVA_TABLE. EP=25 fits under this.
-const NUM_SCORES: usize = MAX_SCORE as usize + 1;
-
-pub fn get_captures(board: &Board) -> SmallVec<[ChessMove; 64]> {
-    // 1) Capture mask
-    let mut mask = *board.color_combined(!board.side_to_move());
-    if let Some(ep_sq) = board.en_passant() {
-        mask |= BitBoard::from_square(ep_sq);
-    }
-
-    // 2) Generate legal moves with destination mask
-    let mut gen = MoveGen::new_legal(board);
-    gen.set_iterator_mask(mask);
-
-    // 3) First pass: score and collect
-    // Using two parallel buffers prevents per-tuple moves during counting sort.
-    let mut moves: SmallVec<[ChessMove; 64]> = SmallVec::new();
-    let mut scores: SmallVec<[u8; 64]> = SmallVec::new();
-    let mut counts = [0usize; NUM_SCORES];
-
-    for mv in gen {
-        // Fast path: if dest has a piece, it is a normal capture
-        let dst = mv.get_dest();
-        let src = mv.get_source();
-
-        let score: u8 = if let Some(victim) = board.piece_on(dst) {
-            // fetch attacker once
-            let attacker = board.piece_on(src).unwrap(); // legal position implies source occupied
-            let v = victim.to_index() as usize;
-            let a = attacker.to_index() as usize;
-            MVV_LVA_TABLE[v][a]
-        } else if is_en_passant_capture(board, mv) {
-            25 // tune as needed
-        } else {
-            0
-        };
-
-        // Only keep capture-type moves. Mask should already filter but keep guard cheap.
-        if score > 0 {
-            moves.push(mv);
-            scores.push(score);
-            counts[score as usize] += 1;
-        }
-    }
-
-    // Nothing to order
-    if moves.is_empty() {
-        return moves;
-    }
-
-    // 4) Build descending starting offsets via prefix sums
-    // starts[s] gives the next write index for score s
-    let mut starts = [0usize; NUM_SCORES];
-    {
-        let mut offset = 0usize;
-        for s in (0..=MAX_SCORE as usize).rev() {
-            starts[s] = offset;
-            offset += counts[s];
-        }
-    }
-
-    // 5) Second pass: place into output in score-descending order
-    let mut out: SmallVec<[ChessMove; 64]> = SmallVec::with_capacity(moves.len());
-    unsafe { out.set_len(moves.len()); } // we will fill every slot
-
-    for (i, mv) in moves.iter().enumerate() {
-        let s = scores[i] as usize;
-        let idx = starts[s];
-        out[idx] = *mv;
-        starts[s] += 1;
-    }
-
-    out
+    scored_moves
 }
 
 /// This functions orders to move based on the first sort of `sort_moves` but adds specific order
