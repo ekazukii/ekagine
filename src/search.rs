@@ -262,7 +262,15 @@ fn quiesce_negamax_it(
     }
 
     for mv in sort_moves(board) {
-        if board.piece_on(mv.get_dest()).is_none() && !is_en_passant_capture(board, mv) {
+        let dest_piece = board.piece_on(mv.get_dest());
+        let is_en_passant = dest_piece.is_none() && is_en_passant_capture(board, mv);
+        if dest_piece.is_none() && !is_en_passant {
+            continue;
+        }
+        let captured_val = dest_piece
+            .map(piece_value)
+            .unwrap_or_else(|| piece_value(Piece::Pawn));
+        if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
             continue;
         }
         if static_exchange_eval(board, mv) < 0 {
@@ -406,6 +414,7 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 ];
 
 const ASPIRATION_START_WINDOW: i32 = 50;
+const QUIESCE_FUTILITY_MARGIN: i32 = 200;
 
 const FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const FUTILITY_MARGIN_BASE: i32 = 200;
