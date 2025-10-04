@@ -23,7 +23,7 @@ jobs:
               \"baseSha\": \"${{ github.event.pull_request.base.sha }}\",
               \"headSha\": \"${{ github.event.pull_request.head.sha }}\",
               \"prNumber\": ${{ github.event.pull_request.number }},
-              \"timeControl\": \"mtime/100\",
+              \"timeControl\": \"10+0.1\",
               \"openingsUrl\": \"https://github.com/official-stockfish/books/raw/refs/heads/master/8moves_v3.pgn.zip\",
               \"targetNGames\": 10000,
               \"batchSize\": 40,
