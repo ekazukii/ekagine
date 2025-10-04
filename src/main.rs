@@ -126,7 +126,7 @@ pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
     }
 
     if let Some(ms) = movetime {
-        let ms_with_margin = ms - 5;
+        let ms_with_margin = ms - 10;
         return Duration::from_millis(ms_with_margin.max(10));
     }
 
@@ -160,7 +160,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.22.0");
+                send_message(&mut stdout, "id name Ekagine-v1.22.1");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }
@@ -358,7 +358,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
             let mut transpo_table = TranspositionTable::new();
             best_move_interruptible(
                 key,
-                Duration::from_millis(100),
+                Duration::from_millis(90),
                 1000,
                 RepetitionTable::new(),
                 &mut transpo_table,
