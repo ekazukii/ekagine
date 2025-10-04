@@ -261,7 +261,7 @@ fn quiesce_negamax_it(
         alpha = stand_pat;
     }
 
-    for mv in get_captures(board) {
+    for (mv, _val) in get_captures(board) {
         let dest_piece = board.piece_on(mv.get_dest());
         let is_en_passant = dest_piece.is_none() && is_en_passant_capture(board, mv);
         if dest_piece.is_none() && !is_en_passant {
@@ -719,37 +719,7 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
     is_passed_pawn(child, dest, color_to_move)
 }
 
-/// This functions orders the move over multiple criteria so that the best probable moves are ordered
-/// on top of the search list.
-/// This function is meant to be the base sorter used by the quiesce search and the base of the ordering
-/// for the "classic search"
-fn sort_moves(board: &Board) -> Vec<ChessMove> {
-    let mut scored_moves: SmallVec<[(ChessMove, u8); 64]> = SmallVec::new();
-
-    for mv in MoveGen::new_legal(board) {
-        let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
-            // It's a capture; find the attacker piece type
-            if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-                let victim_idx = victim_piece.to_index() as usize;
-                let attacker_idx = attacker_piece.to_index() as usize;
-                MVV_LVA_TABLE[victim_idx][attacker_idx]
-            } else {
-                0
-            }
-        } else if is_en_passant_capture(board, mv) {
-            25
-        } else {
-            0
-        };
-
-        scored_moves.push((mv, score));
-    }
-
-    scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    scored_moves.into_iter().map(|(mv, _)| mv).collect()
-}
-
-fn get_captures(board: &Board) -> Vec<ChessMove> {
+fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
     // 1. Build the capture mask: opponent pieces + possible en passant square
     let mut mask = *board.color_combined(!board.side_to_move());
     if let Some(ep_square) = board.en_passant() {
@@ -774,7 +744,6 @@ fn get_captures(board: &Board) -> Vec<ChessMove> {
                 0
             }
         } else if is_en_passant_capture(board, mv) {
-            // En passant capture (destination is empty)
             25 // arbitrary EP value; tune as needed
         } else {
             0
@@ -783,11 +752,8 @@ fn get_captures(board: &Board) -> Vec<ChessMove> {
         scored_moves.push((mv, score));
     }
 
-    // 4. Sort by descending score (higher is better)
     scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
-    // 5. Return moves only
-    scored_moves.into_iter().map(|(mv, _)| mv).collect()
+    scored_moves
 }
 
 /// This functions orders to move based on the first sort of `sort_moves` but adds specific order
