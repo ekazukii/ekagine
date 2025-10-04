@@ -74,74 +74,76 @@ fn send_message(stdout: &mut Stdout, message: &str) {
 
 /// Decide how long to think for this move.
 ///
-/// `tokens`  – slice starting with `"go"`, exactly what you split from stdin
-/// `side`    – `board.side_to_move()`
+/// `tokens` – slice starting with `"go"`, exactly what you split from stdin
+/// `side`   – `board.side_to_move()`
 ///
-/// * If the GUI sent `go movetime N`, we honour that exactly.
-/// * Otherwise we look at `wtime/btime`, `winc/binc`, and (optionally)
-///   `movestogo` and give you a sensible **milliseconds** budget
-///   with a small safety margin so you don't flag.
+/// Rules:
+/// * If `movetime` is given, use it exactly (minus a small safety margin).
+/// * Otherwise, derive time from `wtime/btime`, `winc/binc`, and optional `movestogo`.
+/// * Adapts dynamically: uses less time if time is critically low,
+///   or slightly more if time is abundant.
+///
+/// Returns a `Duration` in milliseconds.
 pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
-    // Defaults
+    use std::time::Duration;
+
+    const SAFETY_MARGIN_MS: u64 = 15;      // reserved safety buffer
+    const MIN_THINK_TIME_MS: u64 = 10;     // never think less than this
+    const MAX_THINK_RATIO: f64 = 0.7;      // never spend more than 70% of time_left/movestogo
+    const CRITICAL_TIME_THRESHOLD: u64 = 3000; // if <3s left, go faster
+
     let mut wtime: u64 = 0;
     let mut btime: u64 = 0;
     let mut winc: u64 = 0;
     let mut binc: u64 = 0;
-    let mut movestogo: u64 = 30; // assume 30 moves left if not specified
+    let mut movestogo: Option<u64> = None;
     let mut movetime: Option<u64> = None;
 
-    let mut i = 1; // skip the "go" token itself
+    // --- Parse tokens safely ---
+    let mut i = 1;
     while i < tokens.len() {
         match tokens[i] {
-            "movetime" => {
-                i += 1;
-                movetime = tokens.get(i).and_then(|v| v.parse().ok());
-            }
-            "wtime" => {
-                i += 1;
-                wtime = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-            "btime" => {
-                i += 1;
-                btime = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-            "winc" => {
-                i += 1;
-                winc = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-            "binc" => {
-                i += 1;
-                binc = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-            "movestogo" => {
-                i += 1;
-                movestogo = tokens
-                    .get(i)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(movestogo);
-            }
+            "movetime" => movetime = tokens.get(i + 1).and_then(|v| v.parse::<u64>().ok()),
+            "wtime"    => wtime = tokens.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+            "btime"    => btime = tokens.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+            "winc"     => winc  = tokens.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+            "binc"     => binc  = tokens.get(i + 1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+            "movestogo"=> movestogo = tokens.get(i + 1).and_then(|v| v.parse::<u64>().ok()),
             _ => {}
         }
         i += 1;
     }
 
+    // --- Handle fixed movetime ---
     if let Some(ms) = movetime {
-        let ms_with_margin = ms - 10;
-        return Duration::from_millis(ms_with_margin.max(10));
+        let think_time = ms.saturating_sub(SAFETY_MARGIN_MS).max(MIN_THINK_TIME_MS);
+        return Duration::from_millis(think_time);
     }
 
+    // --- Derive parameters ---
     let (time_left, increment) = match side {
         Color::White => (wtime, winc),
         Color::Black => (btime, binc),
     };
 
-    const SAFETY_MS: u64 = 50;
+    let moves_left = movestogo.unwrap_or(30).max(1);
 
-    let base = time_left.saturating_sub(SAFETY_MS) / movestogo.max(1);
-    let budget = base + increment / 2;
+    // --- Adaptive allocation heuristic ---
+    let base_allocation = (time_left as f64 / moves_left as f64) * MAX_THINK_RATIO;
+    let inc_bonus = (increment as f64) * 0.5;
 
-    Duration::from_millis(budget.max(10))
+    let mut budget = (base_allocation + inc_bonus) as u64;
+
+    // --- Adjust for low time ---
+    if time_left < CRITICAL_TIME_THRESHOLD {
+        budget = (time_left as f64 * 0.3) as u64; // use only 30% of what’s left
+    }
+
+    // --- Safety checks ---
+    let think_time = budget.saturating_sub(SAFETY_MARGIN_MS).max(MIN_THINK_TIME_MS);
+    Duration::from_millis(think_time)
 }
+
 
 fn uci_loop() {
     let stdin = io::stdin();
@@ -160,7 +162,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v1.22.2");
+                send_message(&mut stdout, "id name Ekagine-v1.23");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(&mut stdout, "uciok");
             }

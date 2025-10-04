@@ -1506,7 +1506,13 @@ pub fn best_move_interruptible(
     {
         let stop_clone = stop.clone();
         thread::spawn(move || {
-            thread::sleep(time_budget);
+            let start = Instant::now();
+            let target = start + time_budget;
+
+            while Instant::now() < target {
+                std::hint::spin_loop();
+            }
+
             stop_clone.store(true, Ordering::Relaxed);
         });
     }
