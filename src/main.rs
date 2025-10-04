@@ -137,7 +137,7 @@ pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
 
     const TIME_LEFT_TO_KEEP: u64 = 50;
     let base = time_left.saturating_sub(TIME_LEFT_TO_KEEP) / movestogo.max(1);
-    let budget = base + increment.saturating_sub(TIME_LEFT_TO_KEEP);
+    let budget = base + increment.saturating_sub(15);
 
     Duration::from_millis(budget.max(10))
 }
