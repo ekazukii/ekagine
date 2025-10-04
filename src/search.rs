@@ -791,8 +791,7 @@ fn ordered_moves(
 /// Usage of quiesce search at end of search and tt/pv cutoff
 fn negamax_it(
     board: &Board,
-    depth: usize,
-    max_depth: usize,
+    depth: i16,
     mut alpha: i32,
     beta: i32,
     transpo_table: &mut TranspositionTable,
@@ -802,7 +801,7 @@ fn negamax_it(
     color: i32,
     stop: &StopFlag,
     ply_from_root: i32,
-    is_pv_move: bool,
+    is_pv_node: bool,
     stats: &mut SearchStats,
 ) -> SearchScore {
     // If time budget expired
@@ -825,8 +824,8 @@ fn negamax_it(
         BoardStatus::Ongoing => {}
     }
 
-    // Start quiesce search if we reached or exceeded the depth limit
-    if depth >= max_depth {
+    // Start quiesce search if we exhausted the search depth
+    if depth <= 0 {
         return SearchScore::EVAL(quiesce_negamax_it(
             board,
             alpha,
@@ -841,14 +840,14 @@ fn negamax_it(
     }
 
     // Probe TT for cutoff
-    let rem_depth: i16 = max_depth.saturating_sub(depth) as i16;
+    let depth_remaining: i16 = depth;
     let zob = board.get_hash();
     let mut tt_eval_hint = None;
     if let Some(entry) = transpo_table.probe(zob) {
         stats.tt_hits += 1;
         tt_eval_hint = entry.eval;
         // Only keep if entry depth is same or higher to avoid pruning from not fully search position
-        if entry.depth >= rem_depth {
+        if entry.depth >= depth_remaining {
             let tt_score = tt_score_on_load(entry.score, ply_from_root);
             match entry.flag {
                 TTFlag::Exact => {
@@ -875,18 +874,17 @@ fn negamax_it(
     // Null-move pruning: if not in check and enough depth, try a null move with reduction.
     // Guard against zugzwang: require some non-pawn material for the side to move.
     let in_check = board.checkers().popcnt() > 0;
-    if !is_pv_move
+    if !is_pv_node
         && !in_check
-        && rem_depth >= 2
+        && depth_remaining >= 2
         && has_non_pawn_material(board, board.side_to_move())
     {
-        let r = if rem_depth >= 6 { 3 } else { 2 } as usize;
+        let r: i16 = if depth_remaining >= 6 { 3 } else { 2 };
         if let Some(nboard) = board_do_null_move(board, repetition_table) {
             // null-window search (fail-high test)
             match negamax_it(
                 &nboard,
-                depth + 1 + r,
-                max_depth,
+                (depth_remaining - 1 - r).max(0),
                 -beta,
                 -beta + 1,
                 transpo_table,
@@ -921,7 +919,7 @@ fn negamax_it(
     let alpha_orig = alpha;
 
     let (static_eval, static_eval_raw) =
-        if !in_check && rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
+        if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
             let raw = cache_eval(board, transpo_table, repetition_table);
             (Some(color * raw), Some(raw))
         } else {
@@ -933,20 +931,20 @@ fn negamax_it(
     }
 
     if let Some(stand_pat) = static_eval {
-        if rem_depth <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
-            && !is_pv_move
+        if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
+            && !is_pv_node
             && alpha != NEG_INFINITY
             && beta != POS_INFINITY
             && !is_mate_score(beta)
             && !is_mate_score(stand_pat)
-            && stand_pat >= beta.saturating_add(reverse_futility_margin(rem_depth))
+            && stand_pat >= beta.saturating_add(reverse_futility_margin(depth_remaining))
         {
             stats.reverse_futility_prunes += 1;
             return SearchScore::EVAL(beta);
         }
     }
 
-    let static_eval_for_futility = if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH {
+    let static_eval_for_futility = if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH {
         static_eval
     } else {
         None
@@ -971,14 +969,14 @@ fn negamax_it(
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let gives_check = applied.board().checkers().popcnt() > 0;
         let is_first_move = move_idx == 0; // treat first move as PV
-        let child_is_pv_node = is_pv_move && is_first_move;
+        let child_is_pv_node = is_pv_node && is_first_move;
 
         // Search extension
-        let mut extension = 0;
-        if gives_check && rem_depth <= CHECK_EXTENSION_DEPTH_LIMIT && rem_depth > 0 {
+        let mut extension: i16 = 0;
+        if gives_check && depth_remaining <= CHECK_EXTENSION_DEPTH_LIMIT && depth_remaining > 0 {
             extension = 1;
-        } else if rem_depth <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
-            && rem_depth > 0
+        } else if depth_remaining <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
+            && depth_remaining > 0
             //TODO: Maybe add an endgame closeness to trigger the is_passed_pawn_push call (can be computed at the root and just be passed bellow)
             && is_passed_pawn_push(board, applied.board(), mv)
         {
@@ -986,7 +984,7 @@ fn negamax_it(
         }
 
         if let Some(stand_pat) = static_eval_for_futility {
-            if rem_depth <= FUTILITY_PRUNE_MAX_DEPTH
+            if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH
                 && !is_capture
                 && !gives_check
                 && !is_first_move
@@ -994,7 +992,7 @@ fn negamax_it(
                 && beta != POS_INFINITY
                 && !is_mate_score(alpha)
             {
-                let margin = futility_margin(rem_depth);
+                let margin = futility_margin(depth_remaining);
                 if stand_pat + margin <= alpha {
                     stats.futility_prunes += 1;
                     move_idx += 1;
@@ -1005,9 +1003,9 @@ fn negamax_it(
 
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
         let apply_lmr =
-            rem_depth >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
-        let reduction = if apply_lmr {
-            if rem_depth >= 6 {
+            depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
+        let reduction: i16 = if apply_lmr {
+            if depth_remaining >= 6 {
                 2
             } else {
                 1
@@ -1023,13 +1021,23 @@ fn negamax_it(
             use_pvs = false;
         }
 
+        let mut depth_after_move = depth_remaining - 1;
+        if depth_after_move < 0 {
+            depth_after_move = 0;
+        }
+        let depth_after_move_with_ext = (depth_after_move + extension).max(0);
+        let mut reduced_depth = depth_after_move - reduction;
+        reduced_depth += extension;
+        if reduced_depth < 0 {
+            reduced_depth = 0;
+        }
+
         if use_pvs {
             let null_window_beta = null_window_beta_candidate;
             let (child_board_view, rep_table) = applied.split();
             let first_result = negamax_it(
                 child_board_view,
-                depth + 1 + reduction,
-                max_depth + extension,
+                reduced_depth,
                 -null_window_beta,
                 -alpha,
                 transpo_table,
@@ -1056,8 +1064,7 @@ fn negamax_it(
                 let (child_board_view, rep_table) = applied.split();
                 value = match negamax_it(
                     child_board_view,
-                    depth + 1,
-                    max_depth + extension,
+                    depth_after_move_with_ext,
                     -beta,
                     -alpha,
                     transpo_table,
@@ -1067,7 +1074,7 @@ fn negamax_it(
                     -color,
                     stop,
                     ply_from_root + 1,
-                    is_pv_move,
+                    child_is_pv_node,
                     stats,
                 ) {
                     SearchScore::CANCELLED => return SearchScore::CANCELLED,
@@ -1079,8 +1086,7 @@ fn negamax_it(
             let (child_board_view, rep_table) = applied.split();
             value = match negamax_it(
                 child_board_view,
-                depth + 1 + reduction,
-                max_depth + extension,
+                reduced_depth,
                 -beta,
                 -alpha,
                 transpo_table,
@@ -1133,7 +1139,14 @@ fn negamax_it(
         TTFlag::Exact
     };
     let stored = tt_score_on_store(best_value, ply_from_root);
-    transpo_table.store(zob, rem_depth, stored, bound, best_move_opt, tt_eval_hint);
+    transpo_table.store(
+        zob,
+        depth_remaining,
+        stored,
+        bound,
+        best_move_opt,
+        tt_eval_hint,
+    );
 
     SearchScore::EVAL(best_value)
 }
@@ -1231,11 +1244,12 @@ fn root_search_with_window(
 
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
         let (child_board, rep_table) = applied.split();
-        let is_pv_move = best_move.is_none();
+        let is_pv_node = best_move.is_none();
+        let mut child_depth = max_depth.saturating_sub(1);
+        child_depth = child_depth.min(i16::MAX as usize);
         match negamax_it(
             child_board,
-            1,
-            max_depth,
+            child_depth as i16,
             -beta,
             -alpha,
             transpo_table,
@@ -1245,7 +1259,7 @@ fn root_search_with_window(
             -color,
             stop,
             1, // one ply from root after making mv
-            is_pv_move,
+            is_pv_node,
             stats,
         ) {
             SearchScore::CANCELLED => {
