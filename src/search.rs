@@ -261,8 +261,16 @@ fn quiesce_negamax_it(
         alpha = stand_pat;
     }
 
-    for mv in sort_moves(board) {
-        if board.piece_on(mv.get_dest()).is_none() && !is_en_passant_capture(board, mv) {
+    for mv in get_captures(board) {
+        let dest_piece = board.piece_on(mv.get_dest());
+        let is_en_passant = dest_piece.is_none() && is_en_passant_capture(board, mv);
+        if dest_piece.is_none() && !is_en_passant {
+            continue;
+        }
+        let captured_val = dest_piece
+            .map(piece_value)
+            .unwrap_or_else(|| piece_value(Piece::Pawn));
+        if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
             continue;
         }
         if static_exchange_eval(board, mv) < 0 {
@@ -406,6 +414,7 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 ];
 
 const ASPIRATION_START_WINDOW: i32 = 50;
+const QUIESCE_FUTILITY_MARGIN: i32 = 200;
 
 const FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const FUTILITY_MARGIN_BASE: i32 = 200;
@@ -737,6 +746,47 @@ fn sort_moves(board: &Board) -> Vec<ChessMove> {
     }
 
     scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    scored_moves.into_iter().map(|(mv, _)| mv).collect()
+}
+
+fn get_captures(board: &Board) -> Vec<ChessMove> {
+    // 1. Build the capture mask: opponent pieces + possible en passant square
+    let mut mask = *board.color_combined(!board.side_to_move());
+    if let Some(ep_square) = board.en_passant() {
+        mask |= BitBoard::from_square(ep_square);
+    }
+
+    // 2. Generate only capture-type moves (filtered by mask)
+    let mut gen = MoveGen::new_legal(board);
+    gen.set_iterator_mask(mask);
+
+    // 3. Score each move
+    let mut scored_moves: SmallVec<[(ChessMove, u8); 64]> = SmallVec::new();
+
+    for mv in gen {
+        let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
+            // Normal capture
+            if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+                let victim_idx = victim_piece.to_index() as usize;
+                let attacker_idx = attacker_piece.to_index() as usize;
+                MVV_LVA_TABLE[victim_idx][attacker_idx]
+            } else {
+                0
+            }
+        } else if is_en_passant_capture(board, mv) {
+            // En passant capture (destination is empty)
+            25 // arbitrary EP value; tune as needed
+        } else {
+            0
+        };
+
+        scored_moves.push((mv, score));
+    }
+
+    // 4. Sort by descending score (higher is better)
+    scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+    // 5. Return moves only
     scored_moves.into_iter().map(|(mv, _)| mv).collect()
 }
 
