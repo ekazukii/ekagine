@@ -305,10 +305,11 @@ fn quiesce_negamax_it(
 /// Check if this position's hash has occurred more than once already.
 /// For simplicity we'll make so that repeating once is the same as repeating twice.
 /// This should not impact the evaluation of engine since repeating a move once or twice ends up anyway
-/// in the same position
+/// in the same position.
 fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
     let target = board.get_hash();
-    for &hash in repetition_table.iter().rev().skip(1) {
+    // Nice idea from akimbo engine, skip half of the repetition (all the moves of the opponent)
+    for &hash in repetition_table.iter().rev().step_by(2).skip(1) {
         if hash == target {
             return true;
         }
