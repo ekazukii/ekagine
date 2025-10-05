@@ -307,8 +307,13 @@ fn quiesce_negamax_it(
 /// This should not impact the evaluation of engine since repeating a move once or twice ends up anyway
 /// in the same position
 fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
-    let zob = board.get_hash();
-    repetition_table.get(&zob).cloned().unwrap_or(0) > 1
+    let target = board.get_hash();
+    for &hash in repetition_table.iter().rev().skip(1) {
+        if hash == target {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
@@ -349,8 +354,7 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
 fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> Option<Board> {
     // Use the chess crate's built-in null move generator
     let new_board = board.null_move()?;
-    let zob = new_board.get_hash();
-    *repetition_table.entry(zob).or_insert(0) += 1;
+    repetition_table.push(new_board.get_hash());
     Some(new_board)
 }
 
@@ -1262,6 +1266,7 @@ fn root_search_with_window(
         let (child_board, rep_table) = applied.split();
         let is_pv_node = best_move.is_none();
         let mut child_depth = max_depth.saturating_sub(1);
+
         child_depth = child_depth.min(i16::MAX as usize);
         match negamax_it(
             child_board,
