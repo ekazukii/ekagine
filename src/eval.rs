@@ -384,142 +384,129 @@ fn mobility_eval(
 /// Otherwise do a material + piece‐square evaluation.
 pub fn eval_board(board: &Board) -> i32 {
     EVAL_COUNT.fetch_add(1, Ordering::Relaxed);
-    match board.status() {
-        BoardStatus::Checkmate => {
-            if board.side_to_move() == Color::White {
-                NEG_INFINITY
-            } else {
-                POS_INFINITY
-            }
-        }
+    let mut total = 0;
 
-        BoardStatus::Stalemate => 0,
-        BoardStatus::Ongoing => {
-            let mut total = 0;
+    let white_pawns: BitBoard =
+        *board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let white_rooks: BitBoard =
+        *board.pieces(Piece::Rook) & board.color_combined(Color::White);
+    let white_knights: BitBoard =
+        *board.pieces(Piece::Knight) & board.color_combined(Color::White);
+    let white_bishops: BitBoard =
+        *board.pieces(Piece::Bishop) & board.color_combined(Color::White);
+    let white_queens: BitBoard =
+        *board.pieces(Piece::Queen) & board.color_combined(Color::White);
+    let white_king: BitBoard =
+        *board.pieces(Piece::King) & board.color_combined(Color::White);
 
-            let white_pawns: BitBoard =
-                *board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-            let white_rooks: BitBoard =
-                *board.pieces(Piece::Rook) & board.color_combined(Color::White);
-            let white_knights: BitBoard =
-                *board.pieces(Piece::Knight) & board.color_combined(Color::White);
-            let white_bishops: BitBoard =
-                *board.pieces(Piece::Bishop) & board.color_combined(Color::White);
-            let white_queens: BitBoard =
-                *board.pieces(Piece::Queen) & board.color_combined(Color::White);
-            let white_king: BitBoard =
-                *board.pieces(Piece::King) & board.color_combined(Color::White);
+    let black_pawns: BitBoard =
+        *board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    let black_rooks: BitBoard =
+        *board.pieces(Piece::Rook) & board.color_combined(Color::Black);
+    let black_knights: BitBoard =
+        *board.pieces(Piece::Knight) & board.color_combined(Color::Black);
+    let black_bishops: BitBoard =
+        *board.pieces(Piece::Bishop) & board.color_combined(Color::Black);
+    let black_queens: BitBoard =
+        *board.pieces(Piece::Queen) & board.color_combined(Color::Black);
+    let black_king: BitBoard =
+        *board.pieces(Piece::King) & board.color_combined(Color::Black);
 
-            let black_pawns: BitBoard =
-                *board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-            let black_rooks: BitBoard =
-                *board.pieces(Piece::Rook) & board.color_combined(Color::Black);
-            let black_knights: BitBoard =
-                *board.pieces(Piece::Knight) & board.color_combined(Color::Black);
-            let black_bishops: BitBoard =
-                *board.pieces(Piece::Bishop) & board.color_combined(Color::Black);
-            let black_queens: BitBoard =
-                *board.pieces(Piece::Queen) & board.color_combined(Color::Black);
-            let black_king: BitBoard =
-                *board.pieces(Piece::King) & board.color_combined(Color::Black);
+    if white_bishops.popcnt() == 2 {
+        total += BISHOP_PAIR_VAL;
+    }
 
-            if white_bishops.popcnt() == 2 {
-                total += BISHOP_PAIR_VAL;
-            }
+    if black_bishops.popcnt() == 2 {
+        total -= BISHOP_PAIR_VAL;
+    }
 
-            if black_bishops.popcnt() == 2 {
-                total -= BISHOP_PAIR_VAL;
-            }
+    total += pieces_type_eval(&white_pawns, &PAWNS_VALUE_MAPPING_WHITE, PAWN_BASE_VAL);
+    total += pieces_type_eval(&white_rooks, &ROOKS_VALUE_MAPPING_WHITE, ROOK_BASE_VAL);
+    total += pieces_type_eval(
+        &white_knights,
+        &KNIGHTS_VALUE_MAPPING_WHITE,
+        KNIGHT_BASE_VAL,
+    );
+    total += pieces_type_eval(
+        &white_bishops,
+        &BISHOPS_VALUE_MAPPING_WHITE,
+        BISHOP_BASE_VAL,
+    );
+    total += pieces_type_eval(&white_queens, &QUEENS_VALUE_MAPPING_WHITE, QUEEN_BASE_VAL);
 
-            total += pieces_type_eval(&white_pawns, &PAWNS_VALUE_MAPPING_WHITE, PAWN_BASE_VAL);
-            total += pieces_type_eval(&white_rooks, &ROOKS_VALUE_MAPPING_WHITE, ROOK_BASE_VAL);
-            total += pieces_type_eval(
-                &white_knights,
-                &KNIGHTS_VALUE_MAPPING_WHITE,
-                KNIGHT_BASE_VAL,
-            );
-            total += pieces_type_eval(
-                &white_bishops,
-                &BISHOPS_VALUE_MAPPING_WHITE,
-                BISHOP_BASE_VAL,
-            );
-            total += pieces_type_eval(&white_queens, &QUEENS_VALUE_MAPPING_WHITE, QUEEN_BASE_VAL);
+    total -= pieces_type_eval(&black_pawns, &PAWNS_VALUE_MAPPING_BLACK, PAWN_BASE_VAL);
+    total -= pieces_type_eval(&black_rooks, &ROOKS_VALUE_MAPPING_BLACK, ROOK_BASE_VAL);
+    total -= pieces_type_eval(
+        &black_knights,
+        &KNIGHTS_VALUE_MAPPING_BLACK,
+        KNIGHT_BASE_VAL,
+    );
+    total -= pieces_type_eval(
+        &black_bishops,
+        &BISHOPS_VALUE_MAPPING_BLACK,
+        BISHOP_BASE_VAL,
+    );
+    total -= pieces_type_eval(&black_queens, &QUEENS_VALUE_MAPPING_BLACK, QUEEN_BASE_VAL);
 
-            total -= pieces_type_eval(&black_pawns, &PAWNS_VALUE_MAPPING_BLACK, PAWN_BASE_VAL);
-            total -= pieces_type_eval(&black_rooks, &ROOKS_VALUE_MAPPING_BLACK, ROOK_BASE_VAL);
-            total -= pieces_type_eval(
-                &black_knights,
-                &KNIGHTS_VALUE_MAPPING_BLACK,
-                KNIGHT_BASE_VAL,
-            );
-            total -= pieces_type_eval(
-                &black_bishops,
-                &BISHOPS_VALUE_MAPPING_BLACK,
-                BISHOP_BASE_VAL,
-            );
-            total -= pieces_type_eval(&black_queens, &QUEENS_VALUE_MAPPING_BLACK, QUEEN_BASE_VAL);
+    total += pawn_structure_eval(white_pawns, White);
+    total += pawn_structure_eval(black_pawns, Black);
 
-            total += pawn_structure_eval(white_pawns, White);
-            total += pawn_structure_eval(black_pawns, Black);
+    total += passed_pawn_eval(white_pawns, black_pawns, White);
+    total += passed_pawn_eval(black_pawns, white_pawns, Black);
 
-            total += passed_pawn_eval(white_pawns, black_pawns, White);
-            total += passed_pawn_eval(black_pawns, white_pawns, Black);
+    let white_pieces = *board.color_combined(Color::White);
+    let black_pieces = *board.color_combined(Color::Black);
+    let occupied = *board.combined();
 
-            let white_pieces = *board.color_combined(Color::White);
-            let black_pieces = *board.color_combined(Color::Black);
-            let occupied = *board.combined();
+    total += mobility_eval(
+        White,
+        white_knights,
+        white_bishops,
+        white_rooks,
+        white_queens,
+        white_king,
+        white_pieces,
+        occupied,
+    );
 
-            total += mobility_eval(
-                White,
-                white_knights,
-                white_bishops,
-                white_rooks,
-                white_queens,
-                white_king,
-                white_pieces,
-                occupied,
-            );
+    total += mobility_eval(
+        Black,
+        black_knights,
+        black_bishops,
+        black_rooks,
+        black_queens,
+        black_king,
+        black_pieces,
+        occupied,
+    );
 
-            total += mobility_eval(
-                Black,
-                black_knights,
-                black_bishops,
-                black_rooks,
-                black_queens,
-                black_king,
-                black_pieces,
-                occupied,
-            );
+    let prog = endgame_progress(board);
 
-            let prog = endgame_progress(board);
+    // The evaluation of the kings is different since we want to weight the change the evaluation
+    // based on the progress of the game, the more advance in the game the less the king safety is important
+    // and the more we need the king advanced on the board
+    for sq in white_king {
+        let idx = sq.to_index();
+        let start_val = KING_START_VALUE_MAPPING_WHITE[idx];
+        let end_val = KING_END_VALUE_MAPPING_WHITE[idx];
+        let weighted = ((100 - prog) * start_val + prog * end_val + 50) / 100;
+        total += weighted;
 
-            // The evaluation of the kings is different since we want to weight the change the evaluation
-            // based on the progress of the game, the more advance in the game the less the king safety is important
-            // and the more we need the king advanced on the board
-            for sq in white_king {
-                let idx = sq.to_index();
-                let start_val = KING_START_VALUE_MAPPING_WHITE[idx];
-                let end_val = KING_END_VALUE_MAPPING_WHITE[idx];
-                let weighted = ((100 - prog) * start_val + prog * end_val + 50) / 100;
-                total += weighted;
-
-                if prog < 50 {
-                    total += (king_safety_eval(board, sq, White) * (100 - prog)) / 100
-                }
-            }
-            for sq in black_king {
-                let idx = sq.to_index();
-                let start_val = KING_START_VALUE_MAPPING_BLACK[idx];
-                let end_val = KING_END_VALUE_MAPPING_BLACK[idx];
-                let weighted = ((100 - prog) * start_val + prog * end_val + 50) / 100;
-                total -= weighted;
-
-                if prog < 50 {
-                    total -= (king_safety_eval(board, sq, Black) * (100 - prog)) / 100
-                }
-            }
-
-            total
+        if prog < 50 {
+            total += (king_safety_eval(board, sq, White) * (100 - prog)) / 100
         }
     }
+    for sq in black_king {
+        let idx = sq.to_index();
+        let start_val = KING_START_VALUE_MAPPING_BLACK[idx];
+        let end_val = KING_END_VALUE_MAPPING_BLACK[idx];
+        let weighted = ((100 - prog) * start_val + prog * end_val + 50) / 100;
+        total -= weighted;
+
+        if prog < 50 {
+            total -= (king_safety_eval(board, sq, Black) * (100 - prog)) / 100
+        }
+    }
+
+    total
 }
