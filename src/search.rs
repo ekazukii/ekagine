@@ -274,7 +274,7 @@ fn quiesce_negamax_it(
         if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
             continue;
         }
-        if static_exchange_eval(board, mv) < 0 {
+        if should_see_prune(board, mv) {
             continue;
         }
         let new_board = board_do_move(board, mv, repetition_table);
