@@ -15,7 +15,7 @@ use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
 use serde::Deserialize;
-use std::collections::{hash_map, HashMap};
+use std::collections::HashMap;
 use std::fmt::format;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Stdout, Write};
@@ -38,7 +38,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
-type RepetitionTable = HashMap<u64, usize>;
+type RepetitionTable = Vec<u64>;
 type PVTable = HashMap<u64, ChessMove>;
 
 /// Apply a move and update `repetition_table` by incrementing the count
@@ -49,9 +49,7 @@ type PVTable = HashMap<u64, ChessMove>;
 ///
 fn board_do_move(board: &Board, mv: ChessMove, repetition_table: &mut RepetitionTable) -> Board {
     let new_board = board.make_move_new(mv);
-    let zob = new_board.get_hash();
-    let counter = repetition_table.entry(zob).or_insert(0);
-    *counter += 1;
+    repetition_table.push(new_board.get_hash());
     new_board
 }
 
@@ -61,10 +59,8 @@ fn board_do_move(board: &Board, mv: ChessMove, repetition_table: &mut Repetition
 ///
 fn board_pop(board: &Board, repetition_table: &mut RepetitionTable) {
     let zob = board.get_hash();
-    if let Some(count) = repetition_table.get_mut(&zob) {
-        if *count > 0 {
-            *count -= 1;
-        }
+    if let Some(last) = repetition_table.pop() {
+        debug_assert_eq!(last, zob, "repetition stack imbalance");
     }
 }
 
@@ -148,7 +144,7 @@ fn uci_loop() {
     let mut stdout = io::stdout();
     let mut board = Board::default();
     let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: RepetitionTable = HashMap::new();
+    let mut repetition_table: RepetitionTable = vec![board.get_hash()];
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
@@ -171,6 +167,7 @@ fn uci_loop() {
                 board = Board::default();
                 transpo_table.clear();
                 repetition_table.clear();
+                repetition_table.push(board.get_hash());
             }
             "position" => {
                 repetition_table.clear();
@@ -185,6 +182,8 @@ fn uci_loop() {
                     i += 7;
                 }
 
+                repetition_table.push(board.get_hash());
+
                 if i < tokens.len() && tokens[i] == "moves" {
                     i += 1;
                     for mv_str in &tokens[i..] {
@@ -193,8 +192,7 @@ fn uci_loop() {
                         } else if let Ok(mv) = ChessMove::from_str(mv_str) {
                             board = board.make_move_new(mv);
                         }
-                        let zob = board.get_hash();
-                        *repetition_table.entry(zob).or_insert(0) += 1;
+                        repetition_table.push(board.get_hash());
                     }
                 }
             }
@@ -203,11 +201,6 @@ fn uci_loop() {
 
                 EVAL_COUNT.store(0, Ordering::Relaxed);
                 CACHE_COUNT.store(0, Ordering::Relaxed);
-                let zob_start = board.get_hash();
-                repetition_table.insert(
-                    zob_start,
-                    repetition_table.get(&zob_start).cloned().unwrap_or(0) + 1,
-                );
 
                 let max_ply = 100;
                 let outcome = best_move_interruptible(
@@ -354,13 +347,12 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         CACHE_COUNT.store(0, Ordering::Relaxed);
 
         let (outcome, duration) = time_fn(|| {
-            let mut repetition_table: RepetitionTable = HashMap::new();
             let mut transpo_table = TranspositionTable::new();
             best_move_interruptible(
                 key,
                 Duration::from_millis(90),
                 1000,
-                RepetitionTable::new(),
+                vec![key.get_hash()],
                 &mut transpo_table,
                 None,
             )
@@ -416,8 +408,7 @@ pub fn compute_best_from_fen(
     let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
     let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: HashMap<u64, usize> = HashMap::new();
-    repetition_table.insert(board.get_hash(), 1);
+    let mut repetition_table: RepetitionTable = vec![board.get_hash()];
 
     let outcome = best_move_using_iterative_deepening(
         &board,
