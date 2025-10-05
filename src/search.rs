@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
+use chess::Piece::{Pawn, Queen};
 /* For reference
 type TranspositionTable = HashMap<u64, i32>;
 type RepetitionTable    = HashMap<u64, usize>;
@@ -547,6 +548,30 @@ fn select_least_valuable_attacker(
         }
     }
     None
+}
+
+fn should_see_prune(board: &Board, mv: ChessMove) -> bool {
+    let from = mv.get_source();
+    let moving_piece = match board.piece_on(from) {
+        Some(p) => p,
+        None => return false
+    };
+
+    if moving_piece == Pawn {
+        return false; // Taking with a pawn can never be SEE loosing
+    }
+
+    let to = mv.get_dest();
+    let captured_piece = match board.piece_on(to) {
+        Some(p ) => p,
+        None => return false // Never occurs cause never be en passant since pawn already ignored
+    };
+
+    if captured_piece == Queen {
+        return false; // Taking a queen can never be SEE loosing
+    }
+
+    static_exchange_eval(board, mv) < 0
 }
 
 fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
@@ -1167,23 +1192,6 @@ fn negamax_it(
     SearchScore::EVAL(best_value)
 }
 
-fn log_root_move_start(
-    out: &mut Stdout,
-    depth: usize,
-    mv: &ChessMove,
-    current_best: Option<(ChessMove, i32)>,
-) {
-    let info_line = if let Some((best_move, best_score)) = current_best {
-        format!(
-            "info string [{}] evaluating move : {}, curr best is {} ({})",
-            depth, mv, best_move, best_score
-        )
-    } else {
-        format!("info string [{}] evaluating move : {}", depth, mv)
-    };
-    send_message(out, &info_line);
-}
-
 fn log_root_best_update(
     out: &mut Stdout,
     depth: usize,
@@ -1256,7 +1264,6 @@ fn root_search_with_window(
         }
 
         let current_best = best_move.map(|bm| (bm, best_value));
-        //log_root_move_start(&mut out, max_depth, &mv, current_best);
 
         let mut applied = AppliedBoard::new(board, mv, repetition_table);
         let (child_board, rep_table) = applied.split();
