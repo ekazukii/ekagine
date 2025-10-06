@@ -242,21 +242,26 @@ fn quiesce_negamax_it(
     stats: &mut SearchStats,
 ) -> i32 {
     stats.qnodes += 1;
+    if is_in_threefold_scenario(board, repetition_table) {
+        return 0;
+    }
+
     match board.status() {
         BoardStatus::Checkmate => return mated_in_plies(ply_from_root),
         BoardStatus::Stalemate => return 0,
         BoardStatus::Ongoing => {}
     }
 
-    if remain_quiet == 0 || is_in_threefold_scenario(board, repetition_table) {
-        return color * cache_eval(board, transpo_table, repetition_table);
+    let stand_pat = color * cache_eval(board, transpo_table, repetition_table);
+    if remain_quiet == 0 {
+        return stand_pat;
     }
 
-    let stand_pat = color * cache_eval(board, transpo_table, repetition_table);
     if stand_pat >= beta {
         stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
     }
+
     if stand_pat > alpha {
         alpha = stand_pat;
     }
