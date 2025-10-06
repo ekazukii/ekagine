@@ -28,7 +28,7 @@ enum MoveGenState {
 }
 
 pub struct IncrementalMoveGen<'a> {
-    iterator: Option<MoveGen>,
+    iterator: MoveGen,
     state: MoveGenState,
     board: &'a Board,
     pv_move: Option<ChessMove>,
@@ -49,7 +49,7 @@ impl<'a> IncrementalMoveGen<'a> {
     ) -> Self {
         let zob = board.get_hash();
         Self {
-            iterator: None,
+            iterator: MoveGen::new_legal(&board),
             state: PrincipalVariation,
             board,
             pv_move: pv_table.get(&zob).copied(),
@@ -70,10 +70,16 @@ impl<'a> IncrementalMoveGen<'a> {
             false
         }
     }
+
+    // Game's over if player cannot play a single move
+    pub fn is_over(&self) -> bool {
+        self.iterator.len() == 0
+    }
 }
 
 impl Iterator for IncrementalMoveGen<'_> {
     type Item = ChessMove;
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.state == PrincipalVariation {
             if self.pv_move.is_some() {
@@ -110,18 +116,14 @@ impl Iterator for IncrementalMoveGen<'_> {
             self.state = Remaining;
         }
 
-        let mut iter = self
-            .iterator
-            .get_or_insert_with(|| MoveGen::new_legal(&self.board));
-
         if self.state == Captures {
             if self.capt_idx.is_none() {
                 // Sort for captures
                 let targets = self.board.color_combined(!self.board.side_to_move());
-                iter.set_iterator_mask(*targets);
+                self.iterator.set_iterator_mask(*targets);
 
                 let mut scored_moves: SmallVec<[(ChessMove, i32); 32]> = SmallVec::new();
-                for mv in &mut iter {
+                for mv in &mut self.iterator {
                     if Some(mv) == self.tt_move || Some(mv) == self.pv_move {
                         continue;
                     }
@@ -148,12 +150,12 @@ impl Iterator for IncrementalMoveGen<'_> {
                 return Some(mv);
             } else {
                 self.state = Killers;
-                iter.set_iterator_mask(!EMPTY);
+                self.iterator.set_iterator_mask(!EMPTY);
             }
         }
 
         loop {
-            let mv = iter.next();
+            let mv = self.iterator.next();
             if (self.pv_move.is_some() && mv == self.pv_move)
                 || (self.tt_move.is_some() && mv == self.tt_move)
             {
