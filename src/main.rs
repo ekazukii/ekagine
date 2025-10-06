@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, thread};
+use chess::Piece::Pawn;
 
 static EVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CACHE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -38,8 +39,38 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
-type RepetitionTable = Vec<u64>;
 type PVTable = HashMap<u64, ChessMove>;
+
+#[derive(Debug, Clone)]
+pub struct RepetitionTable {
+    pub hashs: Vec<u64>,
+    pub halfclock: Vec<usize>
+}
+
+impl RepetitionTable {
+    pub fn new(hash: u64) -> Self {
+        Self {
+            hashs: vec![hash],
+            halfclock: Vec::new()
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.hashs.clear();
+        self.halfclock.clear();
+    }
+
+    pub fn update_half_move(&mut self, board: &Board, mv: ChessMove) {
+        let moved_piece = board.piece_on(mv.get_source()).unwrap();
+        // Pawn move or capture reset the clock
+        if moved_piece == Pawn || board.piece_on(mv.get_dest()).is_some() {
+            self.halfclock.push(0);
+            return;
+        }
+
+        self.halfclock.push(self.halfclock.last().unwrap_or(&0) + 1);
+    }
+}
 
 /// Apply a move and update `repetition_table` by incrementing the count
 /// for the new position's Zobrist hash. Returns the new Board.
@@ -48,8 +79,9 @@ type PVTable = HashMap<u64, ChessMove>;
 ///
 ///
 fn board_do_move(board: &Board, mv: ChessMove, repetition_table: &mut RepetitionTable) -> Board {
+    repetition_table.update_half_move(board, mv, );
     let new_board = board.make_move_new(mv);
-    repetition_table.push(new_board.get_hash());
+    repetition_table.hashs.push(new_board.get_hash());
     new_board
 }
 
@@ -59,9 +91,8 @@ fn board_do_move(board: &Board, mv: ChessMove, repetition_table: &mut Repetition
 ///
 fn board_pop(board: &Board, repetition_table: &mut RepetitionTable) {
     let zob = board.get_hash();
-    if let Some(last) = repetition_table.pop() {
-        debug_assert_eq!(last, zob, "repetition stack imbalance");
-    }
+    repetition_table.hashs.pop();
+    repetition_table.halfclock.pop();
 }
 
 fn send_message(stdout: &mut Stdout, message: &str) {
@@ -144,7 +175,7 @@ fn uci_loop() {
     let mut stdout = io::stdout();
     let mut board = Board::default();
     let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: RepetitionTable = vec![board.get_hash()];
+    let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
@@ -167,7 +198,7 @@ fn uci_loop() {
                 board = Board::default();
                 transpo_table.clear();
                 repetition_table.clear();
-                repetition_table.push(board.get_hash());
+                repetition_table.hashs.push(board.get_hash());
             }
             "position" => {
                 repetition_table.clear();
@@ -179,20 +210,23 @@ fn uci_loop() {
                 } else if i < tokens.len() && tokens[i] == "fen" {
                     let fen = tokens[i + 1..i + 7].join(" ");
                     board = Board::from_str(&fen).unwrap();
+                    // TODO: Read the clock from fen
                     i += 7;
                 }
 
-                repetition_table.push(board.get_hash());
+                repetition_table.hashs.push(board.get_hash());
 
                 if i < tokens.len() && tokens[i] == "moves" {
                     i += 1;
                     for mv_str in &tokens[i..] {
                         if let Ok(mv) = ChessMove::from_san(&board, mv_str) {
+                            repetition_table.update_half_move(&board, mv);
                             board = board.make_move_new(mv);
                         } else if let Ok(mv) = ChessMove::from_str(mv_str) {
+                            repetition_table.update_half_move(&board, mv);
                             board = board.make_move_new(mv);
                         }
-                        repetition_table.push(board.get_hash());
+                        repetition_table.hashs.push(board.get_hash());
                     }
                 }
             }
@@ -352,7 +386,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 key,
                 Duration::from_millis(90),
                 1000,
-                vec![key.get_hash()],
+                RepetitionTable::new(key.get_hash()),
                 &mut transpo_table,
                 None,
             )
@@ -408,7 +442,7 @@ pub fn compute_best_from_fen(
     let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
     let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: RepetitionTable = vec![board.get_hash()];
+    let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
     let outcome = best_move_using_iterative_deepening(
         &board,

@@ -308,7 +308,16 @@ fn quiesce_negamax_it(
 /// in the same position
 fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
     let target = board.get_hash();
-    for &hash in repetition_table.iter().rev().skip(1) {
+    let hashes = &repetition_table.hashs;
+    if hashes.is_empty() {
+        return false;
+    }
+
+    let current_idx = hashes.len() - 1;
+    let since_reset = repetition_table.halfclock.last().copied().unwrap_or(0);
+    let min_index = current_idx.saturating_sub(since_reset);
+
+    for &hash in hashes[min_index..current_idx].iter().rev() {
         if hash == target {
             return true;
         }
@@ -354,7 +363,8 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
 fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> Option<Board> {
     // Use the chess crate's built-in null move generator
     let new_board = board.null_move()?;
-    repetition_table.push(new_board.get_hash());
+    repetition_table.hashs.push(new_board.get_hash());
+    repetition_table.halfclock.push(repetition_table.halfclock.last().unwrap_or(&0) + 1);
     Some(new_board)
 }
 
