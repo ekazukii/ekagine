@@ -309,7 +309,7 @@ fn quiesce_negamax_it(
 fn is_in_threefold_scenario(board: &Board, t: &RepetitionTable) -> bool {
     let target = board.get_hash();
     if t.len() < 2 { return false; }
-    let mut i = t.len() - 2;
+    let mut i = t.len() - 1;
     loop {
         if t[i] == target { return true; }
         if i < 2 { break; }
