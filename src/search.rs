@@ -306,16 +306,22 @@ fn quiesce_negamax_it(
 /// For simplicity we'll make so that repeating once is the same as repeating twice.
 /// This should not impact the evaluation of engine since repeating a move once or twice ends up anyway
 /// in the same position.
-fn is_in_threefold_scenario(board: &Board, t: &RepetitionTable) -> bool {
+fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
     let target = board.get_hash();
-    if t.len() < 2 { return false; }
-    let mut i = t.len() - 1;
+    let len = repetition_table.len();
+    if len < 6 {
+        return false;
+    }
+    let mut i = len - 3;
     loop {
-        if t[i] == target { return true; }
-        if i < 2 { break; }
+        if repetition_table[i] == target {
+            return true;
+        }
+        if i < 2 {
+            return false;
+        }
         i -= 2;
     }
-    false
 }
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
