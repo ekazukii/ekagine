@@ -27,5 +27,5 @@ jobs:
               \"openingsUrl\": \"https://github.com/official-stockfish/books/raw/refs/heads/master/8moves_v3.pgn.zip\",
               \"targetNGames\": 10000,
               \"batchSize\": 40,
-              \"sprt\": { \"h0Elo\": 0, \"h1Elo\": 5, \"alpha\": 0.05, \"beta\": 0.05 }
+              \"sprt\": { \"h0Elo\": -10, \"h1Elo\": 0, \"alpha\": 0.05, \"beta\": 0.05 }
             }"
