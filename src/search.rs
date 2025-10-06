@@ -838,11 +838,6 @@ fn negamax_it(
     if is_in_threefold_scenario(board, repetition_table) {
         return SearchScore::EVAL(0);
     }
-    match board.status() {
-        BoardStatus::Checkmate => return SearchScore::EVAL(mated_in_plies(ply_from_root)),
-        BoardStatus::Stalemate => return SearchScore::EVAL(0),
-        BoardStatus::Ongoing => {}
-    }
 
     // Start quiesce search if we exhausted the search depth
     if depth <= 0 {
@@ -975,6 +970,14 @@ fn negamax_it(
     let killer_moves = killers.killers_for(ply_index);
     let mut incremental_move_gen =
         IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves);
+
+    if incremental_move_gen.is_over() {
+        if in_check {
+            return SearchScore::EVAL(mated_in_plies(ply_from_root))
+        }
+        // Else in stalemate
+        return SearchScore::EVAL(0);
+    }
 
     // Start the main search
     let mut move_idx: usize = 0;
