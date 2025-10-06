@@ -306,13 +306,14 @@ fn quiesce_negamax_it(
 /// For simplicity we'll make so that repeating once is the same as repeating twice.
 /// This should not impact the evaluation of engine since repeating a move once or twice ends up anyway
 /// in the same position.
-fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
+fn is_in_threefold_scenario(board: &Board, t: &RepetitionTable) -> bool {
     let target = board.get_hash();
-    // Nice idea from akimbo engine, skip half of the repetition (all the moves of the opponent)
-    for &hash in repetition_table.iter().rev().step_by(2).skip(1) {
-        if hash == target {
-            return true;
-        }
+    if t.len() < 2 { return false; }
+    let mut i = t.len() - 2;
+    loop {
+        if t[i] == target { return true; }
+        if i < 2 { break; }
+        i -= 2;
     }
     false
 }
