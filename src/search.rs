@@ -242,11 +242,6 @@ fn quiesce_negamax_it(
     stats: &mut SearchStats,
 ) -> i32 {
     stats.qnodes += 1;
-    match board.status() {
-        BoardStatus::Checkmate => return mated_in_plies(ply_from_root),
-        BoardStatus::Stalemate => return 0,
-        BoardStatus::Ongoing => {}
-    }
 
     if remain_quiet == 0 || is_in_threefold_scenario(board, repetition_table) {
         return color * cache_eval(board, transpo_table, repetition_table);
