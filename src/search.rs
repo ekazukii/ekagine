@@ -313,9 +313,11 @@ fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -
         return false;
     }
 
-    let current_idx = hashes.len() - 1;
+    let current_idx = repetition_table.hashs.len().saturating_sub(1);
+    // halfclock value that corresponds to current_idx; if halfclock is shorter by one, use last()
     let since_reset = repetition_table.halfclock.last().copied().unwrap_or(0);
-    let min_index = current_idx.saturating_sub(since_reset);
+    let window_len = since_reset.min(current_idx);
+    let min_index = current_idx.saturating_sub(window_len);
 
     for &hash in hashes[min_index..current_idx].iter().rev() {
         if hash == target {
