@@ -243,7 +243,7 @@ fn quiesce_negamax_it(
 ) -> i32 {
     stats.qnodes += 1;
 
-    if remain_quiet == 0 || is_in_threefold_scenario(board, repetition_table) {
+    if remain_quiet == 0 || repetition_table.is_in_threefold_scenario(board) {
         return color * cache_eval(board, transpo_table, repetition_table);
     }
 
@@ -297,20 +297,6 @@ fn quiesce_negamax_it(
     alpha
 }
 
-/// Check if this position's hash has occurred more than once already.
-/// For simplicity we'll make so that repeating once is the same as repeating twice.
-/// This should not impact the evaluation of engine since repeating a move once or twice ends up anyway
-/// in the same position
-fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
-    let target = board.get_hash();
-    for &hash in repetition_table.iter().rev().skip(1) {
-        if hash == target {
-            return true;
-        }
-    }
-    false
-}
-
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
 /// If not found, compute via `eval_board`, insert into the table, and return.
 fn cache_eval(
@@ -318,7 +304,7 @@ fn cache_eval(
     transpo_table: &mut TranspositionTable,
     repetition_table: &RepetitionTable,
 ) -> i32 {
-    if is_in_threefold_scenario(board, repetition_table) {
+    if repetition_table.is_in_threefold_scenario(board) {
         return 0;
     }
     let zob = board.get_hash();
@@ -349,7 +335,7 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
 fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> Option<Board> {
     // Use the chess crate's built-in null move generator
     let new_board = board.null_move()?;
-    repetition_table.push(new_board.get_hash());
+    repetition_table.push(new_board.get_hash(), true);
     Some(new_board)
 }
 
@@ -786,7 +772,7 @@ fn negamax_it(
     stats.nodes += 1;
 
     // If game is over
-    if is_in_threefold_scenario(board, repetition_table) {
+    if repetition_table.is_in_threefold_scenario(board) {
         return SearchScore::EVAL(0);
     }
 
