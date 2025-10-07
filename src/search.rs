@@ -303,7 +303,8 @@ fn quiesce_negamax_it(
 /// in the same position
 fn is_in_threefold_scenario(board: &Board, repetition_table: &RepetitionTable) -> bool {
     let target = board.get_hash();
-    for &hash in repetition_table.iter().rev().skip(1) {
+    // TODO: Should implement a proper counter since halfmove clock reset
+    for &hash in repetition_table.iter().rev().skip(1).take(30) {
         if hash == target {
             return true;
         }
