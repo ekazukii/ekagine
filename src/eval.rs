@@ -628,276 +628,116 @@ fn select_least_valuable_attacker(
     None
 }
 
-pub fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
-    let from = mv.get_source();
-    let to = mv.get_dest();
-
-    let moving_piece = match board.piece_on(from) {
-        Some(p) => p,
-        None => return 0,
-    };
-    let captured_piece = if is_en_passant_capture(board, mv) {
-        Some(Piece::Pawn)
-    } else {
-        board.piece_on(to)
-    };
-    if captured_piece.is_none() {
-        return 0;
-    }
-    let captured_piece = captured_piece.unwrap();
-
-    let mut occ = *board.combined();
-    let mut piece_bb = [[BitBoard::new(0); 6]; 2];
-    for piece in PIECE_ORDER.iter() {
-        let idx = piece.to_index() as usize;
-        let bb = *board.pieces(*piece);
-        piece_bb[Color::White.to_index()][idx] = bb & *board.color_combined(Color::White);
-        piece_bb[Color::Black.to_index()][idx] = bb & *board.color_combined(Color::Black);
-    }
-
-    let us = board.side_to_move();
-    let them = opposite_color(us);
-    let us_idx = us.to_index();
-    let them_idx = them.to_index();
-
-    let from_bb = BitBoard::from_square(from);
-    let to_bb = BitBoard::from_square(to);
-
-    // Remove moving piece from its origin square
-    piece_bb[us_idx][moving_piece.to_index() as usize] &= !from_bb;
-    occ &= !from_bb;
-
-    // Remove captured piece
-    if is_en_passant_capture(board, mv) {
-        if let Some(capture_sq) = to.backward(us) {
-            let cap_bb = BitBoard::from_square(capture_sq);
-            piece_bb[them_idx][Piece::Pawn.to_index() as usize] &= !cap_bb;
-            occ &= !cap_bb;
-        }
-    } else {
-        piece_bb[them_idx][captured_piece.to_index() as usize] &= !to_bb;
-        occ &= !to_bb;
-    }
-
-    // Place moving piece on the destination square (handle promotion)
-    let mut current_piece = mv.get_promotion().unwrap_or(moving_piece);
-    piece_bb[us_idx][current_piece.to_index() as usize] |= to_bb;
-    occ |= to_bb;
-
-    let mut gain = [0i32; 32];
-    gain[0] = piece_value(captured_piece);
-
-    let mut attackers = compute_attackers_to(to, occ, &piece_bb);
-    let mut depth = 0usize;
-    let mut side_idx = them_idx;
-
-    while depth < gain.len() - 1 {
-        let attack_mask = attackers[side_idx] & occ;
-        if attack_mask.0 == 0 {
-            break;
-        }
-
-        depth += 1;
-        let captured_value = piece_value(current_piece);
-
-        let (att_piece, att_square) =
-            match select_least_valuable_attacker(side_idx, attack_mask, &piece_bb) {
-                Some(v) => v,
-                None => break,
-            };
-
-        gain[depth] = captured_value - gain[depth - 1];
-        if gain[depth] < 0 {
-            break;
-        }
-
-        let captured_side_idx = 1 - side_idx;
-        piece_bb[captured_side_idx][current_piece.to_index() as usize] &= !to_bb;
-        occ &= !to_bb;
-
-        let att_bb = BitBoard::from_square(att_square);
-        piece_bb[side_idx][att_piece.to_index() as usize] &= !att_bb;
-        occ &= !att_bb;
-
-        piece_bb[side_idx][att_piece.to_index() as usize] |= to_bb;
-        occ |= to_bb;
-
-        current_piece = att_piece;
-        attackers = compute_attackers_to(to, occ, &piece_bb);
-        side_idx ^= 1;
-    }
-
-    while depth > 0 {
-        gain[depth - 1] = -cmp::max(-gain[depth - 1], gain[depth]);
-        depth -= 1;
-    }
-
-    gain[0]
-}
-
-//// Returns true iff the SEE of `mv` is strictly lower than `threshold`.
-/// Units are the same as `piece_value` (centipawns).
+// Return true if SEE < threshold (i.e., fail-low)
 pub fn static_exchange_is_below(board: &Board, mv: ChessMove, threshold: i32) -> bool {
     use std::cmp;
 
-    #[inline]
-    fn select_legal_lva(
-        side_idx: usize,
-        attack_mask: BitBoard,
-        piece_bb: &[[BitBoard; 6]; 2],
-        occ: BitBoard,
-        to: Square,
-        current_piece: Piece,
-    ) -> Option<(Piece, Square)> {
-        // Choose the least valuable attacker that can legally capture on `to`
-        // without leaving its own king in check.
-        let to_bb = BitBoard::from_square(to);
-        let opp_idx = 1 - side_idx;
-
-        for piece in PIECE_ORDER.iter() {
-            let pidx = piece.to_index() as usize;
-            let mut cands = piece_bb[side_idx][pidx] & attack_mask;
-            while cands.0 != 0 {
-                let from_sq = cands.to_square();
-                let from_bb = BitBoard::from_square(from_sq);
-
-                // Simulate the capture on local copies
-                let mut occ2 = occ;
-                let mut bb2 = *piece_bb;
-
-                // Remove the piece currently on `to` (belongs to opp_idx)
-                bb2[opp_idx][current_piece.to_index() as usize] &= !to_bb;
-                occ2 &= !to_bb;
-
-                // Move our candidate attacker from `from_sq` to `to`
-                bb2[side_idx][pidx] &= !from_bb;
-                occ2 &= !from_bb;
-                bb2[side_idx][pidx] |= to_bb;
-                occ2 |= to_bb;
-
-                // Is our king safe after this capture?
-                let ksq = bb2[side_idx][Piece::King.to_index() as usize].to_square();
-                let atk_ksq = compute_attackers_to(ksq, occ2, &bb2);
-                if (atk_ksq[opp_idx].0) == 0 {
-                    return Some((*piece, from_sq));
-                }
-
-                // Try next candidate of this piece type
-                cands &= !from_bb;
-            }
-        }
-        None
-    }
-
     let from = mv.get_source();
     let to = mv.get_dest();
 
     let moving_piece = match board.piece_on(from) {
         Some(p) => p,
-        None => return 0 < threshold, // treat as 0 gain
+        None => return 0 < threshold,
     };
 
-    // Target piece, with EP handled as a pawn
-    let captured_piece = if crate::search::is_en_passant_capture(board, mv) {
-        Some(Piece::Pawn)
+    // Identify captured piece correctly (EP -> pawn)
+    let captured_piece = if is_en_passant_capture(board, mv) {
+        Some(Pawn)
     } else {
         board.piece_on(to)
     };
     if captured_piece.is_none() {
-        return 0 < threshold;
+        return 0 < threshold; // quiet move: SEE = 0
     }
     let captured_piece = captured_piece.unwrap();
 
-    // Safe fast bound: SEE can never exceed the value of the first capture
+    // Safe fast bound: SEE cannot exceed value of the first capture
     if piece_value(captured_piece) < threshold {
         return true;
     }
 
-    // Snapshot current occupancy and piece bitboards
+    // Build snapshot
     let mut occ = *board.combined();
     let mut piece_bb = [[BitBoard::new(0); 6]; 2];
     for piece in PIECE_ORDER.iter() {
-        let idx = piece.to_index() as usize;
+        let i = piece.to_index() as usize;
         let bb = *board.pieces(*piece);
-        piece_bb[Color::White.to_index()][idx] = bb & *board.color_combined(Color::White);
-        piece_bb[Color::Black.to_index()][idx] = bb & *board.color_combined(Color::Black);
+        piece_bb[Color::White.to_index()][i] = bb & *board.color_combined(Color::White);
+        piece_bb[Color::Black.to_index()][i] = bb & *board.color_combined(Color::Black);
     }
 
     let us = board.side_to_move();
     let them = opposite_color(us);
-    let us_idx = us.to_index();
-    let them_idx = them.to_index();
+    let ui = us.to_index();
+    let ti = them.to_index();
 
     let from_bb = BitBoard::from_square(from);
     let to_bb = BitBoard::from_square(to);
 
-    // Move our piece off `from`
-    piece_bb[us_idx][moving_piece.to_index() as usize] &= !from_bb;
+    // Make the first capture on the temp state
+    piece_bb[ui][moving_piece.to_index() as usize] &= !from_bb;
     occ &= !from_bb;
 
-    // Remove captured piece from the board
-    if crate::search::is_en_passant_capture(board, mv) {
-        if let Some(capture_sq) = to.backward(us) {
-            let cap_bb = BitBoard::from_square(capture_sq);
-            piece_bb[them_idx][Piece::Pawn.to_index() as usize] &= !cap_bb;
+    if is_en_passant_capture(board, mv) {
+        if let Some(csq) = to.backward(us) {
+            let cap_bb = BitBoard::from_square(csq);
+            piece_bb[ti][Piece::Pawn.to_index() as usize] &= !cap_bb;
             occ &= !cap_bb;
         }
     } else {
-        piece_bb[them_idx][captured_piece.to_index() as usize] &= !to_bb;
+        piece_bb[ti][captured_piece.to_index() as usize] &= !to_bb;
         occ &= !to_bb;
     }
 
-    // Place our moving piece on `to` (promotion handled)
     let mut current_piece = mv.get_promotion().unwrap_or(moving_piece);
-    piece_bb[us_idx][current_piece.to_index() as usize] |= to_bb;
+    piece_bb[ui][current_piece.to_index() as usize] |= to_bb;
     occ |= to_bb;
 
-    // Classical SWAP list
+    // SWAP
     let mut gain = [0i32; 32];
     gain[0] = piece_value(captured_piece);
 
     let mut attackers = compute_attackers_to(to, occ, &piece_bb);
     let mut depth = 0usize;
-    let mut side_idx = them_idx;
+    let mut side = ti;
 
     while depth < gain.len() - 1 {
-        // Only attackers that still occupy their squares
-        let attack_mask = attackers[side_idx] & occ;
+        let attack_mask = attackers[side] & occ;
         if attack_mask.0 == 0 {
             break;
         }
 
-        // Select a legal least-valuable attacker
-        let lva = select_legal_lva(side_idx, attack_mask, &piece_bb, occ, to, current_piece);
-        let (att_piece, att_square) = match lva {
+        let (att_piece, att_sq) = match select_least_valuable_attacker(side, attack_mask, &piece_bb) {
             Some(v) => v,
-            None => break, // all pseudo-attackers were illegal
+            None => break,
         };
 
         depth += 1;
-
-        // Speculative store as in CPW/Stockfish SWAP
         let captured_value = piece_value(current_piece);
         gain[depth] = captured_value - gain[depth - 1];
 
-        // Apply the capture to our temp state
-        let captured_side_idx = 1 - side_idx;
-        piece_bb[captured_side_idx][current_piece.to_index() as usize] &= !to_bb;
+        // Safe early cut: for nonnegative thresholds we can stop once this goes negative
+        if threshold >= 0 && gain[depth] < 0 {
+            break;
+        }
+
+        // Make the recapture
+        let opp = 1 - side;
+        piece_bb[opp][current_piece.to_index() as usize] &= !to_bb;
         occ &= !to_bb;
 
-        let att_bb = BitBoard::from_square(att_square);
-        piece_bb[side_idx][att_piece.to_index() as usize] &= !att_bb;
+        let att_bb = BitBoard::from_square(att_sq);
+        piece_bb[side][att_piece.to_index() as usize] &= !att_bb;
         occ &= !att_bb;
 
-        piece_bb[side_idx][att_piece.to_index() as usize] |= to_bb;
+        piece_bb[side][att_piece.to_index() as usize] |= to_bb;
         occ |= to_bb;
 
         current_piece = att_piece;
         attackers = compute_attackers_to(to, occ, &piece_bb);
-        side_idx ^= 1;
+        side ^= 1;
     }
 
-    // Negamax backprop
     while depth > 0 {
         gain[depth - 1] = -cmp::max(-gain[depth - 1], gain[depth]);
         depth -= 1;
@@ -917,14 +757,14 @@ mod tests {
     fn see_favorable_capture() {
         let board = Board::from_str("k7/3p4/8/8/8/8/3R4/7K w - - 0 1").expect("valid FEN");
         let mv = ChessMove::new(Square::D2, Square::D7, None);
-        assert!(static_exchange_eval(&board, mv) > 0);
+        assert!(!static_exchange_is_below(&board, mv, 0));
     }
 
     #[test]
     fn see_unfavorable_capture() {
         let board = Board::from_str("k7/8/4p3/3p4/8/8/8/3Q3K w - - 0 1").expect("valid FEN");
         let mv = ChessMove::new(Square::D1, Square::D5, None);
-        let see = static_exchange_eval(&board, mv);
-        assert!(see < 0, "expected SEE < 0, got {}", see);
+        let see = static_exchange_is_below(&board, mv, 0);
+        assert!(see, "expected SEE < 0, got {}", see);
     }
 }

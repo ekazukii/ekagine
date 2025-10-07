@@ -1,4 +1,4 @@
-use crate::eval::{eval_board, piece_value, static_exchange_eval, static_exchange_is_below};
+use crate::eval::{eval_board, piece_value, static_exchange_is_below};
 use crate::movegen::IncrementalMoveGen;
 use crate::{
     board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTFlag,
