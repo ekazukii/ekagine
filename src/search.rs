@@ -353,50 +353,6 @@ fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> 
     Some(new_board)
 }
 
-struct AppliedBoard<'a> {
-    board: Board,
-    repetition_table: *mut RepetitionTable,
-    popped: bool,
-    _marker: PhantomData<&'a mut RepetitionTable>,
-}
-
-impl<'a> AppliedBoard<'a> {
-    fn new(parent: &Board, mv: ChessMove, repetition_table: &'a mut RepetitionTable) -> Self {
-        let board = board_do_move(parent, mv, repetition_table);
-        Self {
-            board,
-            repetition_table,
-            popped: false,
-            _marker: PhantomData,
-        }
-    }
-
-    fn board(&self) -> &Board {
-        &self.board
-    }
-
-    fn split(&mut self) -> (&Board, &mut RepetitionTable) {
-        let board_ptr: *const Board = &self.board;
-        let rep_ptr = self.repetition_table;
-        unsafe { (&*board_ptr, &mut *rep_ptr) }
-    }
-
-    fn mark_popped(&mut self) {
-        if !self.popped {
-            unsafe {
-                board_pop(&self.board, &mut *self.repetition_table);
-            }
-            self.popped = true;
-        }
-    }
-}
-
-impl<'a> Drop for AppliedBoard<'a> {
-    fn drop(&mut self) {
-        self.mark_popped();
-    }
-}
-
 const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     // Victim = Pawn
     [15, 14, 13, 12, 11, 10],
@@ -980,12 +936,12 @@ fn negamax_it(
         if incremental_move_gen.take_capture_generation_event() {
             stats.incremental_move_gen_capture_lists += 1;
         }
-        let mut applied = AppliedBoard::new(board, mv, repetition_table);
+        let new_board = board_do_move(board, mv, repetition_table);
 
         // Determine properties for LMR conditions
         let is_capture =
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
-        let gives_check = applied.board().checkers().popcnt() > 0;
+        let gives_check = new_board.checkers().popcnt() > 0;
         let is_first_move = move_idx == 0; // treat first move as PV
         let child_is_pv_node = is_pv_node && is_first_move;
 
@@ -996,7 +952,7 @@ fn negamax_it(
         } else if depth_remaining <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
             && depth_remaining > 0
             //TODO: Maybe add an endgame closeness to trigger the is_passed_pawn_push call (can be computed at the root and just be passed bellow)
-            && is_passed_pawn_push(board, applied.board(), mv)
+            && is_passed_pawn_push(board, &new_board, mv)
         {
             extension = 1;
         }
@@ -1014,6 +970,7 @@ fn negamax_it(
                 if stand_pat + margin <= alpha {
                     stats.futility_prunes += 1;
                     move_idx += 1;
+                    repetition_table.pop();
                     continue;
                 }
             }
@@ -1052,14 +1009,13 @@ fn negamax_it(
 
         if use_pvs {
             let null_window_beta = null_window_beta_candidate;
-            let (child_board_view, rep_table) = applied.split();
             let first_result = negamax_it(
-                child_board_view,
+                &new_board,
                 reduced_depth,
                 -null_window_beta,
                 -alpha,
                 transpo_table,
-                rep_table,
+                repetition_table,
                 pv_table,
                 killers,
                 -color,
@@ -1079,14 +1035,13 @@ fn negamax_it(
                     stats.lmr_researches += 1;
                 }
 
-                let (child_board_view, rep_table) = applied.split();
                 value = match negamax_it(
-                    child_board_view,
+                    &new_board,
                     depth_after_move_with_ext,
                     -beta,
                     -alpha,
                     transpo_table,
-                    rep_table,
+                    repetition_table,
                     pv_table,
                     killers,
                     -color,
@@ -1101,14 +1056,13 @@ fn negamax_it(
             }
         } else {
             // Normal full-depth search (PV move)
-            let (child_board_view, rep_table) = applied.split();
             value = match negamax_it(
-                child_board_view,
+                &new_board,
                 reduced_depth,
                 -beta,
                 -alpha,
                 transpo_table,
-                rep_table,
+                repetition_table,
                 pv_table,
                 killers,
                 -color,
@@ -1128,17 +1082,21 @@ fn negamax_it(
             best_move_opt = Some(mv);
             pv_table.insert(zob, mv);
         }
+
         if value >= beta {
             if !is_capture && !gives_check {
                 killers.record(ply_index, mv);
             }
             stats.beta_cutoffs += 1;
+            repetition_table.pop();
             break;
         }
+
         if value > alpha {
             alpha = value;
         }
 
+        repetition_table.pop();
         move_idx += 1;
     }
 
@@ -1258,21 +1216,18 @@ fn root_search_with_window(
         }
 
         let current_best = best_move.map(|bm| (bm, best_value));
-        //log_root_move_start(&mut out, max_depth, &mv, current_best);
-
-        let mut applied = AppliedBoard::new(board, mv, repetition_table);
-        let (child_board, rep_table) = applied.split();
+        let new_board = board_do_move(board, mv, repetition_table);
         let is_pv_node = best_move.is_none();
         let mut child_depth = max_depth.saturating_sub(1);
 
         child_depth = child_depth.min(i16::MAX as usize);
         match negamax_it(
-            child_board,
+            &new_board,
             child_depth as i16,
             -beta,
             -alpha,
             transpo_table,
-            rep_table,
+            repetition_table,
             pv_table,
             &mut killer_table,
             -color,
@@ -1296,9 +1251,13 @@ fn root_search_with_window(
                 if value > alpha {
                     alpha = value;
                 }
+
                 if alpha >= beta {
+                    repetition_table.pop();
                     break;
                 }
+
+                repetition_table.pop();
             }
         }
     }
