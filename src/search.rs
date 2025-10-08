@@ -335,7 +335,7 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
 fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> Option<Board> {
     // Use the chess crate's built-in null move generator
     let new_board = board.null_move()?;
-    repetition_table.push(new_board.get_hash(), true);
+    repetition_table.push(new_board.get_hash(), false);
     Some(new_board)
 }
 
