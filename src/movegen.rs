@@ -46,13 +46,16 @@ impl<'a> IncrementalMoveGen<'a> {
         pv_table: &PVTable,
         tt: &TranspositionTable,
         killer_moves: [Option<ChessMove>; 2],
+        ply: usize,
     ) -> Self {
         let zob = board.get_hash();
+        let pv_move = pv_table.best_move_at(ply).filter(|mv| board.legal(*mv));
+
         Self {
             iterator: MoveGen::new_legal(&board),
             state: PrincipalVariation,
             board,
-            pv_move: pv_table.get(&zob).copied(),
+            pv_move,
             tt_move: tt.probe(zob).and_then(|e| e.best_move),
             killer_moves,
             move_buff: SmallVec::new(),

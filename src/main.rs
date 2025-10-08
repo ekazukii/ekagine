@@ -5,6 +5,7 @@
 
 mod eval;
 mod movegen;
+mod pv;
 mod search;
 mod tt;
 
@@ -37,6 +38,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Search Tables keyed by the built‐in Zobrist hash (u64).
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub use pv::PVTable;
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
 
 pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
@@ -56,14 +58,14 @@ pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RepetitionTable {
     pub history: Vec<u64>,
-    pub ply_since_last_hmclock: Vec<u32>
+    pub ply_since_last_hmclock: Vec<u32>,
 }
 
 impl RepetitionTable {
     pub fn new(hash: u64) -> Self {
         Self {
             history: vec![hash],
-            ply_since_last_hmclock: vec![0]
+            ply_since_last_hmclock: vec![0],
         }
     }
 
@@ -77,12 +79,13 @@ impl RepetitionTable {
         self.ply_since_last_hmclock.clear();
     }
 
-    pub fn push(&mut self, hash: u64, reset_clock: bool)  {
+    pub fn push(&mut self, hash: u64, reset_clock: bool) {
         self.history.push(hash);
         if reset_clock {
             self.ply_since_last_hmclock.push(0)
         } else {
-            self.ply_since_last_hmclock.push(self.ply_since_last_hmclock.last().unwrap_or(&0) + 1)
+            self.ply_since_last_hmclock
+                .push(self.ply_since_last_hmclock.last().unwrap_or(&0) + 1)
         }
     }
 
@@ -93,7 +96,13 @@ impl RepetitionTable {
 
     fn is_in_threefold_scenario(&self, board: &Board) -> bool {
         let target = board.get_hash();
-        for &hash in self.history.iter().rev().skip(1).take((self.ply_since_last_hmclock.last().unwrap_or(&0) + 1) as usize) {
+        for &hash in self
+            .history
+            .iter()
+            .rev()
+            .skip(1)
+            .take((self.ply_since_last_hmclock.last().unwrap_or(&0) + 1) as usize)
+        {
             if hash == target {
                 return true;
             }
@@ -101,8 +110,6 @@ impl RepetitionTable {
         false
     }
 }
-
-type PVTable = HashMap<u64, ChessMove>;
 
 /// Apply a move and update `repetition_table` by incrementing the count
 /// for the new position's Zobrist hash. Returns the new Board.

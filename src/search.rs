@@ -491,13 +491,14 @@ fn select_least_valuable_attacker(
 }
 
 fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
-    let captured_val = board.piece_on(mv.get_dest())
+    let captured_val = board
+        .piece_on(mv.get_dest())
         .map(piece_value)
         .unwrap_or_else(|| piece_value(Piece::Pawn));
 
     let current_val = match mv.get_promotion() {
         Some(prom) => piece_value(prom) - piece_value(Piece::Pawn),
-        None => piece_value(board.piece_on(mv.get_source()).unwrap())
+        None => piece_value(board.piece_on(mv.get_source()).unwrap()),
     };
 
     // If first capture is already good or equal no need to go later
@@ -723,16 +724,16 @@ fn ordered_moves(
     board: &Board,
     pv_table: &PVTable,
     tt: &TranspositionTable,
-    _depth: usize,
+    ply: usize,
 ) -> Vec<ChessMove> {
     let mut scored_moves: SmallVec<[(ChessMove, i32); 64]> = SmallVec::new();
 
     let zob = board.get_hash();
     let mut tt_mv = tt.probe(zob).and_then(|e| e.best_move);
-    let mut pv_mv = pv_table.get(&zob);
+    let mut pv_mv = pv_table.best_move_at(ply).filter(|mv| board.legal(*mv));
 
     for mv in MoveGen::new_legal(board) {
-        let score = if pv_mv.is_some() && pv_mv == Some(&mv) {
+        let score = if pv_mv.is_some() && pv_mv == Some(mv) {
             pv_mv = None;
             70
         } else if tt_mv.is_some() && tt_mv == Some(mv) {
@@ -923,13 +924,14 @@ fn negamax_it(
 
     stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
+    let child_ply = (ply_from_root + 1).max(0) as usize;
     let killer_moves = killers.killers_for(ply_index);
     let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves);
+        IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves, ply_index);
 
     if incremental_move_gen.is_over() {
         if in_check {
-            return SearchScore::EVAL(mated_in_plies(ply_from_root))
+            return SearchScore::EVAL(mated_in_plies(ply_from_root));
         }
         // Else in stalemate
         return SearchScore::EVAL(0);
@@ -1014,6 +1016,7 @@ fn negamax_it(
 
         if use_pvs {
             let null_window_beta = null_window_beta_candidate;
+            pv_table.clear_line_from(child_ply);
             let first_result = negamax_it(
                 &new_board,
                 reduced_depth,
@@ -1040,6 +1043,7 @@ fn negamax_it(
                     stats.lmr_researches += 1;
                 }
 
+                pv_table.clear_line_from(child_ply);
                 value = match negamax_it(
                     &new_board,
                     depth_after_move_with_ext,
@@ -1061,6 +1065,7 @@ fn negamax_it(
             }
         } else {
             // Normal full-depth search (PV move)
+            pv_table.clear_line_from(child_ply);
             value = match negamax_it(
                 &new_board,
                 reduced_depth,
@@ -1085,7 +1090,7 @@ fn negamax_it(
         if value > best_value {
             best_value = value;
             best_move_opt = Some(mv);
-            pv_table.insert(zob, mv);
+            pv_table.update_line(ply_index, mv);
         }
 
         if value >= beta {
@@ -1105,9 +1110,7 @@ fn negamax_it(
         move_idx += 1;
     }
 
-    if best_move_opt.is_some() {
-        pv_table.insert(board.get_hash(), best_move_opt.unwrap());
-    } else {
+    if best_move_opt.is_none() {
         return SearchScore::CANCELLED;
     }
 
@@ -1252,6 +1255,7 @@ fn root_search_with_window(
                     log_root_best_update(&mut out, max_depth, &mv, value, current_best);
                     best_value = value;
                     best_move = Some(mv);
+                    pv_table.update_line(0, mv);
                 }
                 if value > alpha {
                     alpha = value;
@@ -1267,8 +1271,8 @@ fn root_search_with_window(
         }
     }
 
-    if best_move.is_some() {
-        pv_table.insert(board.get_hash(), best_move.unwrap());
+    if let Some(root_best) = best_move {
+        pv_table.update_line(0, root_best);
     }
 
     let fail_low = !aborted
@@ -1509,11 +1513,17 @@ pub fn best_move_interruptible(
                     0
                 };
 
-                if let Some(pv_mv) = pv_view.get(&board.get_hash()) {
+                let pv_line = pv_view.principal_variation();
+                if !pv_line.is_empty() {
                     let score_str = uci_score_string(report.best_score, board.side_to_move());
+                    let pv_str = pv_line
+                        .iter()
+                        .map(|mv| mv.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     let info_line = format!(
                         "info depth {} score {} nodes {} nps {} time {} pv {}",
-                        report.depth, score_str, nodes, nps, time_ms, pv_mv
+                        report.depth, score_str, nodes, nps, time_ms, pv_str
                     );
                     send_message(&mut **out, &info_line);
                 }

@@ -386,31 +386,19 @@ pub fn eval_board(board: &Board) -> i32 {
     EVAL_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut total = 0;
 
-    let white_pawns: BitBoard =
-        *board.pieces(Piece::Pawn) & board.color_combined(Color::White);
-    let white_rooks: BitBoard =
-        *board.pieces(Piece::Rook) & board.color_combined(Color::White);
-    let white_knights: BitBoard =
-        *board.pieces(Piece::Knight) & board.color_combined(Color::White);
-    let white_bishops: BitBoard =
-        *board.pieces(Piece::Bishop) & board.color_combined(Color::White);
-    let white_queens: BitBoard =
-        *board.pieces(Piece::Queen) & board.color_combined(Color::White);
-    let white_king: BitBoard =
-        *board.pieces(Piece::King) & board.color_combined(Color::White);
+    let white_pawns: BitBoard = *board.pieces(Piece::Pawn) & board.color_combined(Color::White);
+    let white_rooks: BitBoard = *board.pieces(Piece::Rook) & board.color_combined(Color::White);
+    let white_knights: BitBoard = *board.pieces(Piece::Knight) & board.color_combined(Color::White);
+    let white_bishops: BitBoard = *board.pieces(Piece::Bishop) & board.color_combined(Color::White);
+    let white_queens: BitBoard = *board.pieces(Piece::Queen) & board.color_combined(Color::White);
+    let white_king: BitBoard = *board.pieces(Piece::King) & board.color_combined(Color::White);
 
-    let black_pawns: BitBoard =
-        *board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
-    let black_rooks: BitBoard =
-        *board.pieces(Piece::Rook) & board.color_combined(Color::Black);
-    let black_knights: BitBoard =
-        *board.pieces(Piece::Knight) & board.color_combined(Color::Black);
-    let black_bishops: BitBoard =
-        *board.pieces(Piece::Bishop) & board.color_combined(Color::Black);
-    let black_queens: BitBoard =
-        *board.pieces(Piece::Queen) & board.color_combined(Color::Black);
-    let black_king: BitBoard =
-        *board.pieces(Piece::King) & board.color_combined(Color::Black);
+    let black_pawns: BitBoard = *board.pieces(Piece::Pawn) & board.color_combined(Color::Black);
+    let black_rooks: BitBoard = *board.pieces(Piece::Rook) & board.color_combined(Color::Black);
+    let black_knights: BitBoard = *board.pieces(Piece::Knight) & board.color_combined(Color::Black);
+    let black_bishops: BitBoard = *board.pieces(Piece::Bishop) & board.color_combined(Color::Black);
+    let black_queens: BitBoard = *board.pieces(Piece::Queen) & board.color_combined(Color::Black);
+    let black_king: BitBoard = *board.pieces(Piece::King) & board.color_combined(Color::Black);
 
     if white_bishops.popcnt() == 2 {
         total += BISHOP_PAIR_VAL;
