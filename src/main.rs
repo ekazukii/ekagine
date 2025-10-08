@@ -38,7 +38,70 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
-type RepetitionTable = Vec<u64>;
+
+pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
+    if matches!(board.piece_on(mv.get_source()), Some(Piece::Pawn)) {
+        return true;
+    }
+
+    if let Some(dest_color) = board.color_on(mv.get_dest()) {
+        if dest_color != board.side_to_move() {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RepetitionTable {
+    pub history: Vec<u64>,
+    pub ply_since_last_hmclock: Vec<u32>
+}
+
+impl RepetitionTable {
+    pub fn new(hash: u64) -> Self {
+        Self {
+            history: vec![hash],
+            ply_since_last_hmclock: vec![0]
+        }
+    }
+
+    pub fn init(&mut self, hash: u64) {
+        self.history = vec![hash];
+        self.ply_since_last_hmclock = vec![0]
+    }
+
+    pub fn clear(&mut self) {
+        self.history.clear();
+        self.ply_since_last_hmclock.clear();
+    }
+
+    pub fn push(&mut self, hash: u64, reset_clock: bool)  {
+        self.history.push(hash);
+        if reset_clock {
+            self.ply_since_last_hmclock.push(0)
+        } else {
+            self.ply_since_last_hmclock.push(self.ply_since_last_hmclock.last().unwrap_or(&0) + 1)
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<u64> {
+        self.ply_since_last_hmclock.pop();
+        self.history.pop()
+    }
+
+    fn is_in_threefold_scenario(&self, board: &Board) -> bool {
+        let target = board.get_hash();
+        for &hash in self.history.iter().rev().skip(1).take((self.ply_since_last_hmclock.last().unwrap_or(&0) + 1) as usize) {
+            if hash == target {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 type PVTable = HashMap<u64, ChessMove>;
 
 /// Apply a move and update `repetition_table` by incrementing the count
@@ -49,7 +112,7 @@ type PVTable = HashMap<u64, ChessMove>;
 ///
 fn board_do_move(board: &Board, mv: ChessMove, repetition_table: &mut RepetitionTable) -> Board {
     let new_board = board.make_move_new(mv);
-    repetition_table.push(new_board.get_hash());
+    repetition_table.push(new_board.get_hash(), resets_halfmove_clock(board, mv));
     new_board
 }
 
@@ -144,7 +207,7 @@ fn uci_loop() {
     let mut stdout = io::stdout();
     let mut board = Board::default();
     let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: RepetitionTable = vec![board.get_hash()];
+    let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
@@ -167,7 +230,7 @@ fn uci_loop() {
                 board = Board::default();
                 transpo_table.clear();
                 repetition_table.clear();
-                repetition_table.push(board.get_hash());
+                repetition_table.init(board.get_hash());
             }
             "position" => {
                 repetition_table.clear();
@@ -182,17 +245,16 @@ fn uci_loop() {
                     i += 7;
                 }
 
-                repetition_table.push(board.get_hash());
+                repetition_table.init(board.get_hash());
 
                 if i < tokens.len() && tokens[i] == "moves" {
                     i += 1;
                     for mv_str in &tokens[i..] {
                         if let Ok(mv) = ChessMove::from_san(&board, mv_str) {
-                            board = board.make_move_new(mv);
+                            board = board_do_move(&board, mv, &mut repetition_table);
                         } else if let Ok(mv) = ChessMove::from_str(mv_str) {
-                            board = board.make_move_new(mv);
+                            board = board_do_move(&board, mv, &mut repetition_table);
                         }
-                        repetition_table.push(board.get_hash());
                     }
                 }
             }
@@ -352,7 +414,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 key,
                 Duration::from_millis(90),
                 1000,
-                vec![key.get_hash()],
+                RepetitionTable::new(key.get_hash()),
                 &mut transpo_table,
                 None,
             )
@@ -408,7 +470,7 @@ pub fn compute_best_from_fen(
     let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
     let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: RepetitionTable = vec![board.get_hash()];
+    let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
     let outcome = best_move_using_iterative_deepening(
         &board,
