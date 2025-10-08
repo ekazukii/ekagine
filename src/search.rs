@@ -45,6 +45,7 @@ pub struct SearchStats {
     pub lmr_researches: u64,
     pub incremental_move_gen_inits: u64,
     pub incremental_move_gen_capture_lists: u64,
+    pub effective_branching_factor: f64,
 }
 
 impl SearchStats {
@@ -72,12 +73,30 @@ impl SearchStats {
             incremental_move_gen_capture_lists: self
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
+            effective_branching_factor: 0.0,
         }
+    }
+
+    fn update_effective_branching_factor(&mut self, nodes: u64, qnodes: u64, depth: usize) {
+        if depth == 0 {
+            self.effective_branching_factor = 0.0;
+            return;
+        }
+
+        let total_nodes = nodes.saturating_add(qnodes);
+        if total_nodes == 0 {
+            self.effective_branching_factor = 0.0;
+            return;
+        }
+
+        let depth_f = depth as f64;
+        let total_nodes_f = total_nodes as f64;
+        self.effective_branching_factor = total_nodes_f.powf(1.0 / depth_f);
     }
 
     fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -92,6 +111,7 @@ impl SearchStats {
             self.lmr_researches,
             self.incremental_move_gen_inits,
             self.incremental_move_gen_capture_lists,
+            self.effective_branching_factor,
         )
     }
 }
@@ -491,13 +511,14 @@ fn select_least_valuable_attacker(
 }
 
 fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
-    let captured_val = board.piece_on(mv.get_dest())
+    let captured_val = board
+        .piece_on(mv.get_dest())
         .map(piece_value)
         .unwrap_or_else(|| piece_value(Piece::Pawn));
 
     let current_val = match mv.get_promotion() {
         Some(prom) => piece_value(prom) - piece_value(Piece::Pawn),
-        None => piece_value(board.piece_on(mv.get_source()).unwrap())
+        None => piece_value(board.piece_on(mv.get_source()).unwrap()),
     };
 
     // If first capture is already good or equal no need to go later
@@ -929,7 +950,7 @@ fn negamax_it(
 
     if incremental_move_gen.is_over() {
         if in_check {
-            return SearchScore::EVAL(mated_in_plies(ply_from_root))
+            return SearchScore::EVAL(mated_in_plies(ply_from_root));
         }
         // Else in stalemate
         return SearchScore::EVAL(0);
@@ -1404,6 +1425,9 @@ where
         }
 
         let iter_stats = stats.diff(&stats_prev);
+        if !result.aborted {
+            stats.update_effective_branching_factor(iter_stats.nodes, iter_stats.qnodes, depth);
+        }
         stats_prev = *stats;
 
         let report = IterationReport {
