@@ -268,7 +268,7 @@ fn quiesce_negamax_it(
         if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
             continue;
         }
-        if static_exchange_eval(board, mv) < 0 {
+        if see_for_sort(board, mv) < 0 {
             continue;
         }
         let new_board = board_do_move(board, mv, repetition_table);
@@ -488,6 +488,25 @@ fn select_least_valuable_attacker(
         }
     }
     None
+}
+
+fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
+    let captured_val = board.piece_on(mv.get_dest())
+        .map(piece_value)
+        .unwrap_or_else(|| piece_value(Piece::Pawn));
+
+    let current_val = match mv.get_promotion() {
+        Some(prom) => piece_value(prom) - piece_value(Piece::Pawn),
+        None => piece_value(board.piece_on(mv.get_source()).unwrap())
+    };
+
+    // If first capture is already good or equal no need to go later
+    if captured_val >= current_val {
+        return captured_val - current_val;
+    }
+
+    // For "bad" captures we check if really bad with static exchange evaluation
+    static_exchange_eval(board, mv)
 }
 
 fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
