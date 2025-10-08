@@ -505,13 +505,13 @@ fn select_least_valuable_attacker(
 }
 
 fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
-    let captured_val = mv.get_dest()
+    let captured_val = board.piece_on(mv.get_dest())
         .map(piece_value)
         .unwrap_or_else(|| piece_value(Piece::Pawn));
 
     let current_val = match mv.get_promotion() {
         Some(prom) => piece_value(prom) - piece_value(Piece::Pawn),
-        None => piece_value(piece_value(mv.get_source()))
+        None => piece_value(board.piece_on(mv.get_source()).unwrap())
     };
 
     // If first capture is already good or equal no need to go later
