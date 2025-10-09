@@ -262,8 +262,7 @@ fn quiesce_negamax_it(
     stats: &mut SearchStats,
 ) -> i32 {
     stats.qnodes += 1;
-
-    if remain_quiet == 0 || repetition_table.is_in_threefold_scenario(board) {
+    if remain_quiet == 0 {
         return color * cache_eval(board, transpo_table, repetition_table);
     }
 

@@ -1,7 +1,8 @@
-use crate::movegen::MoveGenState::{Captures, Killers, PrincipalVariation, Remaining, TTStep};
+use crate::movegen::MoveGenState::{PrincipalVariation, Remaining, Sorted, TTStep};
 use crate::{PVTable, TranspositionTable};
 use chess::{Board, ChessMove, MoveGen, EMPTY};
 use smallvec::SmallVec;
+use crate::search::see_for_sort;
 
 pub const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     // Victim = Pawn
@@ -22,8 +23,7 @@ pub const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 enum MoveGenState {
     PrincipalVariation,
     TTStep,
-    Captures,
-    Killers,
+    Sorted,
     Remaining,
 }
 
@@ -91,32 +91,13 @@ impl Iterator for IncrementalMoveGen<'_> {
 
         if self.state == TTStep {
             if self.tt_move.is_some() && self.tt_move != self.pv_move {
-                self.state = Captures;
+                self.state = Sorted;
                 return self.tt_move;
             }
-            self.state = Captures;
+            self.state = Sorted;
         }
 
-        if self.state == Killers {
-            while self.killer_idx < self.killer_moves.len() {
-                let killer = self.killer_moves[self.killer_idx];
-                self.killer_idx += 1;
-                if let Some(kmv) = killer {
-                    if Some(kmv) == self.pv_move || Some(kmv) == self.tt_move {
-                        continue;
-                    }
-                    if self.board.piece_on(kmv.get_dest()).is_some() {
-                        continue;
-                    }
-                    if self.board.legal(kmv) {
-                        return Some(kmv);
-                    }
-                }
-            }
-            self.state = Remaining;
-        }
-
-        if self.state == Captures {
+        if self.state == Sorted {
             if self.capt_idx.is_none() {
                 // Sort for captures
                 let targets = self.board.color_combined(!self.board.side_to_move());
@@ -128,15 +109,30 @@ impl Iterator for IncrementalMoveGen<'_> {
                         continue;
                     }
 
-                    let attacker_idx = self.board.piece_on(mv.get_source()).unwrap().to_index();
-                    let score = if let Some(victim) = self.board.piece_on(mv.get_dest()) {
-                        MVV_LVA_TABLE[victim.to_index()][attacker_idx] as i32
-                    } else {
-                        // En passant
-                        25i32
-                    };
+                    let mut score = see_for_sort(self.board, mv);
+                    if score >= 0 {
+                        score += 1;
+                    }
                     scored_moves.push((mv, score));
                 }
+
+
+                while self.killer_idx < self.killer_moves.len() {
+                    let killer = self.killer_moves[self.killer_idx];
+                    self.killer_idx += 1;
+                    if let Some(kmv) = killer {
+                        if Some(kmv) == self.pv_move || Some(kmv) == self.tt_move {
+                            continue;
+                        }
+                        if self.board.piece_on(kmv.get_dest()).is_some() {
+                            continue;
+                        }
+                        if self.board.legal(kmv) {
+                            scored_moves.push((kmv, 0));
+                        }
+                    }
+                }
+
                 scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
                 self.move_buff
                     .extend(scored_moves.into_iter().map(|(m, _)| m));
@@ -144,12 +140,14 @@ impl Iterator for IncrementalMoveGen<'_> {
                 self.capture_gen_pending = true;
             }
 
+
+
             if (self.capt_idx.unwrap()) < self.move_buff.len() {
                 let mv = self.move_buff[self.capt_idx.unwrap()];
                 self.capt_idx = Some(self.capt_idx.unwrap() + 1);
                 return Some(mv);
             } else {
-                self.state = Killers;
+                self.state = Remaining;
                 self.iterator.set_iterator_mask(!EMPTY);
             }
         }
