@@ -509,7 +509,7 @@ fn select_least_valuable_attacker(
     None
 }
 
-fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
+pub fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
     let captured_val = board
         .piece_on(mv.get_dest())
         .map(piece_value)
