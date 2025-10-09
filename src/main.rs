@@ -9,7 +9,7 @@ mod search;
 mod tt;
 
 use crate::search::{
-    best_move_interruptible, best_move_using_iterative_deepening, uci_score_string,
+    best_move_interruptible, best_move_using_iterative_deepening, uci_score_string, SearchStats,
 };
 use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
@@ -20,14 +20,10 @@ use std::fmt::format;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, thread};
-
-static EVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-static CACHE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DEPTH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 type StopFlag = Arc<AtomicBool>;
 
@@ -56,14 +52,14 @@ pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RepetitionTable {
     pub history: Vec<u64>,
-    pub ply_since_last_hmclock: Vec<u32>
+    pub ply_since_last_hmclock: Vec<u32>,
 }
 
 impl RepetitionTable {
     pub fn new(hash: u64) -> Self {
         Self {
             history: vec![hash],
-            ply_since_last_hmclock: vec![0]
+            ply_since_last_hmclock: vec![0],
         }
     }
 
@@ -77,12 +73,13 @@ impl RepetitionTable {
         self.ply_since_last_hmclock.clear();
     }
 
-    pub fn push(&mut self, hash: u64, reset_clock: bool)  {
+    pub fn push(&mut self, hash: u64, reset_clock: bool) {
         self.history.push(hash);
         if reset_clock {
             self.ply_since_last_hmclock.push(0)
         } else {
-            self.ply_since_last_hmclock.push(self.ply_since_last_hmclock.last().unwrap_or(&0) + 1)
+            self.ply_since_last_hmclock
+                .push(self.ply_since_last_hmclock.last().unwrap_or(&0) + 1)
         }
     }
 
@@ -93,7 +90,13 @@ impl RepetitionTable {
 
     fn is_in_threefold_scenario(&self, board: &Board) -> bool {
         let target = board.get_hash();
-        for &hash in self.history.iter().rev().skip(1).take((self.ply_since_last_hmclock.last().unwrap_or(&0) + 1) as usize) {
+        for &hash in self
+            .history
+            .iter()
+            .rev()
+            .skip(1)
+            .take((self.ply_since_last_hmclock.last().unwrap_or(&0) + 1) as usize)
+        {
             if hash == target {
                 return true;
             }
@@ -261,9 +264,6 @@ fn uci_loop() {
             "go" => {
                 let time_budget = choose_time_for_move(&tokens, board.side_to_move());
 
-                EVAL_COUNT.store(0, Ordering::Relaxed);
-                CACHE_COUNT.store(0, Ordering::Relaxed);
-
                 let max_ply = 100;
                 let outcome = best_move_interruptible(
                     &board,
@@ -398,16 +398,10 @@ fn compute_stats(data: &[f64]) -> (f64, f64, f64, f64, f64, f64, f64) {
 fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
     let mut scores: Vec<(i32, i32)> = Vec::new();
     let mut times: Vec<Duration> = Vec::new();
-    let mut eval_counts: Vec<usize> = Vec::new();
-    let mut cache_counts: Vec<usize> = Vec::new();
-    let mut depth_counts: Vec<usize> = Vec::new();
-    let stop = Arc::new(AtomicBool::new(false));
+    let mut stat_snapshots: Vec<SearchStats> = Vec::new();
 
     let max_depth = 5;
     for (key, val) in fen_to_stockfish.iter() {
-        EVAL_COUNT.store(0, Ordering::Relaxed);
-        CACHE_COUNT.store(0, Ordering::Relaxed);
-
         let (outcome, duration) = time_fn(|| {
             let mut transpo_table = TranspositionTable::new();
             best_move_interruptible(
@@ -421,9 +415,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         });
 
         times.push(duration);
-        eval_counts.push(EVAL_COUNT.load(Ordering::Relaxed));
-        cache_counts.push(CACHE_COUNT.load(Ordering::Relaxed));
-        depth_counts.push(DEPTH_COUNT.load(Ordering::Relaxed));
+        stat_snapshots.push(outcome.stats);
 
         if let Some(_mv) = outcome.best_move {
             scores.push((outcome.score, *val));
@@ -432,29 +424,44 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
 
     // Convert durations to milliseconds
     let time_ms: Vec<f64> = times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-    let evals_f64: Vec<f64> = eval_counts.iter().map(|&x| x as f64).collect();
-    let caches_f64: Vec<f64> = cache_counts.iter().map(|&x| x as f64).collect();
     let diffs: Vec<f64> = scores.iter().map(|(a, b)| (*a - *b) as f64).collect();
-    let depths_f64: Vec<f64> = depth_counts.iter().map(|&d| d as f64).collect();
+    let nodes_f64: Vec<f64> = stat_snapshots.iter().map(|s| s.nodes as f64).collect();
+    let qnodes_f64: Vec<f64> = stat_snapshots.iter().map(|s| s.qnodes as f64).collect();
+    let depth_f64: Vec<f64> = stat_snapshots.iter().map(|s| s.depth as f64).collect();
+    let ebf_f64: Vec<f64> = stat_snapshots
+        .iter()
+        .map(|s| {
+            if s.effective_branching_factor.is_finite() {
+                s.effective_branching_factor
+            } else {
+                0.0
+            }
+        })
+        .collect();
 
     let (avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time) =
         compute_stats(&time_ms);
-    let (avg_e, med_e, min_e, max_e, std_e, p5_e, p95_e) = compute_stats(&evals_f64);
-    let (avg_c, med_c, min_c, max_c, std_c, p5_c, p95_c) = compute_stats(&caches_f64);
+    let (avg_nodes, med_nodes, min_nodes, max_nodes, std_nodes, p5_nodes, p95_nodes) =
+        compute_stats(&nodes_f64);
+    let (avg_qnodes, med_qnodes, min_qnodes, max_qnodes, std_qnodes, p5_qnodes, p95_qnodes) =
+        compute_stats(&qnodes_f64);
     let (avg_d, med_d, min_d, max_d, std_d, p5_d, p95_d) = compute_stats(&diffs);
-    let (avg_dpt, med_dpt, min_dpt, max_dpt, std_dpt, p5_dpt, p95_dpt) = compute_stats(&depths_f64);
+    let (avg_depth, med_depth, min_depth, max_depth, std_depth, p5_depth, p95_depth) =
+        compute_stats(&depth_f64);
+    let (avg_ebf, med_ebf, min_ebf, max_ebf, std_ebf, p5_ebf, p95_ebf) = compute_stats(&ebf_f64);
 
     println!("⏱ Timing (ms)     : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
              avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time);
-    println!("📊 Eval Counts     : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
-             avg_e, med_e, min_e, max_e, std_e, p5_e, p95_e);
-    println!("🗃 Cache Counts    : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
-             avg_c, med_c, min_c, max_c, std_c, p5_c, p95_c);
+    println!("🌲 Nodes           : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
+             avg_nodes, med_nodes, min_nodes, max_nodes, std_nodes, p5_nodes, p95_nodes);
+    println!("🍃 QNodes          : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
+             avg_qnodes, med_qnodes, min_qnodes, max_qnodes, std_qnodes, p5_qnodes, p95_qnodes);
     println!("🎯 Score Diffs     : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
              avg_d, med_d, min_d, max_d, std_d, p5_d, p95_d);
-    println!("🔍 Search Depth   : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
-             avg_dpt, med_dpt, min_dpt, max_dpt, std_dpt, p5_dpt, p95_dpt
-    );
+    println!("🔍 Search Depth    : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
+             avg_depth, med_depth, min_depth, max_depth, std_depth, p5_depth, p95_depth);
+    println!("📐 EBF             : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
+             avg_ebf, med_ebf, min_ebf, max_ebf, std_ebf, p5_ebf, p95_ebf);
 }
 
 const NEG_INFINITY: i32 = -100_000_000;
