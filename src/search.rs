@@ -736,50 +736,6 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
     scored_moves
 }
 
-/// This functions orders to move based on the first sort of `sort_moves` but adds specific order
-/// criteria for the non-quiesce search.
-/// Such as taking moves from the transposition table and principal variation
-fn ordered_moves(
-    board: &Board,
-    pv_table: &PVTable,
-    tt: &TranspositionTable,
-    _depth: usize,
-) -> Vec<ChessMove> {
-    let mut scored_moves: SmallVec<[(ChessMove, i32); 64]> = SmallVec::new();
-
-    let zob = board.get_hash();
-    let mut tt_mv = tt.probe(zob).and_then(|e| e.best_move);
-    let mut pv_mv = pv_table.get(&zob);
-
-    for mv in MoveGen::new_legal(board) {
-        let score = if pv_mv.is_some() && pv_mv == Some(&mv) {
-            pv_mv = None;
-            70
-        } else if tt_mv.is_some() && tt_mv == Some(mv) {
-            tt_mv = None;
-            65
-        } else if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
-            // It's a capture; find the attacker piece type
-            if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-                let victim_idx = victim_piece.to_index() as usize;
-                let attacker_idx = attacker_piece.to_index() as usize;
-                MVV_LVA_TABLE[victim_idx][attacker_idx] as i32
-            } else {
-                0
-            }
-        } else if is_en_passant_capture(board, mv) {
-            25
-        } else {
-            0
-        };
-
-        scored_moves.push((mv, score));
-    }
-
-    scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    scored_moves.into_iter().map(|(mv, _)| mv).collect()
-}
-
 // ---------------------------------------------------------------------------
 // Core Negamax with α/β pruning + PV maintenance — renamed `negamax_it`.
 // ---------------------------------------------------------------------------
@@ -1234,7 +1190,11 @@ fn root_search_with_window(
     let mut killer_table = KillerTable::new(max_depth + 4);
     let mut out = io::stdout();
 
-    for mv in ordered_moves(board, pv_table, transpo_table, 0) {
+    let killer_moves = killer_table.killers_for(0);
+    let mut incremental_move_gen =
+        IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves);
+
+    while let Some(mv) = incremental_move_gen.next() {
         if should_stop(stop) {
             aborted = true;
             break;
