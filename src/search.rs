@@ -2,8 +2,7 @@ use crate::eval::eval_board;
 use crate::movegen::IncrementalMoveGen;
 use crate::{
     board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTFlag,
-    TranspositionTable, CACHE_COUNT, DEPTH_COUNT, EVAL_COUNT, NEG_INFINITY, POS_INFINITY,
-    QUIESCE_REMAIN,
+    TranspositionTable, NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
 };
 use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
@@ -17,15 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
-/* For reference
-type TranspositionTable = HashMap<u64, i32>;
-type RepetitionTable    = HashMap<u64, usize>;
-type PVTable = HashMap<u64, ChessMove>;
- */
 
 enum SearchScore {
     CANCELLED,
-    //MATE(u8),
     EVAL(i32),
 }
 
@@ -46,6 +39,7 @@ pub struct SearchStats {
     pub incremental_move_gen_inits: u64,
     pub incremental_move_gen_capture_lists: u64,
     pub effective_branching_factor: f64,
+    pub depth: u64,
 }
 
 impl SearchStats {
@@ -74,6 +68,7 @@ impl SearchStats {
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
             effective_branching_factor: 0.0,
+            depth: self.depth,
         }
     }
 
@@ -94,9 +89,18 @@ impl SearchStats {
         self.effective_branching_factor = total_nodes_f.powf(1.0 / depth_f);
     }
 
+    fn record_depth(&mut self, ply_from_root: i32) {
+        if ply_from_root >= 0 {
+            let ply = ply_from_root as u64;
+            if ply > self.depth {
+                self.depth = ply;
+            }
+        }
+    }
+
     fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -112,6 +116,7 @@ impl SearchStats {
             self.incremental_move_gen_inits,
             self.incremental_move_gen_capture_lists,
             self.effective_branching_factor,
+            self.depth,
         )
     }
 }
@@ -261,6 +266,7 @@ fn quiesce_negamax_it(
     ply_from_root: i32,
     stats: &mut SearchStats,
 ) -> i32 {
+    stats.record_depth(ply_from_root);
     stats.qnodes += 1;
     if remain_quiet == 0 {
         return color * cache_eval(board, transpo_table, repetition_table);
@@ -329,7 +335,6 @@ fn cache_eval(
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.probe(zob) {
         if let Some(cached) = entry.eval {
-            CACHE_COUNT.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
     }
@@ -764,6 +769,7 @@ fn negamax_it(
         return SearchScore::CANCELLED;
     }
 
+    stats.record_depth(ply_from_root);
     stats.nodes += 1;
 
     // If game is over
@@ -1167,6 +1173,7 @@ fn root_search_with_window(
     alpha_start: i32,
     beta_start: i32,
 ) -> RootSearchResult {
+    stats.record_depth(0);
     let mut alpha = alpha_start;
     let mut beta = beta_start;
 
@@ -1465,9 +1472,6 @@ pub fn best_move_interruptible(
     let mut stats = SearchStats::default();
 
     let t0 = Instant::now();
-    EVAL_COUNT.store(0, Ordering::Relaxed);
-    DEPTH_COUNT.store(0, Ordering::Relaxed);
-
     let (best_move, best_score) = iterative_deepening_loop(
         board,
         max_depth_cap,
@@ -1480,8 +1484,6 @@ pub fn best_move_interruptible(
             if report.result.aborted {
                 return;
             }
-
-            DEPTH_COUNT.store(report.depth, Ordering::Relaxed);
 
             if let Some(out) = stdout_opt.as_mut() {
                 let nodes = report.stats_delta.nodes;
@@ -1501,8 +1503,6 @@ pub fn best_move_interruptible(
                     send_message(&mut **out, &info_line);
                 }
             }
-
-            EVAL_COUNT.store(0, Ordering::Relaxed);
         },
     );
 
