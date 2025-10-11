@@ -266,13 +266,15 @@ fn quiesce_negamax_it(
     ply_from_root: i32,
     stats: &mut SearchStats,
 ) -> i32 {
+    debug_assert!(!repetition_table.is_in_threefold_scenario(board));
+
     stats.record_depth(ply_from_root);
     stats.qnodes += 1;
     if remain_quiet == 0 {
-        return color * cache_eval(board, transpo_table, repetition_table);
+        return color * cache_eval(board, transpo_table);
     }
 
-    let stand_pat = color * cache_eval(board, transpo_table, repetition_table);
+    let stand_pat = color * cache_eval(board, transpo_table);
     if stand_pat >= beta {
         stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -327,11 +329,7 @@ fn quiesce_negamax_it(
 fn cache_eval(
     board: &Board,
     transpo_table: &mut TranspositionTable,
-    repetition_table: &RepetitionTable,
 ) -> i32 {
-    if repetition_table.is_in_threefold_scenario(board) {
-        return 0;
-    }
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.probe(zob) {
         if let Some(cached) = entry.eval {
@@ -873,7 +871,7 @@ fn negamax_it(
 
     let (static_eval, static_eval_raw) =
         if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let raw = cache_eval(board, transpo_table, repetition_table);
+            let raw = cache_eval(board, transpo_table);
             (Some(color * raw), Some(raw))
         } else {
             (None, None)
