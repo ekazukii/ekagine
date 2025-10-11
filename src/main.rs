@@ -105,8 +105,6 @@ impl RepetitionTable {
     }
 }
 
-type PVTable = HashMap<u64, ChessMove>;
-
 /// Apply a move and update `repetition_table` by incrementing the count
 /// for the new position's Zobrist hash. Returns the new Board.
 ///

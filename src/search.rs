@@ -1,8 +1,8 @@
 use crate::eval::eval_board;
 use crate::movegen::IncrementalMoveGen;
 use crate::{
-    board_do_move, board_pop, send_message, PVTable, RepetitionTable, StopFlag, TTFlag,
-    TranspositionTable, NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
+    board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
+    NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
 };
 use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
@@ -751,7 +751,6 @@ fn negamax_it(
     beta: i32,
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
-    pv_table: &mut PVTable,
     killers: &mut KillerTable,
     color: i32,
     stop: &StopFlag,
@@ -840,7 +839,6 @@ fn negamax_it(
                 -beta + 1,
                 transpo_table,
                 repetition_table,
-                pv_table,
                 killers,
                 -color,
                 stop,
@@ -904,8 +902,7 @@ fn negamax_it(
     stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
     let killer_moves = killers.killers_for(ply_index);
-    let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves);
+    let mut incremental_move_gen = IncrementalMoveGen::new(board, transpo_table, killer_moves);
 
     if incremental_move_gen.is_over() {
         if in_check {
@@ -1001,7 +998,6 @@ fn negamax_it(
                 -alpha,
                 transpo_table,
                 repetition_table,
-                pv_table,
                 killers,
                 -color,
                 stop,
@@ -1027,7 +1023,6 @@ fn negamax_it(
                     -alpha,
                     transpo_table,
                     repetition_table,
-                    pv_table,
                     killers,
                     -color,
                     stop,
@@ -1048,7 +1043,6 @@ fn negamax_it(
                 -alpha,
                 transpo_table,
                 repetition_table,
-                pv_table,
                 killers,
                 -color,
                 stop,
@@ -1065,7 +1059,6 @@ fn negamax_it(
         if value > best_value {
             best_value = value;
             best_move_opt = Some(mv);
-            pv_table.insert(zob, mv);
         }
 
         if value >= beta {
@@ -1085,9 +1078,7 @@ fn negamax_it(
         move_idx += 1;
     }
 
-    if best_move_opt.is_some() {
-        pv_table.insert(board.get_hash(), best_move_opt.unwrap());
-    } else {
+    if best_move_opt.is_none() {
         return SearchScore::CANCELLED;
     }
 
@@ -1158,6 +1149,36 @@ struct RootSearchResult {
     aborted: bool,
 }
 
+fn collect_principal_variation(
+    board: &Board,
+    tt: &TranspositionTable,
+    max_depth: usize,
+) -> Vec<ChessMove> {
+    let mut pv = Vec::new();
+    let mut current = board.clone();
+
+    for _ in 0..max_depth {
+        let entry = match tt.probe(current.get_hash()) {
+            Some(e) => e,
+            None => break,
+        };
+
+        let mv = match entry.best_move {
+            Some(mv) => mv,
+            None => break,
+        };
+
+        if !current.legal(mv) {
+            break;
+        }
+
+        pv.push(mv);
+        current = current.make_move_new(mv);
+    }
+
+    pv
+}
+
 /// Execute one root search at a fixed depth using the provided aspiration window.
 /// Returns the best move found, the score, and flags indicating fail-high/low outcomes.
 fn root_search_with_window(
@@ -1165,7 +1186,6 @@ fn root_search_with_window(
     max_depth: usize,
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
-    pv_table: &mut PVTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
     alpha_start: i32,
@@ -1196,8 +1216,7 @@ fn root_search_with_window(
     let mut out = io::stdout();
 
     let killer_moves = killer_table.killers_for(0);
-    let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, pv_table, transpo_table, killer_moves);
+    let mut incremental_move_gen = IncrementalMoveGen::new(board, transpo_table, killer_moves);
 
     while let Some(mv) = incremental_move_gen.next() {
         if should_stop(stop) {
@@ -1218,7 +1237,6 @@ fn root_search_with_window(
             -alpha,
             transpo_table,
             repetition_table,
-            pv_table,
             &mut killer_table,
             -color,
             stop,
@@ -1252,10 +1270,6 @@ fn root_search_with_window(
         }
     }
 
-    if best_move.is_some() {
-        pv_table.insert(board.get_hash(), best_move.unwrap());
-    }
-
     let fail_low = !aborted
         && best_move.is_some()
         && alpha_orig != NEG_INFINITY
@@ -1266,6 +1280,29 @@ fn root_search_with_window(
         && beta_orig != POS_INFINITY
         && alpha_orig < beta_orig
         && best_value >= beta_orig;
+
+    if !aborted {
+        if let Some(best_mv) = best_move {
+            let bound = if fail_low {
+                TTFlag::Upper
+            } else if fail_high {
+                TTFlag::Lower
+            } else {
+                TTFlag::Exact
+            };
+
+            let depth_store = max_depth.min(i16::MAX as usize) as i16;
+            let stored_score = tt_score_on_store(best_value, 0);
+            transpo_table.store(
+                board.get_hash(),
+                depth_store,
+                stored_score,
+                bound,
+                Some(best_mv),
+                None,
+            );
+        }
+    }
 
     RootSearchResult {
         best_move,
@@ -1281,7 +1318,6 @@ fn aspiration_root_search(
     max_depth: usize,
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
-    pv_table: &mut PVTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
     prev_score: Option<i32>,
@@ -1292,7 +1328,6 @@ fn aspiration_root_search(
             max_depth,
             transpo_table,
             repetition_table,
-            pv_table,
             stop,
             stats,
             NEG_INFINITY,
@@ -1312,7 +1347,6 @@ fn aspiration_root_search(
             max_depth,
             transpo_table,
             repetition_table,
-            pv_table,
             stop,
             stats,
             alpha,
@@ -1344,6 +1378,7 @@ struct IterationReport {
     best_move: Option<ChessMove>,
     best_score: i32,
     stats_delta: SearchStats,
+    principal_variation: Vec<ChessMove>,
 }
 
 fn iterative_deepening_loop<F>(
@@ -1351,13 +1386,12 @@ fn iterative_deepening_loop<F>(
     max_depth: usize,
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
-    pv_table: &mut PVTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
     mut on_iteration: F,
 ) -> (Option<ChessMove>, i32)
 where
-    F: FnMut(&IterationReport, &PVTable),
+    F: FnMut(&IterationReport),
 {
     let mut best_move = None;
     let mut best_score = 0;
@@ -1376,7 +1410,6 @@ where
             depth,
             transpo_table,
             repetition_table,
-            pv_table,
             stop,
             stats,
             prev_score,
@@ -1394,15 +1427,18 @@ where
         }
         stats_prev = *stats;
 
+        let principal_variation = collect_principal_variation(board, transpo_table, max_depth);
+
         let report = IterationReport {
             depth,
             result,
             best_move,
             best_score,
             stats_delta: iter_stats,
+            principal_variation,
         };
 
-        on_iteration(&report, &*pv_table);
+        on_iteration(&report);
 
         if report.result.aborted {
             break;
@@ -1420,7 +1456,6 @@ pub fn best_move_using_iterative_deepening(
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
 ) -> SearchOutcome {
-    let mut pv_table: PVTable = PVTable::default();
     let stop = Arc::new(AtomicBool::new(false));
     let mut stats = SearchStats::default();
 
@@ -1429,10 +1464,9 @@ pub fn best_move_using_iterative_deepening(
         max_depth,
         transpo_table,
         repetition_table,
-        &mut pv_table,
         &stop,
         &mut stats,
-        |_, _| {},
+        |_| {},
     );
 
     SearchOutcome::new(best_move, best_score, stats)
@@ -1466,7 +1500,6 @@ pub fn best_move_interruptible(
         });
     }
 
-    let mut pv_table = PVTable::default();
     let mut stats = SearchStats::default();
 
     let t0 = Instant::now();
@@ -1475,10 +1508,9 @@ pub fn best_move_interruptible(
         max_depth_cap,
         transpo_table,
         &mut repetition_table,
-        &mut pv_table,
         &stop,
         &mut stats,
-        |report, pv_view| {
+        |report| {
             if report.result.aborted {
                 return;
             }
@@ -1492,11 +1524,17 @@ pub fn best_move_interruptible(
                     0
                 };
 
-                if let Some(pv_mv) = pv_view.get(&board.get_hash()) {
+                if !report.principal_variation.is_empty() {
+                    let pv_line = report
+                        .principal_variation
+                        .iter()
+                        .map(|mv| mv.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     let score_str = uci_score_string(report.best_score, board.side_to_move());
                     let info_line = format!(
                         "info depth {} score {} nodes {} nps {} time {} pv {}",
-                        report.depth, score_str, nodes, nps, time_ms, pv_mv
+                        report.depth, score_str, nodes, nps, time_ms, pv_line
                     );
                     send_message(&mut **out, &info_line);
                 }

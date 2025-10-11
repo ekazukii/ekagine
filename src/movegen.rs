@@ -1,6 +1,6 @@
-use crate::movegen::MoveGenState::{PrincipalVariation, Remaining, Sorted, TTStep};
+use crate::movegen::MoveGenState::{Remaining, Sorted, TTMove};
 use crate::search::see_for_sort;
-use crate::{PVTable, TranspositionTable};
+use crate::TranspositionTable;
 use chess::{Board, ChessMove, MoveGen, EMPTY};
 use smallvec::SmallVec;
 
@@ -21,8 +21,7 @@ pub const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MoveGenState {
-    PrincipalVariation,
-    TTStep,
+    TTMove,
     Sorted,
     Remaining,
 }
@@ -31,7 +30,6 @@ pub struct IncrementalMoveGen<'a> {
     iterator: MoveGen,
     state: MoveGenState,
     board: &'a Board,
-    pv_move: Option<ChessMove>,
     tt_move: Option<ChessMove>,
     killer_moves: [Option<ChessMove>; 2],
     move_buff: SmallVec<[ChessMove; 64]>,
@@ -43,17 +41,20 @@ pub struct IncrementalMoveGen<'a> {
 impl<'a> IncrementalMoveGen<'a> {
     pub fn new(
         board: &'a Board,
-        pv_table: &PVTable,
         tt: &TranspositionTable,
         killer_moves: [Option<ChessMove>; 2],
     ) -> Self {
         let zob = board.get_hash();
+        let tt_move = tt
+            .probe(zob)
+            .and_then(|e| e.best_move)
+            .filter(|mv| board.legal(*mv));
+
         Self {
             iterator: MoveGen::new_legal(&board),
-            state: PrincipalVariation,
+            state: TTMove,
             board,
-            pv_move: pv_table.get(&zob).copied(),
-            tt_move: tt.probe(zob).and_then(|e| e.best_move),
+            tt_move,
             killer_moves,
             move_buff: SmallVec::new(),
             capt_idx: None,
@@ -81,20 +82,11 @@ impl Iterator for IncrementalMoveGen<'_> {
     type Item = ChessMove;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.state == PrincipalVariation {
-            if self.pv_move.is_some() {
-                self.state = TTStep;
-                return self.pv_move;
-            }
-            self.state = TTStep;
-        }
-
-        if self.state == TTStep {
-            if self.tt_move.is_some() && self.tt_move != self.pv_move {
-                self.state = Sorted;
-                return self.tt_move;
-            }
+        if self.state == TTMove {
             self.state = Sorted;
+            if let Some(tt_mv) = self.tt_move {
+                return Some(tt_mv);
+            }
         }
 
         if self.state == Sorted {
@@ -105,7 +97,7 @@ impl Iterator for IncrementalMoveGen<'_> {
 
                 let mut scored_moves: SmallVec<[(ChessMove, i32); 32]> = SmallVec::new();
                 for mv in &mut self.iterator {
-                    if Some(mv) == self.tt_move || Some(mv) == self.pv_move {
+                    if Some(mv) == self.tt_move {
                         continue;
                     }
 
@@ -120,7 +112,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                     let killer = self.killer_moves[self.killer_idx];
                     self.killer_idx += 1;
                     if let Some(kmv) = killer {
-                        if Some(kmv) == self.pv_move || Some(kmv) == self.tt_move {
+                        if Some(kmv) == self.tt_move {
                             continue;
                         }
                         if self.board.piece_on(kmv.get_dest()).is_some() {
@@ -151,9 +143,7 @@ impl Iterator for IncrementalMoveGen<'_> {
 
         loop {
             let mv = self.iterator.next();
-            if (self.pv_move.is_some() && mv == self.pv_move)
-                || (self.tt_move.is_some() && mv == self.tt_move)
-            {
+            if self.tt_move.is_some() && mv == self.tt_move {
                 continue; // skip duplicates
             }
             return mv;
