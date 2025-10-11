@@ -262,6 +262,70 @@ fn uci_loop() {
                 }
             }
             "go" => {
+                if let Some(depth_idx) = tokens.iter().position(|&t| t == "depth") {
+                    if let Some(depth_token) = tokens.get(depth_idx + 1) {
+                        match depth_token.parse::<usize>() {
+                            Ok(depth) if depth > 0 => {
+                                let mut search_repetition = repetition_table.clone();
+                                let search_start = Instant::now();
+                                let outcome = best_move_using_iterative_deepening(
+                                    &board,
+                                    depth,
+                                    &mut transpo_table,
+                                    &mut search_repetition,
+                                );
+                                let elapsed = search_start.elapsed();
+
+                                let nodes = outcome.stats.nodes;
+                                let seldepth = outcome.stats.depth as u64;
+                                let time_ms = elapsed.as_millis() as u64;
+                                let nps = if time_ms > 0 {
+                                    nodes.saturating_mul(1_000) / time_ms
+                                } else {
+                                    0
+                                };
+                                let score_str = uci_score_string(outcome.score, board.side_to_move());
+
+                                if let Some(best_move) = outcome.best_move {
+                                    let info_line = format!(
+                                        "info depth {} seldepth {} score {} nodes {} time {} nps {} pv {}",
+                                        depth,
+                                        seldepth,
+                                        score_str,
+                                        nodes,
+                                        time_ms,
+                                        nps,
+                                        best_move,
+                                    );
+                                    send_message(&mut stdout, &info_line);
+
+                                    let stats_line = format!(
+                                        "info string stats {}",
+                                        outcome.stats.format_as_info()
+                                    );
+                                    send_message(&mut stdout, &stats_line);
+
+                                    send_message(&mut stdout, format!("bestmove {}", best_move).as_str());
+                                } else {
+                                    let info_line = format!(
+                                        "info string failed to find best move at depth {}",
+                                        depth
+                                    );
+                                    send_message(&mut stdout, &info_line);
+                                    send_message(&mut stdout, "bestmove 0000");
+                                }
+
+                                continue;
+                            }
+                            Ok(_) | Err(_) => {
+                                let warn = format!("info string invalid depth '{}'", depth_token);
+                                send_message(&mut stdout, &warn);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let time_budget = choose_time_for_move(&tokens, board.side_to_move());
 
                 let max_ply = 100;

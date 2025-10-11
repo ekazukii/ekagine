@@ -98,7 +98,7 @@ impl SearchStats {
         }
     }
 
-    fn format_as_info(&self) -> String {
+    pub(crate) fn format_as_info(&self) -> String {
         format!(
             "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
             self.nodes,
