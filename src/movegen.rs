@@ -1,8 +1,8 @@
 use crate::movegen::MoveGenState::{PrincipalVariation, Remaining, Sorted, TTStep};
+use crate::search::see_for_sort;
 use crate::{PVTable, TranspositionTable};
 use chess::{Board, ChessMove, MoveGen, EMPTY};
 use smallvec::SmallVec;
-use crate::search::see_for_sort;
 
 pub const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     // Victim = Pawn
@@ -116,7 +116,6 @@ impl Iterator for IncrementalMoveGen<'_> {
                     scored_moves.push((mv, score));
                 }
 
-
                 while self.killer_idx < self.killer_moves.len() {
                     let killer = self.killer_moves[self.killer_idx];
                     self.killer_idx += 1;
@@ -139,8 +138,6 @@ impl Iterator for IncrementalMoveGen<'_> {
                 self.capt_idx = Some(0);
                 self.capture_gen_pending = true;
             }
-
-
 
             if (self.capt_idx.unwrap()) < self.move_buff.len() {
                 let mv = self.move_buff[self.capt_idx.unwrap()];
