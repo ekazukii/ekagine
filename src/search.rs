@@ -270,17 +270,57 @@ fn quiesce_negamax_it(
 
     stats.record_depth(ply_from_root);
     stats.qnodes += 1;
-    if remain_quiet == 0 {
+    let in_check = board.checkers().popcnt() > 0;
+
+    if remain_quiet == 0 && !in_check {
         return color * cache_eval(board, transpo_table);
     }
 
-    let stand_pat = color * cache_eval(board, transpo_table);
-    if stand_pat >= beta {
-        stats.beta_cutoffs_quiescence += 1;
-        return stand_pat;
+    let mut stand_pat: Option<i32> = None;
+    if !in_check {
+        let eval = color * cache_eval(board, transpo_table);
+        if eval >= beta {
+            stats.beta_cutoffs_quiescence += 1;
+            return eval;
+        }
+        if eval > alpha {
+            alpha = eval;
+        }
+        stand_pat = Some(eval);
     }
-    if stand_pat > alpha {
-        alpha = stand_pat;
+
+    if in_check {
+        let mut legal_moves = MoveGen::new_legal(board);
+        if legal_moves.len() == 0 {
+            return color * mated_in_plies(ply_from_root);
+        }
+
+        for mv in legal_moves {
+            let new_board = board_do_move(board, mv, repetition_table);
+            let next_remain = remain_quiet.saturating_sub(1);
+            let score = -quiesce_negamax_it(
+                &new_board,
+                -beta,
+                -alpha,
+                next_remain,
+                transpo_table,
+                repetition_table,
+                -color,
+                ply_from_root + 1,
+                stats,
+            );
+            board_pop(&new_board, repetition_table);
+
+            if score >= beta {
+                stats.beta_cutoffs_quiescence += 1;
+                return score;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+        }
+
+        return alpha;
     }
 
     for (mv, _val) in get_captures(board) {
@@ -292,8 +332,10 @@ fn quiesce_negamax_it(
         let captured_val = dest_piece
             .map(piece_value)
             .unwrap_or_else(|| piece_value(Piece::Pawn));
-        if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
-            continue;
+        if let Some(sp) = stand_pat {
+            if sp + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
+                continue;
+            }
         }
         if see_for_sort(board, mv) < 0 {
             continue;
@@ -326,10 +368,7 @@ fn quiesce_negamax_it(
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
 /// If not found, compute via `eval_board`, insert into the table, and return.
-fn cache_eval(
-    board: &Board,
-    transpo_table: &mut TranspositionTable,
-) -> i32 {
+fn cache_eval(board: &Board, transpo_table: &mut TranspositionTable) -> i32 {
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.probe(zob) {
         if let Some(cached) = entry.eval {
