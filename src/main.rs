@@ -7,6 +7,7 @@ mod eval;
 mod movegen;
 mod search;
 mod tt;
+mod nnue;
 
 use crate::search::{
     best_move_interruptible, best_move_using_iterative_deepening, uci_score_string, SearchStats,
