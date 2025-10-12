@@ -39,16 +39,9 @@ pub struct IncrementalMoveGen<'a> {
 }
 
 impl<'a> IncrementalMoveGen<'a> {
-    pub fn new(
-        board: &'a Board,
-        tt: &TranspositionTable,
-        killer_moves: [Option<ChessMove>; 2],
-    ) -> Self {
+    pub fn new(board: &'a Board, tt: &TranspositionTable, killer_moves: [Option<ChessMove>; 2]) -> Self {
         let zob = board.get_hash();
-        let tt_move = tt
-            .probe(zob)
-            .and_then(|e| e.best_move)
-            .filter(|mv| board.legal(*mv));
+        let tt_move = tt.probe(zob).and_then(|e| e.best_move).filter(|mv| board.legal(*mv));
 
         Self {
             iterator: MoveGen::new_legal(&board),
@@ -125,8 +118,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                 }
 
                 scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                self.move_buff
-                    .extend(scored_moves.into_iter().map(|(m, _)| m));
+                self.move_buff.extend(scored_moves.into_iter().map(|(m, _)| m));
                 self.capt_idx = Some(0);
                 self.capture_gen_pending = true;
             }

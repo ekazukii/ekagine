@@ -9,9 +9,7 @@ mod nnue;
 mod search;
 mod tt;
 
-use crate::search::{
-    best_move_interruptible, best_move_using_iterative_deepening, uci_score_string, SearchStats,
-};
+use crate::search::{best_move_interruptible, best_move_using_iterative_deepening, uci_score_string, SearchStats};
 use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
@@ -176,10 +174,7 @@ pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
             }
             "movestogo" => {
                 i += 1;
-                movestogo = tokens
-                    .get(i)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(movestogo);
+                movestogo = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(movestogo);
             }
             _ => {}
         }
@@ -283,37 +278,21 @@ fn uci_loop() {
                                 } else {
                                     0
                                 };
-                                let score_str =
-                                    uci_score_string(outcome.score, board.side_to_move());
+                                let score_str = uci_score_string(outcome.score, board.side_to_move());
 
                                 if let Some(best_move) = outcome.best_move {
                                     let info_line = format!(
                                         "info depth {} seldepth {} score {} nodes {} time {} nps {} pv {}",
-                                        depth,
-                                        seldepth,
-                                        score_str,
-                                        nodes,
-                                        time_ms,
-                                        nps,
-                                        best_move,
+                                        depth, seldepth, score_str, nodes, time_ms, nps, best_move,
                                     );
                                     send_message(&mut stdout, &info_line);
 
-                                    let stats_line = format!(
-                                        "info string stats {}",
-                                        outcome.stats.format_as_info()
-                                    );
+                                    let stats_line = format!("info string stats {}", outcome.stats.format_as_info());
                                     send_message(&mut stdout, &stats_line);
 
-                                    send_message(
-                                        &mut stdout,
-                                        format!("bestmove {}", best_move).as_str(),
-                                    );
+                                    send_message(&mut stdout, format!("bestmove {}", best_move).as_str());
                                 } else {
-                                    let info_line = format!(
-                                        "info string failed to find best move at depth {}",
-                                        depth
-                                    );
+                                    let info_line = format!("info string failed to find best move at depth {}", depth);
                                     send_message(&mut stdout, &info_line);
                                     send_message(&mut stdout, "bestmove 0000");
                                 }
@@ -400,10 +379,7 @@ fn process_file(filepath: &str) -> io::Result<HashMap<Board, i32>> {
                                 Ok(board) => {
                                     result.insert(board, cp_value);
                                 }
-                                Err(err) => eprintln!(
-                                    "Failed to parse board {} Error: {})",
-                                    position_eval.fen, err
-                                ),
+                                Err(err) => eprintln!("Failed to parse board {} Error: {})", position_eval.fen, err),
                             }
                         } else {
                             eprintln!(
@@ -506,29 +482,38 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
         })
         .collect();
 
-    let (avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time) =
-        compute_stats(&time_ms);
-    let (avg_nodes, med_nodes, min_nodes, max_nodes, std_nodes, p5_nodes, p95_nodes) =
-        compute_stats(&nodes_f64);
+    let (avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time) = compute_stats(&time_ms);
+    let (avg_nodes, med_nodes, min_nodes, max_nodes, std_nodes, p5_nodes, p95_nodes) = compute_stats(&nodes_f64);
     let (avg_qnodes, med_qnodes, min_qnodes, max_qnodes, std_qnodes, p5_qnodes, p95_qnodes) =
         compute_stats(&qnodes_f64);
     let (avg_d, med_d, min_d, max_d, std_d, p5_d, p95_d) = compute_stats(&diffs);
-    let (avg_depth, med_depth, min_depth, max_depth, std_depth, p5_depth, p95_depth) =
-        compute_stats(&depth_f64);
+    let (avg_depth, med_depth, min_depth, max_depth, std_depth, p5_depth, p95_depth) = compute_stats(&depth_f64);
     let (avg_ebf, med_ebf, min_ebf, max_ebf, std_ebf, p5_ebf, p95_ebf) = compute_stats(&ebf_f64);
 
-    println!("⏱ Timing (ms)     : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
-             avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time);
-    println!("🌲 Nodes           : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
-             avg_nodes, med_nodes, min_nodes, max_nodes, std_nodes, p5_nodes, p95_nodes);
-    println!("🍃 QNodes          : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
-             avg_qnodes, med_qnodes, min_qnodes, max_qnodes, std_qnodes, p5_qnodes, p95_qnodes);
-    println!("🎯 Score Diffs     : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
-             avg_d, med_d, min_d, max_d, std_d, p5_d, p95_d);
-    println!("🔍 Search Depth    : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
-             avg_depth, med_depth, min_depth, max_depth, std_depth, p5_depth, p95_depth);
-    println!("📐 EBF             : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
-             avg_ebf, med_ebf, min_ebf, max_ebf, std_ebf, p5_ebf, p95_ebf);
+    println!(
+        "⏱ Timing (ms)     : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
+        avg_time, med_time, min_time, max_time, std_time, p5_time, p95_time
+    );
+    println!(
+        "🌲 Nodes           : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
+        avg_nodes, med_nodes, min_nodes, max_nodes, std_nodes, p5_nodes, p95_nodes
+    );
+    println!(
+        "🍃 QNodes          : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
+        avg_qnodes, med_qnodes, min_qnodes, max_qnodes, std_qnodes, p5_qnodes, p95_qnodes
+    );
+    println!(
+        "🎯 Score Diffs     : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
+        avg_d, med_d, min_d, max_d, std_d, p5_d, p95_d
+    );
+    println!(
+        "🔍 Search Depth    : Avg {:.2}, Med {:.2}, Min {:.0}, Max {:.0}, Std {:.2}, P5 {:.0}, P95 {:.0}",
+        avg_depth, med_depth, min_depth, max_depth, std_depth, p5_depth, p95_depth
+    );
+    println!(
+        "📐 EBF             : Avg {:.2}, Med {:.2}, Min {:.2}, Max {:.2}, Std {:.2}, P5 {:.2}, P95 {:.2}",
+        avg_ebf, med_ebf, min_ebf, max_ebf, std_ebf, p5_ebf, p95_ebf
+    );
 }
 
 const NEG_INFINITY: i32 = -100_000_000;
@@ -537,21 +522,13 @@ const PV_WIDTH: usize = 1; // keep up to X moves per position for ordering
 
 const QUIESCE_REMAIN: usize = 15;
 
-pub fn compute_best_from_fen(
-    fen: &str,
-    max_depth: usize,
-) -> Result<(Option<ChessMove>, i32), String> {
+pub fn compute_best_from_fen(fen: &str, max_depth: usize) -> Result<(Option<ChessMove>, i32), String> {
     let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
     let mut transpo_table = TranspositionTable::new();
     let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
-    let outcome = best_move_using_iterative_deepening(
-        &board,
-        max_depth,
-        &mut transpo_table,
-        &mut repetition_table,
-    );
+    let outcome = best_move_using_iterative_deepening(&board, max_depth, &mut transpo_table, &mut repetition_table);
 
     Ok((outcome.best_move, outcome.score))
 }
@@ -559,10 +536,7 @@ pub fn compute_best_from_fen(
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!(
-            "Usage: {} [--uci] [--benchmark [FILE]] [--best <FEN> [DEPTH]]",
-            args[0]
-        );
+        eprintln!("Usage: {} [--uci] [--benchmark [FILE]] [--best <FEN> [DEPTH]]", args[0]);
         std::process::exit(1);
     }
 

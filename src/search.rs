@@ -1,12 +1,12 @@
 use crate::movegen::IncrementalMoveGen;
 use crate::nnue::NNUEState;
 use crate::{
-    board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
-    NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
+    board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable, NEG_INFINITY,
+    POS_INFINITY, QUIESCE_REMAIN,
 };
 use chess::{
-    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
-    BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
+    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, BoardStatus, ChessMove, Color,
+    MoveGen, Piece, Square,
 };
 use smallvec::SmallVec;
 use std::cmp;
@@ -296,9 +296,7 @@ fn quiesce_negamax_it(
         if dest_piece.is_none() && !is_en_passant {
             continue;
         }
-        let captured_val = dest_piece
-            .map(piece_value)
-            .unwrap_or_else(|| piece_value(Piece::Pawn));
+        let captured_val = dest_piece.map(piece_value).unwrap_or_else(|| piece_value(Piece::Pawn));
         if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
             continue;
         }
@@ -474,11 +472,7 @@ fn pawn_attackers_to(square: Square, pawns: BitBoard, color: Color) -> BitBoard 
     attackers
 }
 
-fn compute_attackers_to(
-    square: Square,
-    occ: BitBoard,
-    piece_bb: &[[BitBoard; 6]; 2],
-) -> [BitBoard; 2] {
+fn compute_attackers_to(square: Square, occ: BitBoard, piece_bb: &[[BitBoard; 6]; 2]) -> [BitBoard; 2] {
     let mut attackers = [BitBoard::new(0); 2];
 
     for color in [Color::White, Color::Black] {
@@ -610,11 +604,10 @@ fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
         depth += 1;
         let captured_value = piece_value(current_piece);
 
-        let (att_piece, att_square) =
-            match select_least_valuable_attacker(side_idx, attack_mask, &piece_bb) {
-                Some(v) => v,
-                None => break,
-            };
+        let (att_piece, att_square) = match select_least_valuable_attacker(side_idx, attack_mask, &piece_bb) {
+            Some(v) => v,
+            None => break,
+        };
 
         gain[depth] = captured_value - gain[depth - 1];
         if gain[depth] < 0 {
@@ -826,11 +819,7 @@ fn negamax_it(
     // Null-move pruning: if not in check and enough depth, try a null move with reduction.
     // Guard against zugzwang: require some non-pawn material for the side to move.
     let in_check = board.checkers().popcnt() > 0;
-    if !is_pv_node
-        && !in_check
-        && depth_remaining >= 2
-        && has_non_pawn_material(board, board.side_to_move())
-    {
+    if !is_pv_node && !in_check && depth_remaining >= 2 && has_non_pawn_material(board, board.side_to_move()) {
         let r: i16 = if depth_remaining >= 6 { 3 } else { 2 };
         if let Some(nboard) = board_do_null_move(board, ctx.repetition_table) {
             nnue_state.push();
@@ -868,13 +857,12 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
-    let (static_eval, static_eval_raw) =
-        if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let raw = cache_eval(board, ctx, nnue_state);
-            (Some(color * raw), Some(raw))
-        } else {
-            (None, None)
-        };
+    let (static_eval, static_eval_raw) = if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
+        let raw = cache_eval(board, ctx, nnue_state);
+        (Some(color * raw), Some(raw))
+    } else {
+        (None, None)
+    };
 
     if let Some(raw) = static_eval_raw {
         tt_eval_hint = Some(raw);
@@ -922,8 +910,7 @@ fn negamax_it(
         let new_board = board_do_move(board, mv, ctx.repetition_table);
 
         // Determine properties for LMR conditions
-        let is_capture =
-            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
+        let is_capture = board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let gives_check = new_board.checkers().popcnt() > 0;
         let is_first_move = move_idx == 0; // treat first move as PV
         let child_is_pv_node = is_pv_node && is_first_move;
@@ -960,8 +947,7 @@ fn negamax_it(
         }
 
         // Apply LMR for late, quiet, non-check, non-PV moves with sufficient remaining depth
-        let apply_lmr =
-            depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
+        let apply_lmr = depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
         let reduction: i16 = if apply_lmr {
             if depth_remaining >= 6 {
                 2
@@ -1101,24 +1087,13 @@ fn negamax_it(
         TTFlag::Exact
     };
     let stored = tt_score_on_store(best_value, ply_from_root);
-    ctx.tt.store(
-        zob,
-        depth_remaining,
-        stored,
-        bound,
-        best_move_opt,
-        tt_eval_hint,
-    );
+    ctx.tt
+        .store(zob, depth_remaining, stored, bound, best_move_opt, tt_eval_hint);
 
     SearchScore::EVAL(best_value)
 }
 
-fn log_root_move_start(
-    out: &mut Stdout,
-    depth: usize,
-    mv: &ChessMove,
-    current_best: Option<(ChessMove, i32)>,
-) {
+fn log_root_move_start(out: &mut Stdout, depth: usize, mv: &ChessMove, current_best: Option<(ChessMove, i32)>) {
     let info_line = if let Some((best_move, best_score)) = current_best {
         format!(
             "info string [{}] evaluating move : {}, curr best is {} ({})",
@@ -1159,11 +1134,7 @@ struct RootSearchResult {
     aborted: bool,
 }
 
-fn collect_principal_variation(
-    board: &Board,
-    tt: &TranspositionTable,
-    max_depth: usize,
-) -> Vec<ChessMove> {
+fn collect_principal_variation(board: &Board, tt: &TranspositionTable, max_depth: usize) -> Vec<ChessMove> {
     let mut pv = Vec::new();
     let mut current = board.clone();
 
@@ -1214,11 +1185,7 @@ fn root_search_with_window(
     let mut best_value = NEG_INFINITY;
     let mut best_move = None;
     let mut aborted = false;
-    let color = if board.side_to_move() == Color::White {
-        1
-    } else {
-        -1
-    };
+    let color = if board.side_to_move() == Color::White { 1 } else { -1 };
 
     let mut out = io::stdout();
 
@@ -1305,14 +1272,8 @@ fn root_search_with_window(
 
             let depth_store = max_depth.min(i16::MAX as usize) as i16;
             let stored_score = tt_score_on_store(best_value, 0);
-            ctx.tt.store(
-                board.get_hash(),
-                depth_store,
-                stored_score,
-                bound,
-                Some(best_mv),
-                None,
-            );
+            ctx.tt
+                .store(board.get_hash(), depth_store, stored_score, bound, Some(best_mv), None);
         }
     }
 
@@ -1333,14 +1294,7 @@ fn aspiration_root_search(
     prev_score: Option<i32>,
 ) -> RootSearchResult {
     if prev_score.is_none() {
-        return root_search_with_window(
-            board,
-            max_depth,
-            ctx,
-            nnue_state,
-            NEG_INFINITY,
-            POS_INFINITY,
-        );
+        return root_search_with_window(board, max_depth, ctx, nnue_state, NEG_INFINITY, POS_INFINITY);
     }
 
     let mut delta = ASPIRATION_START_WINDOW;
@@ -1461,8 +1415,7 @@ pub fn best_move_using_iterative_deepening(
         stop: &stop,
     };
 
-    let (best_move, best_score) =
-        iterative_deepening_loop(board, max_depth, &mut ctx, nnue_state.as_mut(), |_| {});
+    let (best_move, best_score) = iterative_deepening_loop(board, max_depth, &mut ctx, nnue_state.as_mut(), |_| {});
 
     SearchOutcome::new(best_move, best_score, stats)
 }
@@ -1508,12 +1461,8 @@ pub fn best_move_interruptible(
     };
 
     let t0 = Instant::now();
-    let (best_move, best_score) = iterative_deepening_loop(
-        board,
-        max_depth_cap,
-        &mut ctx,
-        nnue_state.as_mut(),
-        |report| {
+    let (best_move, best_score) =
+        iterative_deepening_loop(board, max_depth_cap, &mut ctx, nnue_state.as_mut(), |report| {
             if report.result.aborted {
                 return;
             }
@@ -1521,11 +1470,7 @@ pub fn best_move_interruptible(
             if let Some(out) = stdout_opt.as_mut() {
                 let nodes = report.stats_delta.nodes;
                 let time_ms = t0.elapsed().as_millis() as u64;
-                let nps = if time_ms > 0 {
-                    nodes * 1_000 / time_ms
-                } else {
-                    0
-                };
+                let nps = if time_ms > 0 { nodes * 1_000 / time_ms } else { 0 };
 
                 if !report.principal_variation.is_empty() {
                     let pv_line = report
@@ -1542,8 +1487,7 @@ pub fn best_move_interruptible(
                     send_message(&mut **out, &info_line);
                 }
             }
-        },
-    );
+        });
 
     if let Some(out) = stdout_opt.as_mut() {
         let stats_line = format!("info string stats {}", stats.format_as_info());

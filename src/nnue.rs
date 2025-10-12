@@ -80,9 +80,7 @@ impl Accumulator {
     /// Updates weights for a single feature, either turning them on or off
     fn update_weights<const ON: bool>(&mut self, idx: (usize, usize)) {
         fn update<const ON: bool>(acc: &mut SideAccumulator, idx: usize) {
-            let zip = acc
-                .iter_mut()
-                .zip(&MODEL.feature_weights[idx..idx + HIDDEN]);
+            let zip = acc.iter_mut().zip(&MODEL.feature_weights[idx..idx + HIDDEN]);
 
             for (acc_val, &weight) in zip {
                 if ON {
@@ -197,12 +195,8 @@ impl NNUEState {
         let from = mv.get_source();
         let to = mv.get_dest();
 
-        let piece = board
-            .piece_on(from)
-            .expect("expected piece on move source square");
-        let color = board
-            .color_on(from)
-            .expect("expected color on move source square");
+        let piece = board.piece_on(from).expect("expected piece on move source square");
+        let color = board.color_on(from).expect("expected color on move source square");
 
         let from_file = from.get_file().to_index() as i32;
         let to_file = to.get_file().to_index() as i32;
@@ -226,9 +220,8 @@ impl NNUEState {
 
         let promotion = mv.get_promotion();
         let dest_piece = board.piece_on(to);
-        let is_en_passant = piece == Piece::Pawn
-            && dest_piece.is_none()
-            && board.en_passant() == Some(to.ubackward(color));
+        let is_en_passant =
+            piece == Piece::Pawn && dest_piece.is_none() && board.en_passant() == Some(to.ubackward(color));
 
         if promotion.is_none() && !is_en_passant && dest_piece.is_none() {
             self.move_update(piece, color, from, to);
@@ -243,9 +236,7 @@ impl NNUEState {
             };
             self.manual_update::<OFF>(Piece::Pawn, captured_color, capture_sq);
         } else if let Some(captured_piece) = dest_piece {
-            let captured_color = board
-                .color_on(to)
-                .expect("expected color on captured square");
+            let captured_color = board.color_on(to).expect("expected color on captured square");
             self.manual_update::<OFF>(captured_piece, captured_color, to);
         }
 
@@ -313,14 +304,8 @@ mod tests {
 
     fn assert_accumulators_equal(a: &NNUEState, a_idx: usize, b: &NNUEState, b_idx: usize) {
         for i in 0..HIDDEN {
-            assert_eq!(
-                a.accumulator_stack[a_idx].white[i],
-                b.accumulator_stack[b_idx].white[i]
-            );
-            assert_eq!(
-                a.accumulator_stack[a_idx].black[i],
-                b.accumulator_stack[b_idx].black[i]
-            );
+            assert_eq!(a.accumulator_stack[a_idx].white[i], b.accumulator_stack[b_idx].white[i]);
+            assert_eq!(a.accumulator_stack[a_idx].black[i], b.accumulator_stack[b_idx].black[i]);
         }
     }
 
@@ -334,14 +319,8 @@ mod tests {
         s2.pop();
 
         for i in 0..HIDDEN {
-            assert_eq!(
-                s1.accumulator_stack[0].white[i],
-                s2.accumulator_stack[0].white[i]
-            );
-            assert_eq!(
-                s1.accumulator_stack[0].black[i],
-                s2.accumulator_stack[0].black[i]
-            );
+            assert_eq!(s1.accumulator_stack[0].white[i], s2.accumulator_stack[0].white[i]);
+            assert_eq!(s1.accumulator_stack[0].black[i], s2.accumulator_stack[0].black[i]);
         }
         assert_eq!(s1.current_acc, s2.current_acc);
     }
@@ -384,9 +363,7 @@ mod tests {
         let mut s1 = NNUEState::from_board(&b1);
         let s2 = NNUEState::from_board(&b2);
 
-        if let (Some(piece), Some(color)) =
-            (b1.piece_on(m.get_source()), b1.color_on(m.get_source()))
-        {
+        if let (Some(piece), Some(color)) = (b1.piece_on(m.get_source()), b1.color_on(m.get_source())) {
             s1.move_update(piece, color, m.get_source(), m.get_dest());
         } else {
             panic!("expected piece on source square");

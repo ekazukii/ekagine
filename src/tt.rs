@@ -188,11 +188,7 @@ impl TranspositionTable {
         slot.is_pv = false;
     }
 
-    fn select_replacement(
-        bucket: &[TTSlot; TT_BUCKET_SIZE],
-        generation: u8,
-        prefer_pv: bool,
-    ) -> usize {
+    fn select_replacement(bucket: &[TTSlot; TT_BUCKET_SIZE], generation: u8, prefer_pv: bool) -> usize {
         let mut target_idx = 0;
         let mut best_score = i32::MIN;
 

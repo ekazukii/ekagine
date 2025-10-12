@@ -4,8 +4,8 @@
 use crate::{NEG_INFINITY, POS_INFINITY};
 use chess::Color::{Black, White};
 use chess::{
-    get_adjacent_files, get_bishop_moves, get_file, get_king_moves, get_knight_moves,
-    get_rook_moves, BitBoard, Board, BoardStatus, Color, File, Piece, Rank, Square,
+    get_adjacent_files, get_bishop_moves, get_file, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
+    BoardStatus, Color, File, Piece, Rank, Square,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,9 +41,8 @@ fn flip_vertical(table: &[i32; 64]) -> [i32; 64] {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PAWNS_VALUE_MAPPING_BLACK: [i32; 64] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 10, 10, 20, 30, 30, 20, 10, 10, 5, 5,
-    10, 25, 25, 10, 5, 5, 0, 0, 0, 20, 20, 0, 0, 0, 5, -5, -10, 0, 0, -10, -5, 5, 5, 10, 10, -20,
-    -20, 10, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 10, 10, 20, 30, 30, 20, 10, 10, 5, 5, 10, 25, 25, 10, 5, 5,
+    0, 0, 0, 20, 20, 0, 0, 0, 5, -5, -10, 0, 0, -10, -5, 5, 5, 10, 10, -20, -20, 10, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 lazy_static::lazy_static! {
     static ref PAWNS_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -51,9 +50,8 @@ lazy_static::lazy_static! {
 }
 
 const ROOKS_VALUE_MAPPING_BLACK: [i32; 64] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0,
-    0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, 0, 0,
-    0, 5, 5, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0,
+    0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, 0, 0, 0, 5, 5, 0, 0, 0,
 ];
 lazy_static::lazy_static! {
     static ref ROOKS_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -61,9 +59,9 @@ lazy_static::lazy_static! {
 }
 
 const KNIGHTS_VALUE_MAPPING_BLACK: [i32; 64] = [
-    -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15, 15, 10,
-    0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5, 10, 15, 15, 10,
-    5, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50,
+    -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15, 15, 10, 0, -30, -30, 5, 15,
+    20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5, 10, 15, 15, 10, 5, -30, -40, -20, 0, 5, 5, 0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50,
 ];
 lazy_static::lazy_static! {
     static ref KNIGHTS_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -71,9 +69,9 @@ lazy_static::lazy_static! {
 }
 
 const BISHOPS_VALUE_MAPPING_BLACK: [i32; 64] = [
-    -20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10, 5, 0,
-    -10, -10, 5, 5, 10, 10, 5, 5, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 10, 10, 10, 10, 10, 10,
-    -10, -10, 5, 0, 0, 0, 0, 5, -10, -20, -10, -10, -10, -10, -10, -10, -20,
+    -20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10, 5, 0, -10, -10, 5, 5, 10,
+    10, 5, 5, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 10, 10, 10, 10, 10, 10, -10, -10, 5, 0, 0, 0, 0, 5, -10, -20,
+    -10, -10, -10, -10, -10, -10, -20,
 ];
 lazy_static::lazy_static! {
     static ref BISHOPS_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -81,9 +79,9 @@ lazy_static::lazy_static! {
 }
 
 const QUEENS_VALUE_MAPPING_BLACK: [i32; 64] = [
-    -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10,
-    -5, 0, 5, 5, 5, 5, 0, -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10, -10, 0, 5, 0, 0,
-    0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20,
+    -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10, -5, 0, 5, 5, 5, 5, 0,
+    -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10, -10, 0, 5, 0, 0, 0, 0, -10, -20, -10, -10, -5, -5, -10,
+    -10, -20,
 ];
 lazy_static::lazy_static! {
     static ref QUEENS_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -91,10 +89,9 @@ lazy_static::lazy_static! {
 }
 
 const KING_START_VALUE_MAPPING_BLACK: [i32; 64] = [
-    -80, -70, -70, -70, -70, -70, -70, -80, -60, -60, -60, -60, -60, -60, -60, -60, -40, -50, -50,
-    -60, -60, -50, -50, -40, -30, -40, -40, -50, -50, -40, -40, -30, -20, -30, -30, -40, -40, -30,
-    -30, -20, -10, -20, -20, -20, -20, -20, -20, -10, 20, 20, -5, -5, -5, -5, 20, 20, 20, 30, 10,
-    0, 0, 10, 30, 20,
+    -80, -70, -70, -70, -70, -70, -70, -80, -60, -60, -60, -60, -60, -60, -60, -60, -40, -50, -50, -60, -60, -50, -50,
+    -40, -30, -40, -40, -50, -50, -40, -40, -30, -20, -30, -30, -40, -40, -30, -30, -20, -10, -20, -20, -20, -20, -20,
+    -20, -10, 20, 20, -5, -5, -5, -5, 20, 20, 20, 30, 10, 0, 0, 10, 30, 20,
 ];
 lazy_static::lazy_static! {
     static ref KING_START_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -102,9 +99,9 @@ lazy_static::lazy_static! {
 }
 
 const KING_END_VALUE_MAPPING_BLACK: [i32; 64] = [
-    -20, -10, -10, -10, -10, -10, -10, -20, -5, 0, 5, 5, 5, 5, 0, -5, -10, -5, 20, 30, 30, 20, -5,
-    -10, -15, -10, 35, 45, 45, 35, -10, -15, -20, -15, 30, 40, 40, 30, -15, -20, -25, -20, 20, 25,
-    25, 20, -20, -25, -30, -25, 0, 0, 0, 0, -25, -30, -50, -30, -30, -30, -30, -30, -30, -50,
+    -20, -10, -10, -10, -10, -10, -10, -20, -5, 0, 5, 5, 5, 5, 0, -5, -10, -5, 20, 30, 30, 20, -5, -10, -15, -10, 35,
+    45, 45, 35, -10, -15, -20, -15, 30, 40, 40, 30, -15, -20, -25, -20, 20, 25, 25, 20, -20, -25, -30, -25, 0, 0, 0, 0,
+    -25, -30, -50, -30, -30, -30, -30, -30, -30, -50,
 ];
 lazy_static::lazy_static! {
     static ref KING_END_VALUE_MAPPING_WHITE: [i32; 64] =
@@ -118,12 +115,8 @@ const BISHOP_BASE_VAL: i32 = 300;
 const ROOK_BASE_VAL: i32 = 500;
 const QUEEN_BASE_VAL: i32 = 900;
 const BISHOP_PAIR_VAL: i32 = 30;
-const STARTING_MATERIALS: i32 = (PAWN_BASE_VAL * 8
-    + KNIGHT_BASE_VAL * 2
-    + BISHOP_BASE_VAL * 2
-    + ROOK_BASE_VAL * 2
-    + QUEEN_BASE_VAL)
-    * 2;
+const STARTING_MATERIALS: i32 =
+    (PAWN_BASE_VAL * 8 + KNIGHT_BASE_VAL * 2 + BISHOP_BASE_VAL * 2 + ROOK_BASE_VAL * 2 + QUEEN_BASE_VAL) * 2;
 
 const DOUBLED_PAWN_PENALTY: i32 = 15;
 const ISOLATED_PAWN_PENALTY: i32 = 15;
@@ -170,16 +163,7 @@ fn endgame_progress(board: &Board) -> i32 {
 /// a centipawn adjustment: positive values mean "safer" whereas negative values
 /// indicate king exposure.
 fn king_safety_eval(board: &Board, king_sq: Square, our_color: Color) -> i32 {
-    const NEIGHBORS: &[(i8, i8)] = &[
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (-1, 0),
-        (1, 0),
-        (-1, 1),
-        (0, 1),
-        (1, 1),
-    ];
+    const NEIGHBORS: &[(i8, i8)] = &[(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
 
     let mut friendly_shield = 0;
     let mut enemy_encounters = 0;
@@ -198,10 +182,7 @@ fn king_safety_eval(board: &Board, king_sq: Square, our_color: Color) -> i32 {
         if !(0..8).contains(&f) || !(0..8).contains(&r) {
             continue;
         }
-        let sq = Square::make_square(
-            chess::Rank::from_index(r as usize),
-            chess::File::from_index(f as usize),
-        );
+        let sq = Square::make_square(chess::Rank::from_index(r as usize), chess::File::from_index(f as usize));
         match board.piece_on(sq) {
             Some(Piece::Pawn) if board.color_on(sq) == Some(our_color) => {
                 friendly_shield += 1;
@@ -283,14 +264,12 @@ fn build_passed_masks(color: Color) -> [BitBoard; 64] {
 
     for rank_idx in 0..8 {
         for file_idx in 0..8 {
-            let square =
-                Square::make_square(Rank::from_index(rank_idx), File::from_index(file_idx));
+            let square = Square::make_square(Rank::from_index(rank_idx), File::from_index(file_idx));
             let mut mask = BitBoard::new(0);
             for df in -1..=1 {
                 let target_file = file_idx as i32 + df;
                 if (0..8).contains(&target_file) {
-                    mask |=
-                        forward_squares_mask(square, color, File::from_index(target_file as usize));
+                    mask |= forward_squares_mask(square, color, File::from_index(target_file as usize));
                 }
             }
             masks[square.to_index()] = mask;
@@ -411,30 +390,14 @@ pub fn eval_board(board: &Board) -> i32 {
 
     total += pieces_type_eval(&white_pawns, &PAWNS_VALUE_MAPPING_WHITE, PAWN_BASE_VAL);
     total += pieces_type_eval(&white_rooks, &ROOKS_VALUE_MAPPING_WHITE, ROOK_BASE_VAL);
-    total += pieces_type_eval(
-        &white_knights,
-        &KNIGHTS_VALUE_MAPPING_WHITE,
-        KNIGHT_BASE_VAL,
-    );
-    total += pieces_type_eval(
-        &white_bishops,
-        &BISHOPS_VALUE_MAPPING_WHITE,
-        BISHOP_BASE_VAL,
-    );
+    total += pieces_type_eval(&white_knights, &KNIGHTS_VALUE_MAPPING_WHITE, KNIGHT_BASE_VAL);
+    total += pieces_type_eval(&white_bishops, &BISHOPS_VALUE_MAPPING_WHITE, BISHOP_BASE_VAL);
     total += pieces_type_eval(&white_queens, &QUEENS_VALUE_MAPPING_WHITE, QUEEN_BASE_VAL);
 
     total -= pieces_type_eval(&black_pawns, &PAWNS_VALUE_MAPPING_BLACK, PAWN_BASE_VAL);
     total -= pieces_type_eval(&black_rooks, &ROOKS_VALUE_MAPPING_BLACK, ROOK_BASE_VAL);
-    total -= pieces_type_eval(
-        &black_knights,
-        &KNIGHTS_VALUE_MAPPING_BLACK,
-        KNIGHT_BASE_VAL,
-    );
-    total -= pieces_type_eval(
-        &black_bishops,
-        &BISHOPS_VALUE_MAPPING_BLACK,
-        BISHOP_BASE_VAL,
-    );
+    total -= pieces_type_eval(&black_knights, &KNIGHTS_VALUE_MAPPING_BLACK, KNIGHT_BASE_VAL);
+    total -= pieces_type_eval(&black_bishops, &BISHOPS_VALUE_MAPPING_BLACK, BISHOP_BASE_VAL);
     total -= pieces_type_eval(&black_queens, &QUEENS_VALUE_MAPPING_BLACK, QUEEN_BASE_VAL);
 
     total += pawn_structure_eval(white_pawns, White);
