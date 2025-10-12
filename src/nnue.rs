@@ -1,14 +1,12 @@
+use chess::{Board, ChessMove, Color, Piece, Square};
 /// NNUE Implementation
-/// Carp uses a (768->1024)x2->1 perspective net architecture, fully trained on self play data.
+/// We use a simple architecture (768->1024)x2->1 perspective net architecture
 /// Network is initialized at compile time from the 'net.bin' file in thie bins directory.
-/// A new net can be loaded by running the convert_json.py script in the scripts folder.
-///
-/// Huge thanks to Cosmo, author of Viridithas, for the help. The code here is heavily inspired by
-/// his engine.
+/// The code is based on the code of Carp and Viridithas adpated to work with the chess crate
+/// Most likely this can be copy-pasted for any other engine that use the chess crate
 use std::alloc;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use chess::{Board, Color, Piece, Square};
 
 const MAX_DEPTH: usize = 128;
 
@@ -38,10 +36,10 @@ struct NNUEParams {
     output_bias: i16,
 }
 
-/// NNUE model is initialized from binary values (Viridithas format)
+/// NNUE model is initialized from direct binary values (Viridithas format)
+// TODO: Adapt to work with zstd format for the weights
 static MODEL: NNUEParams = unsafe { mem::transmute(*include_bytes!("../net.bin")) };
 
-/// Generic wrapper for types aligned to 64B for AVX512 (also a Viridithas trick)
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(C, align(64))]
 struct Align64<T>(pub T);
@@ -183,8 +181,7 @@ impl NNUEState {
 
     /// Manually turn on or off the single given feature
     pub fn manual_update<const ON: bool>(&mut self, piece: Piece, color: Color, sq: Square) {
-        self.accumulator_stack[self.current_acc]
-            .update_weights::<ON>(nnue_index(piece, color, sq));
+        self.accumulator_stack[self.current_acc].update_weights::<ON>(nnue_index(piece, color, sq));
     }
 
     /// Efficiently update accumulator for a quiet move (that is, only changes from/to features)
@@ -193,6 +190,68 @@ impl NNUEState {
         let to_idx = nnue_index(piece, color, to);
 
         self.accumulator_stack[self.current_acc].add_sub_weights(from_idx, to_idx);
+    }
+
+    /// Apply a move to the top accumulator, assuming the stack already reflects the pre-move board.
+    pub fn apply_move(&mut self, board: &Board, mv: ChessMove) {
+        let from = mv.get_source();
+        let to = mv.get_dest();
+
+        let piece = board
+            .piece_on(from)
+            .expect("expected piece on move source square");
+        let color = board
+            .color_on(from)
+            .expect("expected color on move source square");
+
+        let from_file = from.get_file().to_index() as i32;
+        let to_file = to.get_file().to_index() as i32;
+        let is_castling = piece == Piece::King && (from_file - to_file).abs() == 2;
+        if is_castling {
+            self.manual_update::<OFF>(Piece::King, color, from);
+            self.manual_update::<ON>(Piece::King, color, to);
+
+            let (rook_from, rook_to) = match (color, to) {
+                (Color::White, Square::G1) => (Square::H1, Square::F1),
+                (Color::White, Square::C1) => (Square::A1, Square::D1),
+                (Color::Black, Square::G8) => (Square::H8, Square::F8),
+                (Color::Black, Square::C8) => (Square::A8, Square::D8),
+                _ => panic!("unexpected castling destination"),
+            };
+
+            self.manual_update::<OFF>(Piece::Rook, color, rook_from);
+            self.manual_update::<ON>(Piece::Rook, color, rook_to);
+            return;
+        }
+
+        let promotion = mv.get_promotion();
+        let dest_piece = board.piece_on(to);
+        let is_en_passant = piece == Piece::Pawn
+            && dest_piece.is_none()
+            && board.en_passant() == Some(to.ubackward(color));
+
+        if promotion.is_none() && !is_en_passant && dest_piece.is_none() {
+            self.move_update(piece, color, from, to);
+            return;
+        }
+
+        if is_en_passant {
+            let capture_sq = to.ubackward(color);
+            let captured_color = match color {
+                Color::White => Color::Black,
+                Color::Black => Color::White,
+            };
+            self.manual_update::<OFF>(Piece::Pawn, captured_color, capture_sq);
+        } else if let Some(captured_piece) = dest_piece {
+            let captured_color = board
+                .color_on(to)
+                .expect("expected color on captured square");
+            self.manual_update::<OFF>(captured_piece, captured_color, to);
+        }
+
+        self.manual_update::<OFF>(piece, color, from);
+        let target_piece = promotion.unwrap_or(piece);
+        self.manual_update::<ON>(target_piece, color, to);
     }
 
     /// Evaluate the nn from the current accumulator
@@ -250,6 +309,20 @@ fn squared_crelu(value: i16) -> i32 {
 mod tests {
     use super::*;
     use chess::ChessMove;
+    use std::str::FromStr;
+
+    fn assert_accumulators_equal(a: &NNUEState, a_idx: usize, b: &NNUEState, b_idx: usize) {
+        for i in 0..HIDDEN {
+            assert_eq!(
+                a.accumulator_stack[a_idx].white[i],
+                b.accumulator_stack[b_idx].white[i]
+            );
+            assert_eq!(
+                a.accumulator_stack[a_idx].black[i],
+                b.accumulator_stack[b_idx].black[i]
+            );
+        }
+    }
 
     #[test]
     fn test_nnue_stack() {
@@ -311,24 +384,122 @@ mod tests {
         let mut s1 = NNUEState::from_board(&b1);
         let s2 = NNUEState::from_board(&b2);
 
-        if let (Some(piece), Some(color)) = (
-            b1.piece_on(m.get_source()),
-            b1.color_on(m.get_source()),
-        ) {
+        if let (Some(piece), Some(color)) =
+            (b1.piece_on(m.get_source()), b1.color_on(m.get_source()))
+        {
             s1.move_update(piece, color, m.get_source(), m.get_dest());
         } else {
             panic!("expected piece on source square");
         }
 
-        for i in 0..HIDDEN {
-            assert_eq!(
-                s1.accumulator_stack[0].white[i],
-                s2.accumulator_stack[0].white[i]
-            );
-            assert_eq!(
-                s1.accumulator_stack[0].black[i],
-                s2.accumulator_stack[0].black[i]
-            );
+        assert_accumulators_equal(&s1, 0, &s2, 0);
+    }
+
+    #[test]
+    fn test_apply_move_quiet_matches_rebuild() {
+        let board = Board::default();
+        let mv = ChessMove::new(Square::G1, Square::F3, None);
+
+        let mut state = NNUEState::from_board(&board);
+        let new_board = board.make_move_new(mv);
+        let rebuilt = NNUEState::from_board(&new_board);
+
+        state.push();
+        state.apply_move(&board, mv);
+
+        assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
+    }
+
+    #[test]
+    fn test_apply_move_capture_matches_rebuild() {
+        let mut board = Board::default();
+        let sequence = [
+            ChessMove::new(Square::E2, Square::E4, None),
+            ChessMove::new(Square::D7, Square::D5, None),
+        ];
+        for mv in sequence {
+            board = board.make_move_new(mv);
         }
+        let capture = ChessMove::new(Square::E4, Square::D5, None);
+
+        let mut state = NNUEState::from_board(&board);
+        let new_board = board.make_move_new(capture);
+        let rebuilt = NNUEState::from_board(&new_board);
+
+        state.push();
+        state.apply_move(&board, capture);
+
+        assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
+    }
+
+    #[test]
+    fn test_apply_move_en_passant_matches_rebuild() {
+        let mut board = Board::default();
+        let sequence = [
+            ChessMove::new(Square::E2, Square::E4, None),
+            ChessMove::new(Square::D7, Square::D5, None),
+            ChessMove::new(Square::E4, Square::E5, None),
+            ChessMove::new(Square::F7, Square::F5, None),
+        ];
+        for mv in sequence {
+            board = board.make_move_new(mv);
+        }
+
+        assert_eq!(board.en_passant(), Some(Square::F5));
+
+        let ep = ChessMove::new(Square::E5, Square::F6, None);
+        let mut state = NNUEState::from_board(&board);
+        let new_board = board.make_move_new(ep);
+        let rebuilt = NNUEState::from_board(&new_board);
+
+        state.push();
+        state.apply_move(&board, ep);
+
+        assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
+    }
+
+    #[test]
+    fn test_apply_move_castling_matches_rebuild() {
+        let board = Board::from_str("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        let mv = ChessMove::new(Square::E1, Square::G1, None);
+
+        let mut state = NNUEState::from_board(&board);
+        let new_board = board.make_move_new(mv);
+        let rebuilt = NNUEState::from_board(&new_board);
+
+        state.push();
+        state.apply_move(&board, mv);
+
+        assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
+    }
+
+    #[test]
+    fn test_apply_move_promotion_matches_rebuild() {
+        let board = Board::from_str("7k/P7/8/8/8/8/8/7K w - - 0 1").unwrap();
+        let mv = ChessMove::new(Square::A7, Square::A8, Some(Piece::Queen));
+
+        let mut state = NNUEState::from_board(&board);
+        let new_board = board.make_move_new(mv);
+        let rebuilt = NNUEState::from_board(&new_board);
+
+        state.push();
+        state.apply_move(&board, mv);
+
+        assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
+    }
+
+    #[test]
+    fn test_apply_move_promotion_capture_matches_rebuild() {
+        let board = Board::from_str("1r5k/P7/8/8/8/8/8/7K w - - 0 1").unwrap();
+        let mv = ChessMove::new(Square::A7, Square::B8, Some(Piece::Queen));
+
+        let mut state = NNUEState::from_board(&board);
+        let new_board = board.make_move_new(mv);
+        let rebuilt = NNUEState::from_board(&new_board);
+
+        state.push();
+        state.apply_move(&board, mv);
+
+        assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
     }
 }

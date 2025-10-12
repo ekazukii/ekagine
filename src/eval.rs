@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 /* New helper: compute endgame progress as an integer between 0 and 100 */
 use crate::{NEG_INFINITY, POS_INFINITY};
 use chess::Color::{Black, White};

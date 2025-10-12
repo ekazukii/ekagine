@@ -1,5 +1,5 @@
-use crate::eval::eval_board;
 use crate::movegen::IncrementalMoveGen;
+use crate::nnue::NNUEState;
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
@@ -265,16 +265,17 @@ fn quiesce_negamax_it(
     color: i32, // +1 if White to move in this node, −1 otherwise
     ply_from_root: i32,
     stats: &mut SearchStats,
+    nnue_state: &mut NNUEState,
 ) -> i32 {
     debug_assert!(!repetition_table.is_in_threefold_scenario(board));
 
     stats.record_depth(ply_from_root);
     stats.qnodes += 1;
     if remain_quiet == 0 {
-        return color * cache_eval(board, transpo_table);
+        return color * cache_eval(board, transpo_table, nnue_state);
     }
 
-    let stand_pat = color * cache_eval(board, transpo_table);
+    let stand_pat = color * cache_eval(board, transpo_table, nnue_state);
     if stand_pat >= beta {
         stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -299,6 +300,8 @@ fn quiesce_negamax_it(
             continue;
         }
         let new_board = board_do_move(board, mv, repetition_table);
+        nnue_state.push();
+        nnue_state.apply_move(board, mv);
         let score = -quiesce_negamax_it(
             &new_board,
             -beta,
@@ -309,8 +312,10 @@ fn quiesce_negamax_it(
             -color,
             ply_from_root + 1,
             stats,
+            nnue_state,
         );
         board_pop(&new_board, repetition_table);
+        nnue_state.pop();
 
         if score >= beta {
             stats.beta_cutoffs_quiescence += 1;
@@ -329,6 +334,7 @@ fn quiesce_negamax_it(
 fn cache_eval(
     board: &Board,
     transpo_table: &mut TranspositionTable,
+    nnue_state: &NNUEState,
 ) -> i32 {
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.probe(zob) {
@@ -336,7 +342,7 @@ fn cache_eval(
             return cached;
         }
     }
-    let val = eval_board(board);
+    let val = nnue_state.evaluate(Color::White);
     transpo_table.store_eval(zob, val);
     val
 }
@@ -752,6 +758,7 @@ fn negamax_it(
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
     killers: &mut KillerTable,
+    nnue_state: &mut NNUEState,
     color: i32,
     stop: &StopFlag,
     ply_from_root: i32,
@@ -786,6 +793,7 @@ fn negamax_it(
             color,
             ply_from_root,
             stats,
+            nnue_state,
         ));
     }
 
@@ -831,8 +839,9 @@ fn negamax_it(
     {
         let r: i16 = if depth_remaining >= 6 { 3 } else { 2 };
         if let Some(nboard) = board_do_null_move(board, repetition_table) {
+            nnue_state.push();
             // null-window search (fail-high test)
-            match negamax_it(
+            let result = negamax_it(
                 &nboard,
                 (depth_remaining - 1 - r).max(0),
                 -beta,
@@ -840,19 +849,21 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 killers,
+                nnue_state,
                 -color,
                 stop,
                 ply_from_root + 1,
                 false,
                 stats,
-            ) {
+            );
+            board_pop(&nboard, repetition_table);
+            nnue_state.pop();
+            match result {
                 SearchScore::CANCELLED => {
-                    board_pop(&nboard, repetition_table);
                     return SearchScore::CANCELLED;
                 }
                 SearchScore::EVAL(v) => {
                     let value = -v;
-                    board_pop(&nboard, repetition_table);
                     if value >= beta {
                         stats.null_move_prunes += 1;
                         stats.beta_cutoffs += 1;
@@ -869,7 +880,7 @@ fn negamax_it(
 
     let (static_eval, static_eval_raw) =
         if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let raw = cache_eval(board, transpo_table);
+            let raw = cache_eval(board, transpo_table, nnue_state);
             (Some(color * raw), Some(raw))
         } else {
             (None, None)
@@ -971,7 +982,6 @@ fn negamax_it(
             0
         };
 
-        let mut value;
         let mut use_pvs = !is_first_move;
         let null_window_beta_candidate = alpha.saturating_add(1).min(beta);
         if null_window_beta_candidate <= alpha {
@@ -989,9 +999,14 @@ fn negamax_it(
             reduced_depth = 0;
         }
 
+        nnue_state.push();
+        nnue_state.apply_move(board, mv);
+
+        let mut value_opt: Option<i32> = None;
+
         if use_pvs {
             let null_window_beta = null_window_beta_candidate;
-            let first_result = negamax_it(
+            match negamax_it(
                 &new_board,
                 reduced_depth,
                 -null_window_beta,
@@ -999,44 +1014,49 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 killers,
+                nnue_state,
                 -color,
                 stop,
                 ply_from_root + 1,
                 false,
                 stats,
-            );
+            ) {
+                SearchScore::CANCELLED => {}
+                SearchScore::EVAL(v) => {
+                    let mut current_value = -v;
+                    if current_value > alpha && current_value < beta {
+                        if reduction > 0 {
+                            stats.lmr_researches += 1;
+                        }
 
-            value = match first_result {
-                SearchScore::CANCELLED => return SearchScore::CANCELLED,
-                SearchScore::EVAL(v) => -v,
-            };
-
-            if value > alpha && value < beta {
-                if reduction > 0 {
-                    stats.lmr_researches += 1;
+                        match negamax_it(
+                            &new_board,
+                            depth_after_move_with_ext,
+                            -beta,
+                            -alpha,
+                            transpo_table,
+                            repetition_table,
+                            killers,
+                            nnue_state,
+                            -color,
+                            stop,
+                            ply_from_root + 1,
+                            child_is_pv_node,
+                            stats,
+                        ) {
+                            SearchScore::CANCELLED => {}
+                            SearchScore::EVAL(v2) => {
+                                current_value = -v2;
+                                value_opt = Some(current_value);
+                            }
+                        }
+                    } else {
+                        value_opt = Some(current_value);
+                    }
                 }
-
-                value = match negamax_it(
-                    &new_board,
-                    depth_after_move_with_ext,
-                    -beta,
-                    -alpha,
-                    transpo_table,
-                    repetition_table,
-                    killers,
-                    -color,
-                    stop,
-                    ply_from_root + 1,
-                    child_is_pv_node,
-                    stats,
-                ) {
-                    SearchScore::CANCELLED => return SearchScore::CANCELLED,
-                    SearchScore::EVAL(v) => -v,
-                };
             }
         } else {
-            // Normal full-depth search (PV move)
-            value = match negamax_it(
+            match negamax_it(
                 &new_board,
                 reduced_depth,
                 -beta,
@@ -1044,16 +1064,28 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 killers,
+                nnue_state,
                 -color,
                 stop,
                 ply_from_root + 1,
                 child_is_pv_node,
                 stats,
             ) {
-                SearchScore::CANCELLED => return SearchScore::CANCELLED,
-                SearchScore::EVAL(v) => -v,
-            };
+                SearchScore::CANCELLED => {}
+                SearchScore::EVAL(v) => {
+                    value_opt = Some(-v);
+                }
+            }
         }
+
+        nnue_state.pop();
+
+        if value_opt.is_none() {
+            repetition_table.pop();
+            return SearchScore::CANCELLED;
+        }
+
+        let value = value_opt.unwrap();
 
         // Update best / alpha-beta
         if value > best_value {
@@ -1188,6 +1220,7 @@ fn root_search_with_window(
     repetition_table: &mut RepetitionTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
+    nnue_state: &mut NNUEState,
     alpha_start: i32,
     beta_start: i32,
 ) -> RootSearchResult {
@@ -1230,7 +1263,10 @@ fn root_search_with_window(
         let mut child_depth = max_depth.saturating_sub(1);
 
         child_depth = child_depth.min(i16::MAX as usize);
-        match negamax_it(
+        nnue_state.push();
+        nnue_state.apply_move(board, mv);
+
+        let result = negamax_it(
             &new_board,
             child_depth as i16,
             -beta,
@@ -1238,13 +1274,19 @@ fn root_search_with_window(
             transpo_table,
             repetition_table,
             &mut killer_table,
+            nnue_state,
             -color,
             stop,
             1, // one ply from root after making mv
             is_pv_node,
             stats,
-        ) {
+        );
+
+        nnue_state.pop();
+
+        match result {
             SearchScore::CANCELLED => {
+                repetition_table.pop();
                 aborted = true;
                 break;
             }
@@ -1320,6 +1362,7 @@ fn aspiration_root_search(
     repetition_table: &mut RepetitionTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
+    nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
 ) -> RootSearchResult {
     if prev_score.is_none() {
@@ -1330,6 +1373,7 @@ fn aspiration_root_search(
             repetition_table,
             stop,
             stats,
+            nnue_state,
             NEG_INFINITY,
             POS_INFINITY,
         );
@@ -1349,6 +1393,7 @@ fn aspiration_root_search(
             repetition_table,
             stop,
             stats,
+            nnue_state,
             alpha,
             beta,
         );
@@ -1388,6 +1433,7 @@ fn iterative_deepening_loop<F>(
     repetition_table: &mut RepetitionTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
+    nnue_state: &mut NNUEState,
     mut on_iteration: F,
 ) -> (Option<ChessMove>, i32)
 where
@@ -1404,6 +1450,7 @@ where
         }
 
         transpo_table.bump_generation();
+        nnue_state.refresh(board);
 
         let result = aspiration_root_search(
             board,
@@ -1412,6 +1459,7 @@ where
             repetition_table,
             stop,
             stats,
+            nnue_state,
             prev_score,
         );
 
@@ -1458,6 +1506,7 @@ pub fn best_move_using_iterative_deepening(
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
     let mut stats = SearchStats::default();
+    let mut nnue_state = NNUEState::from_board(board);
 
     let (best_move, best_score) = iterative_deepening_loop(
         board,
@@ -1466,6 +1515,7 @@ pub fn best_move_using_iterative_deepening(
         repetition_table,
         &stop,
         &mut stats,
+        nnue_state.as_mut(),
         |_| {},
     );
 
@@ -1501,6 +1551,7 @@ pub fn best_move_interruptible(
     }
 
     let mut stats = SearchStats::default();
+    let mut nnue_state = NNUEState::from_board(board);
 
     let t0 = Instant::now();
     let (best_move, best_score) = iterative_deepening_loop(
@@ -1510,6 +1561,7 @@ pub fn best_move_interruptible(
         &mut repetition_table,
         &stop,
         &mut stats,
+        nnue_state.as_mut(),
         |report| {
             if report.result.aborted {
                 return;
