@@ -5,13 +5,12 @@ use crate::{
     NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
 };
 use chess::{
-    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
-    BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
+    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove,
+    Color, MoveGen, Piece, Square,
 };
 use smallvec::SmallVec;
 use std::cmp;
 use std::io::Stdout;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -262,7 +261,6 @@ fn quiesce_negamax_it(
     remain_quiet: usize,
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
-    color: i32, // +1 if White to move in this node, −1 otherwise
     ply_from_root: i32,
     stats: &mut SearchStats,
 ) -> i32 {
@@ -271,10 +269,10 @@ fn quiesce_negamax_it(
     stats.record_depth(ply_from_root);
     stats.qnodes += 1;
     if remain_quiet == 0 {
-        return color * cache_eval(board, transpo_table);
+        return cache_eval(board, transpo_table);
     }
 
-    let stand_pat = color * cache_eval(board, transpo_table);
+    let stand_pat = cache_eval(board, transpo_table);
     if stand_pat >= beta {
         stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -306,7 +304,6 @@ fn quiesce_negamax_it(
             remain_quiet - 1,
             transpo_table,
             repetition_table,
-            -color,
             ply_from_root + 1,
             stats,
         );
@@ -326,10 +323,7 @@ fn quiesce_negamax_it(
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
 /// If not found, compute via `eval_board`, insert into the table, and return.
-fn cache_eval(
-    board: &Board,
-    transpo_table: &mut TranspositionTable,
-) -> i32 {
+fn cache_eval(board: &Board, transpo_table: &mut TranspositionTable) -> i32 {
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.probe(zob) {
         if let Some(cached) = entry.eval {
@@ -752,7 +746,6 @@ fn negamax_it(
     transpo_table: &mut TranspositionTable,
     repetition_table: &mut RepetitionTable,
     killers: &mut KillerTable,
-    color: i32,
     stop: &StopFlag,
     ply_from_root: i32,
     is_pv_node: bool,
@@ -783,7 +776,6 @@ fn negamax_it(
             QUIESCE_REMAIN,
             transpo_table,
             repetition_table,
-            color,
             ply_from_root,
             stats,
         ));
@@ -840,7 +832,6 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 killers,
-                -color,
                 stop,
                 ply_from_root + 1,
                 false,
@@ -870,7 +861,7 @@ fn negamax_it(
     let (static_eval, static_eval_raw) =
         if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
             let raw = cache_eval(board, transpo_table);
-            (Some(color * raw), Some(raw))
+            (Some(raw), Some(raw))
         } else {
             (None, None)
         };
@@ -999,7 +990,6 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 killers,
-                -color,
                 stop,
                 ply_from_root + 1,
                 false,
@@ -1024,7 +1014,6 @@ fn negamax_it(
                     transpo_table,
                     repetition_table,
                     killers,
-                    -color,
                     stop,
                     ply_from_root + 1,
                     child_is_pv_node,
@@ -1044,7 +1033,6 @@ fn negamax_it(
                 transpo_table,
                 repetition_table,
                 killers,
-                -color,
                 stop,
                 ply_from_root + 1,
                 child_is_pv_node,
@@ -1206,11 +1194,6 @@ fn root_search_with_window(
     let mut best_value = NEG_INFINITY;
     let mut best_move = None;
     let mut aborted = false;
-    let color = if board.side_to_move() == Color::White {
-        1
-    } else {
-        -1
-    };
 
     let mut killer_table = KillerTable::new(max_depth + 4);
     let mut out = io::stdout();
@@ -1238,7 +1221,6 @@ fn root_search_with_window(
             transpo_table,
             repetition_table,
             &mut killer_table,
-            -color,
             stop,
             1, // one ply from root after making mv
             is_pv_node,

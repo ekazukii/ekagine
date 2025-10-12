@@ -282,7 +282,8 @@ fn uci_loop() {
                                 } else {
                                     0
                                 };
-                                let score_str = uci_score_string(outcome.score, board.side_to_move());
+                                let score_str =
+                                    uci_score_string(outcome.score, board.side_to_move());
 
                                 if let Some(best_move) = outcome.best_move {
                                     let info_line = format!(
@@ -303,7 +304,10 @@ fn uci_loop() {
                                     );
                                     send_message(&mut stdout, &stats_line);
 
-                                    send_message(&mut stdout, format!("bestmove {}", best_move).as_str());
+                                    send_message(
+                                        &mut stdout,
+                                        format!("bestmove {}", best_move).as_str(),
+                                    );
                                 } else {
                                     let info_line = format!(
                                         "info string failed to find best move at depth {}",

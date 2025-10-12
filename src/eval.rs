@@ -1,14 +1,9 @@
 /* New helper: compute endgame progress as an integer between 0 and 100 */
-use crate::{NEG_INFINITY, POS_INFINITY};
 use chess::Color::{Black, White};
 use chess::{
     get_adjacent_files, get_bishop_moves, get_file, get_king_moves, get_knight_moves,
-    get_rook_moves, BitBoard, Board, BoardStatus, Color, File, Piece, Rank, Square,
+    get_rook_moves, BitBoard, Board, Color, File, Piece, Rank, Square,
 };
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
 
 /// Evaluate a set of bitboard squares using a piece‐square table + base value.
 fn pieces_type_eval(bitboard: &chess::BitBoard, table: &[i32; 64], base_val: i32) -> i32 {
@@ -380,8 +375,8 @@ fn mobility_eval(
     }
 }
 
-/// Compute a static evaluation for `board`. If game over, return ±10000 or 0.
-/// Otherwise do a material + piece‐square evaluation.
+/// Compute a static evaluation for `board` from the side-to-move's perspective.
+/// If game over, return ±10000 or 0. Otherwise do a material + piece-square evaluation.
 pub fn eval_board(board: &Board) -> i32 {
     let mut total = 0;
 
@@ -495,5 +490,8 @@ pub fn eval_board(board: &Board) -> i32 {
         }
     }
 
-    total
+    match board.side_to_move() {
+        Color::White => total,
+        Color::Black => -total,
+    }
 }
