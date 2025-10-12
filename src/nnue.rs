@@ -39,7 +39,7 @@ struct NNUEParams {
 }
 
 /// NNUE model is initialized from binary values (Viridithas format)
-static MODEL: NNUEParams = unsafe { mem::transmute(*include_bytes!("../../../bins/net.bin")) };
+static MODEL: NNUEParams = unsafe { mem::transmute(*include_bytes!("../net.bin")) };
 
 /// Generic wrapper for types aligned to 64B for AVX512 (also a Viridithas trick)
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -145,7 +145,8 @@ impl NNUEState {
 
         // init with feature biases and add in all features of the board
         boxed.accumulator_stack[0] = Accumulator::default();
-        for sq in board.combined() {
+        let mut occupied = *board.combined();
+        while let Some(sq) = occupied.next() {
             if let (Some(piece), Some(color)) = (board.piece_on(sq), board.color_on(sq)) {
                 boxed.manual_update::<ON>(piece, color, sq);
             }
@@ -161,7 +162,8 @@ impl NNUEState {
         self.accumulator_stack[self.current_acc] = Accumulator::default();
 
         // update the first accumulator
-        for sq in board.combined() {
+        let mut occupied = *board.combined();
+        while let Some(sq) = occupied.next() {
             if let (Some(piece), Some(color)) = (board.piece_on(sq), board.color_on(sq)) {
                 self.manual_update::<ON>(piece, color, sq);
             }
