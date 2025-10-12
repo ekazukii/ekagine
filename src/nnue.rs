@@ -6,10 +6,9 @@
 /// Huge thanks to Cosmo, author of Viridithas, for the help. The code here is heavily inspired by
 /// his engine.
 use std::alloc;
-use std::marker::PointeeSized;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use chess::{Board, Piece, Square};
+use chess::{Board, Color, Piece, Square};
 
 const MAX_DEPTH: usize = 128;
 
@@ -27,6 +26,8 @@ const QAB: i32 = 255 * 64;
 
 // Eval scaling factor
 const SCALE: i32 = 400;
+
+type Eval = i32;
 
 /// Container for all network parameters
 #[repr(C)]
@@ -144,8 +145,10 @@ impl NNUEState {
 
         // init with feature biases and add in all features of the board
         boxed.accumulator_stack[0] = Accumulator::default();
-        for sq in board.occupancy() {
-            boxed.manual_update::<ON>(board.piece_at(sq), sq);
+        for sq in board.combined() {
+            if let (Some(piece), Some(color)) = (board.piece_on(sq), board.color_on(sq)) {
+                boxed.manual_update::<ON>(piece, color, sq);
+            }
         }
 
         boxed
@@ -158,9 +161,9 @@ impl NNUEState {
         self.accumulator_stack[self.current_acc] = Accumulator::default();
 
         // update the first accumulator
-        for piece in Piece::ALL {
-            for sq in board.piece_occupancy(piece) {
-                self.manual_update::<ON>(piece, sq);
+        for sq in board.combined() {
+            if let (Some(piece), Some(color)) = (board.piece_on(sq), board.color_on(sq)) {
+                self.manual_update::<ON>(piece, color, sq);
             }
         }
     }
@@ -177,14 +180,15 @@ impl NNUEState {
     }
 
     /// Manually turn on or off the single given feature
-    pub fn manual_update<const ON: bool>(&mut self, piece: Piece, sq: Square) {
-        self.accumulator_stack[self.current_acc].update_weights::<ON>(nnue_index(piece, sq));
+    pub fn manual_update<const ON: bool>(&mut self, piece: Piece, color: Color, sq: Square) {
+        self.accumulator_stack[self.current_acc]
+            .update_weights::<ON>(nnue_index(piece, color, sq));
     }
 
     /// Efficiently update accumulator for a quiet move (that is, only changes from/to features)
-    pub fn move_update(&mut self, piece: Piece, from: Square, to: Square) {
-        let from_idx = nnue_index(piece, from);
-        let to_idx = nnue_index(piece, to);
+    pub fn move_update(&mut self, piece: Piece, color: Color, from: Square, to: Square) {
+        let from_idx = nnue_index(piece, color, from);
+        let to_idx = nnue_index(piece, color, to);
 
         self.accumulator_stack[self.current_acc].add_sub_weights(from_idx, to_idx);
     }
@@ -215,14 +219,20 @@ impl NNUEState {
 }
 
 /// Returns white and black feature weight index for given feature
-const fn nnue_index(piece: Piece, sq: Square) -> (usize, usize) {
+fn nnue_index(piece: Piece, color: Color, sq: Square) -> (usize, usize) {
     const COLOR_STRIDE: usize = 64 * 6;
     const PIECE_STRIDE: usize = 64;
-    let p = (piece as usize) / 2;
-    let c = piece.color() as usize;
 
-    let white_idx = c * COLOR_STRIDE + p * PIECE_STRIDE + sq.flipv() as usize;
-    let black_idx = (1 ^ c) * COLOR_STRIDE + p * PIECE_STRIDE + sq as usize;
+    let p = piece.to_index();
+    let c = color.to_index();
+    let file = sq.get_file().to_index();
+    let rank = sq.get_rank().to_index();
+
+    let sq_idx = (7 - rank) * 8 + file;
+    let flipped_idx = rank * 8 + file;
+
+    let white_idx = c * COLOR_STRIDE + p * PIECE_STRIDE + flipped_idx;
+    let black_idx = (1 ^ c) * COLOR_STRIDE + p * PIECE_STRIDE + sq_idx;
 
     (white_idx * HIDDEN, black_idx * HIDDEN)
 }
@@ -237,6 +247,7 @@ fn squared_crelu(value: i16) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chess::ChessMove;
 
     #[test]
     fn test_nnue_stack() {
@@ -262,10 +273,10 @@ mod tests {
 
     #[test]
     fn test_nnue_index() {
-        let idx1 = nnue_index(Piece::WP, Square::A8);
-        let idx2 = nnue_index(Piece::WP, Square::H1);
-        let idx3 = nnue_index(Piece::BP, Square::A1);
-        let idx4 = nnue_index(Piece::WK, Square::E1);
+        let idx1 = nnue_index(Piece::Pawn, Color::White, Square::A8);
+        let idx2 = nnue_index(Piece::Pawn, Color::White, Square::H1);
+        let idx3 = nnue_index(Piece::Pawn, Color::Black, Square::A1);
+        let idx4 = nnue_index(Piece::King, Color::White, Square::E1);
 
         assert_eq!(idx1, (HIDDEN * 56, HIDDEN * 384));
         assert_eq!(idx2, (HIDDEN * 7, HIDDEN * 447));
@@ -280,8 +291,8 @@ mod tests {
 
         let old_acc = s1.accumulator_stack[0];
 
-        s1.manual_update::<ON>(Piece::WP, Square::A3);
-        s1.manual_update::<OFF>(Piece::WP, Square::A3);
+        s1.manual_update::<ON>(Piece::Pawn, Color::White, Square::A3);
+        s1.manual_update::<OFF>(Piece::Pawn, Color::White, Square::A3);
 
         for i in 0..HIDDEN {
             assert_eq!(old_acc.white[i], s1.accumulator_stack[0].white[i]);
@@ -292,13 +303,20 @@ mod tests {
     #[test]
     fn test_incremental_updates() {
         let b1: Board = Board::default();
-        let m = b1.find_move("e2e4").unwrap();
-        let b2: Board = b1.make_move(m);
+        let m = ChessMove::new(Square::E2, Square::E4, None);
+        let b2: Board = b1.make_move_new(m);
 
         let mut s1 = NNUEState::from_board(&b1);
         let s2 = NNUEState::from_board(&b2);
 
-        s1.move_update(b1.piece_at(m.get_src()), m.get_src(), m.get_tgt());
+        if let (Some(piece), Some(color)) = (
+            b1.piece_on(m.get_source()),
+            b1.color_on(m.get_source()),
+        ) {
+            s1.move_update(piece, color, m.get_source(), m.get_dest());
+        } else {
+            panic!("expected piece on source square");
+        }
 
         for i in 0..HIDDEN {
             assert_eq!(
