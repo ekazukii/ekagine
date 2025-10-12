@@ -40,6 +40,7 @@ pub struct SearchStats {
     pub incremental_move_gen_capture_lists: u64,
     pub effective_branching_factor: f64,
     pub depth: u64,
+    pub qs_see_pruning: u64,
 }
 
 struct ThreadContext<'a> {
@@ -76,7 +77,8 @@ impl SearchStats {
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
             effective_branching_factor: 0.0,
-            depth: self.depth,
+            depth: self.depth.saturating_sub(other.depth),
+            qs_see_pruning: self.qs_see_pruning.saturating_sub(other.qs_see_pruning),
         }
     }
 
@@ -108,7 +110,7 @@ impl SearchStats {
 
     pub(crate) fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={} qs_see_pruning={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -125,6 +127,7 @@ impl SearchStats {
             self.incremental_move_gen_capture_lists,
             self.effective_branching_factor,
             self.depth,
+            self.qs_see_pruning,
         )
     }
 }
@@ -301,6 +304,7 @@ fn quiesce_negamax_it(
             continue;
         }
         if see_for_sort(board, mv) < 0 {
+            ctx.stats.qs_see_pruning += 1;
             continue;
         }
         let new_board = board_do_move(board, mv, ctx.repetition_table);
