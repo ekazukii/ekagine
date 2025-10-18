@@ -17,6 +17,7 @@ use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Squa
 use lazy_static::lazy_static;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::env;
 use std::fmt::format;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Stdout, Write};
@@ -24,9 +25,28 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{env, thread};
 
 type StopFlag = Arc<AtomicBool>;
+
+const MAX_THREADS: usize = 64;
+
+#[derive(Clone, Debug)]
+struct EngineOptions {
+    threads: usize,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self { threads: 1 }
+    }
+}
+
+impl EngineOptions {
+    fn set_threads(&mut self, value: usize) {
+        let clamped = value.clamp(1, MAX_THREADS);
+        self.threads = clamped;
+    }
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -208,8 +228,9 @@ fn uci_loop() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut board = Board::default();
-    let mut transpo_table = TranspositionTable::new();
+    let transpo_table = Arc::new(TranspositionTable::new());
     let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
+    let mut options = EngineOptions::default();
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
@@ -223,6 +244,15 @@ fn uci_loop() {
             "uci" => {
                 send_message(&mut stdout, "id name Ekagine-v2.0.1");
                 send_message(&mut stdout, "id author BaptisteLoison");
+                send_message(
+                    &mut stdout,
+                    format!(
+                        "option name Threads type spin default {} min 1 max {}",
+                        EngineOptions::default().threads,
+                        MAX_THREADS
+                    )
+                    .as_str(),
+                );
                 send_message(&mut stdout, "uciok");
             }
             "isready" => {
@@ -233,6 +263,30 @@ fn uci_loop() {
                 transpo_table.clear();
                 repetition_table.clear();
                 repetition_table.init(board.get_hash());
+            }
+            "setoption" => {
+                if let Some(name_idx) = tokens.iter().position(|&t| t.eq_ignore_ascii_case("name"))
+                {
+                    if let Some(value_idx) =
+                        tokens.iter().position(|&t| t.eq_ignore_ascii_case("value"))
+                    {
+                        if value_idx > name_idx + 1 {
+                            let name = tokens[name_idx + 1..value_idx].join(" ");
+                            let value_str = tokens[value_idx + 1..].join(" ");
+                            if name.eq_ignore_ascii_case("Threads") {
+                                if let Ok(parsed) = value_str.parse::<usize>() {
+                                    options.set_threads(parsed);
+                                } else {
+                                    let warn = format!(
+                                        "info string invalid value '{}' for Threads",
+                                        value_str
+                                    );
+                                    send_message(&mut stdout, &warn);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             "position" => {
                 repetition_table.clear();
@@ -265,13 +319,13 @@ fn uci_loop() {
                     if let Some(depth_token) = tokens.get(depth_idx + 1) {
                         match depth_token.parse::<usize>() {
                             Ok(depth) if depth > 0 => {
-                                let mut search_repetition = repetition_table.clone();
                                 let search_start = Instant::now();
                                 let outcome = best_move_using_iterative_deepening(
                                     &board,
                                     depth,
-                                    &mut transpo_table,
-                                    &mut search_repetition,
+                                    Arc::clone(&transpo_table),
+                                    repetition_table.clone(),
+                                    options.threads,
                                 );
                                 let elapsed = search_start.elapsed();
 
@@ -331,14 +385,14 @@ fn uci_loop() {
 
                 let time_budget = choose_time_for_move(&tokens, board.side_to_move());
 
-                let max_ply = 100;
                 let outcome = best_move_interruptible(
                     &board,
                     time_budget,
                     99,
                     repetition_table.clone(),
-                    &mut transpo_table,
+                    Arc::clone(&transpo_table),
                     Some(&mut stdout),
+                    options.threads,
                 );
                 if let Some(mv) = outcome.best_move {
                     send_message(&mut stdout, format!("bestmove {}", mv).as_str());
@@ -470,14 +524,15 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
     let max_depth = 5;
     for (key, val) in fen_to_stockfish.iter() {
         let (outcome, duration) = time_fn(|| {
-            let mut transpo_table = TranspositionTable::new();
+            let transpo_table = Arc::new(TranspositionTable::new());
             best_move_interruptible(
                 key,
                 Duration::from_millis(90),
                 1000,
                 RepetitionTable::new(key.get_hash()),
-                &mut transpo_table,
+                Arc::clone(&transpo_table),
                 None,
+                1,
             )
         });
 
@@ -543,14 +598,15 @@ pub fn compute_best_from_fen(
 ) -> Result<(Option<ChessMove>, i32), String> {
     let board = Board::from_str(fen).map_err(|e| format!("Invalid FEN '{}': {}", fen, e))?;
 
-    let mut transpo_table = TranspositionTable::new();
-    let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
+    let transpo_table = Arc::new(TranspositionTable::new());
+    let repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
     let outcome = best_move_using_iterative_deepening(
         &board,
         max_depth,
-        &mut transpo_table,
-        &mut repetition_table,
+        Arc::clone(&transpo_table),
+        repetition_table,
+        1,
     );
 
     Ok((outcome.best_move, outcome.score))

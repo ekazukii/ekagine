@@ -1,5 +1,5 @@
 use chess::{ChessMove, File, Piece, Rank, Square};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TTFlag {
@@ -240,7 +240,7 @@ fn encode_flag(flag: TTFlag) -> u8 {
 /// age, the node depth, and whether the stored value is part of the principal variation.
 pub struct TranspositionTable {
     table: Vec<CompressedTTEntry>,
-    age: u8,
+    age: AtomicU8,
 }
 
 impl TranspositionTable {
@@ -266,7 +266,10 @@ impl TranspositionTable {
             table.push(CompressedTTEntry::default());
         }
 
-        Self { table, age: 0 }
+        Self {
+            table,
+            age: AtomicU8::new(0),
+        }
     }
 
     #[inline]
@@ -290,7 +293,7 @@ impl TranspositionTable {
     }
 
     pub fn store(
-        &mut self,
+        &self,
         key: u64,
         depth: i16,
         score: i32,
@@ -302,7 +305,7 @@ impl TranspositionTable {
         let idx = self.get_key(key);
         let slot = &self.table[idx];
         let (stored_key, stored_data) = slot.load();
-        let mut current_entry = TTEntry::from((stored_key, stored_data));
+        let current_entry = TTEntry::from((stored_key, stored_data));
         let pv = flag == TTFlag::Exact;
         let same_position = stored_key == key;
         let previous_entry = if same_position {
@@ -311,7 +314,7 @@ impl TranspositionTable {
             None
         };
         let previous_age = current_entry.age;
-        let age_now = self.age & 0x3F;
+        let age_now = self.age.load(Ordering::Relaxed) & 0x3F;
 
         let old_depth = previous_entry.map_or(0, |entry| entry.depth.max(0) as usize);
 
@@ -349,14 +352,15 @@ impl TranspositionTable {
         slot.store_entry(new_entry);
     }
 
-    pub fn bump_generation(&mut self) {
-        self.age = self.age.wrapping_add(1);
+    pub fn bump_generation(&self) {
+        self.age.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         for slot in &self.table {
             slot.store(0, 0);
         }
+        self.age.store(0, Ordering::Relaxed);
     }
 }
 

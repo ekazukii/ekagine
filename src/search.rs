@@ -260,7 +260,7 @@ fn quiesce_negamax_it(
     mut alpha: i32,
     beta: i32,
     remain_quiet: usize,
-    transpo_table: &mut TranspositionTable,
+    transpo_table: &TranspositionTable,
     repetition_table: &mut RepetitionTable,
     color: i32, // +1 if White to move in this node, −1 otherwise
     ply_from_root: i32,
@@ -331,11 +331,7 @@ fn quiesce_negamax_it(
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
 /// If not found, compute via `eval_board`, insert into the table, and return.
-fn cache_eval(
-    board: &Board,
-    transpo_table: &mut TranspositionTable,
-    nnue_state: &NNUEState,
-) -> i32 {
+fn cache_eval(board: &Board, transpo_table: &TranspositionTable, nnue_state: &NNUEState) -> i32 {
     let zob = board.get_hash();
     if let Some(entry) = transpo_table.probe(zob) {
         if let Some(cached) = entry.eval {
@@ -756,7 +752,7 @@ fn negamax_it(
     depth: i16,
     mut alpha: i32,
     beta: i32,
-    transpo_table: &mut TranspositionTable,
+    transpo_table: &TranspositionTable,
     repetition_table: &mut RepetitionTable,
     killers: &mut KillerTable,
     nnue_state: &mut NNUEState,
@@ -1217,7 +1213,7 @@ fn collect_principal_variation(
 fn root_search_with_window(
     board: &Board,
     max_depth: usize,
-    transpo_table: &mut TranspositionTable,
+    transpo_table: &TranspositionTable,
     repetition_table: &mut RepetitionTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
@@ -1359,7 +1355,7 @@ fn root_search_with_window(
 fn aspiration_root_search(
     board: &Board,
     max_depth: usize,
-    transpo_table: &mut TranspositionTable,
+    transpo_table: &TranspositionTable,
     repetition_table: &mut RepetitionTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
@@ -1430,7 +1426,7 @@ struct IterationReport {
 fn iterative_deepening_loop<F>(
     board: &Board,
     max_depth: usize,
-    transpo_table: &mut TranspositionTable,
+    transpo_table: &TranspositionTable,
     repetition_table: &mut RepetitionTable,
     stop: &StopFlag,
     stats: &mut SearchStats,
@@ -1497,28 +1493,92 @@ where
     (best_move, best_score)
 }
 
+fn spawn_lazy_smp_helpers(
+    board: &Board,
+    max_depth: usize,
+    transpo_table: &Arc<TranspositionTable>,
+    repetition_table: RepetitionTable,
+    threads: usize,
+    stop: &StopFlag,
+) -> Vec<thread::JoinHandle<()>> {
+    let worker_count = threads.saturating_sub(1);
+    if worker_count == 0 {
+        return Vec::new();
+    }
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for worker_id in 1..=worker_count {
+        let board_clone = board.clone();
+        let tt_clone = Arc::clone(transpo_table);
+        let stop_clone = stop.clone();
+        let mut repetition_clone = repetition_table.clone();
+        handles.push(thread::spawn(move || {
+            // Light stagger to reduce identical search fronts
+            if worker_id > 0 {
+                let delay_ms = (worker_id as u64) * 5;
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+
+            let mut local_stats = SearchStats::default();
+            let mut nnue_state = NNUEState::from_board(&board_clone);
+            let _ = iterative_deepening_loop(
+                &board_clone,
+                max_depth,
+                tt_clone.as_ref(),
+                &mut repetition_clone,
+                &stop_clone,
+                &mut local_stats,
+                nnue_state.as_mut(),
+                |_| {},
+            );
+        }));
+    }
+
+    handles
+}
+
+fn join_helper_threads(handles: Vec<thread::JoinHandle<()>>) {
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
 /// Compute the best move of a board from a depth limit
 #[allow(clippy::too_many_arguments)]
 pub fn best_move_using_iterative_deepening(
     board: &Board,
     max_depth: usize,
-    transpo_table: &mut TranspositionTable,
-    repetition_table: &mut RepetitionTable,
+    transpo_table: Arc<TranspositionTable>,
+    repetition_table: RepetitionTable,
+    threads: usize,
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
     let mut stats = SearchStats::default();
     let mut nnue_state = NNUEState::from_board(board);
+    let mut local_repetition = repetition_table.clone();
+
+    let helper_handles = spawn_lazy_smp_helpers(
+        board,
+        max_depth,
+        &transpo_table,
+        repetition_table,
+        threads,
+        &stop,
+    );
 
     let (best_move, best_score) = iterative_deepening_loop(
         board,
         max_depth,
-        transpo_table,
-        repetition_table,
+        transpo_table.as_ref(),
+        &mut local_repetition,
         &stop,
         &mut stats,
         nnue_state.as_mut(),
         |_| {},
     );
+
+    stop.store(true, Ordering::Relaxed);
+    join_helper_threads(helper_handles);
 
     SearchOutcome::new(best_move, best_score, stats)
 }
@@ -1538,9 +1598,10 @@ pub fn best_move_interruptible(
     board: &Board,
     time_budget: Duration,
     max_depth_cap: usize,
-    mut repetition_table: RepetitionTable,
-    transpo_table: &mut TranspositionTable,
+    repetition_table: RepetitionTable,
+    transpo_table: Arc<TranspositionTable>,
     mut stdout_opt: Option<&mut Stdout>,
+    threads: usize,
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -1553,13 +1614,23 @@ pub fn best_move_interruptible(
 
     let mut stats = SearchStats::default();
     let mut nnue_state = NNUEState::from_board(board);
+    let mut local_repetition = repetition_table.clone();
+
+    let helper_handles = spawn_lazy_smp_helpers(
+        board,
+        max_depth_cap,
+        &transpo_table,
+        repetition_table,
+        threads,
+        &stop,
+    );
 
     let t0 = Instant::now();
     let (best_move, best_score) = iterative_deepening_loop(
         board,
         max_depth_cap,
-        transpo_table,
-        &mut repetition_table,
+        transpo_table.as_ref(),
+        &mut local_repetition,
         &stop,
         &mut stats,
         nnue_state.as_mut(),
@@ -1599,6 +1670,9 @@ pub fn best_move_interruptible(
         let stats_line = format!("info string stats {}", stats.format_as_info());
         send_message(&mut **out, &stats_line);
     }
+
+    stop.store(true, Ordering::Relaxed);
+    join_helper_threads(helper_handles);
 
     SearchOutcome::new(best_move, best_score, stats)
 }
