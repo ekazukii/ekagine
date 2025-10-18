@@ -13,6 +13,8 @@ const MAX_DEPTH: usize = 128;
 // Network Arch
 const FEATURES: usize = 768;
 const HIDDEN: usize = 1024;
+const COLOR_STRIDE: usize = 64 * 6;
+const PIECE_STRIDE: usize = 64;
 
 // Clipped ReLu bounds
 const CR_MIN: i16 = 0;
@@ -279,23 +281,42 @@ impl NNUEState {
     }
 }
 
+const fn build_feature_index() -> [[[(usize, usize); 2]; 64]; 6] {
+    let mut table = [[[(0usize, 0usize); 2]; 64]; 6];
+    let mut p = 0;
+    while p < 6 {
+        let mut sq = 0;
+        while sq < 64 {
+            let file = sq % 8;
+            let rank = sq / 8;
+            let sq_idx = (7 - rank) * 8 + file;
+            let flipped_idx = rank * 8 + file;
+
+            let mut c = 0;
+            while c < 2 {
+                let white_idx = c * COLOR_STRIDE + p * PIECE_STRIDE + flipped_idx;
+                let black_idx = (1 ^ c) * COLOR_STRIDE + p * PIECE_STRIDE + sq_idx;
+                table[p][sq][c] = (white_idx * HIDDEN, black_idx * HIDDEN);
+                c += 1;
+            }
+
+            sq += 1;
+        }
+        p += 1;
+    }
+    table
+}
+
+const FEATURE_INDEX: [[[(usize, usize); 2]; 64]; 6] = build_feature_index();
+
 /// Returns white and black feature weight index for given feature
+#[inline(always)]
 fn nnue_index(piece: Piece, color: Color, sq: Square) -> (usize, usize) {
-    const COLOR_STRIDE: usize = 64 * 6;
-    const PIECE_STRIDE: usize = 64;
+    let p = piece.to_index() as usize;
+    let c = color.to_index() as usize;
+    let sq_idx = sq.get_rank().to_index() * 8 + sq.get_file().to_index();
 
-    let p = piece.to_index();
-    let c = color.to_index();
-    let file = sq.get_file().to_index();
-    let rank = sq.get_rank().to_index();
-
-    let sq_idx = (7 - rank) * 8 + file;
-    let flipped_idx = rank * 8 + file;
-
-    let white_idx = c * COLOR_STRIDE + p * PIECE_STRIDE + flipped_idx;
-    let black_idx = (1 ^ c) * COLOR_STRIDE + p * PIECE_STRIDE + sq_idx;
-
-    (white_idx * HIDDEN, black_idx * HIDDEN)
+    FEATURE_INDEX[p][sq_idx][c]
 }
 
 /// Squared Clipped ReLu activation function
