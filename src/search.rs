@@ -241,17 +241,16 @@ fn tt_score_on_load(score: i32, ply_from_root: i32) -> i32 {
 }
 
 /// Format a score for UCI output ("cp X" or "mate N").
-/// `side` is the side to move in the root position.
-pub fn uci_score_string(score: i32, side: Color) -> String {
-    let color = if side == Color::White { 1 } else { -1 };
+/// `side` is the side to move in the root position and is kept for API compatibility.
+pub fn uci_score_string(score: i32, _side: Color) -> String {
     if is_mate_score(score) {
         let ply_to_mate = MATE_VALUE - score.abs();
         // Convert plies to moves (ceil(ply/2))
         let moves = (ply_to_mate + 1) / 2;
-        let signed_moves = if score * color > 0 { moves } else { -moves };
+        let signed_moves = if score > 0 { moves } else { -moves };
         format!("mate {}", signed_moves)
     } else {
-        format!("cp {}", score * color)
+        format!("cp {}", score)
     }
 }
 
@@ -272,7 +271,6 @@ fn quiesce_negamax_it(
     beta: i32,
     remain_quiet: usize,
     ctx: &mut ThreadContext,
-    color: i32, // +1 if White to move in this node, −1 otherwise
     ply_from_root: i32,
     nnue_state: &mut NNUEState,
 ) -> i32 {
@@ -280,11 +278,11 @@ fn quiesce_negamax_it(
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
+    let eval = cache_eval(board, ctx, nnue_state);
+    let stand_pat = eval.oriented;
     if remain_quiet == 0 {
-        return color * cache_eval(board, ctx, nnue_state);
+        return stand_pat;
     }
-
-    let stand_pat = color * cache_eval(board, ctx, nnue_state);
     if stand_pat >= beta {
         ctx.stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -316,7 +314,6 @@ fn quiesce_negamax_it(
             -alpha,
             remain_quiet - 1,
             ctx,
-            -color,
             ply_from_root + 1,
             nnue_state,
         );
@@ -337,16 +334,44 @@ fn quiesce_negamax_it(
 
 /// Cached evaluation: if threefold, return 0, else look up in transposition table.
 /// If not found, compute via `eval_board`, insert into the table, and return.
-fn cache_eval(board: &Board, ctx: &mut ThreadContext, nnue_state: &NNUEState) -> i32 {
+#[derive(Clone, Copy, Debug)]
+struct EvalScores {
+    oriented: i32,
+    raw: i32,
+}
+
+impl EvalScores {
+    #[inline]
+    fn from_raw(side_to_move: Color, raw: i32) -> Self {
+        let oriented = if side_to_move == Color::White { raw } else { -raw };
+        Self { oriented, raw }
+    }
+
+    #[inline]
+    fn from_oriented(side_to_move: Color, oriented: i32) -> Self {
+        let raw = if side_to_move == Color::White {
+            oriented
+        } else {
+            -oriented
+        };
+        Self { oriented, raw }
+    }
+}
+
+/// Cached evaluation: if threefold, return 0, else look up in transposition table.
+/// If not found, compute via `eval_board`, insert into the table, and return.
+fn cache_eval(board: &Board, ctx: &mut ThreadContext, nnue_state: &NNUEState) -> EvalScores {
     let zob = board.get_hash();
+    let side_to_move = board.side_to_move();
     if let Some(entry) = ctx.tt.probe(zob) {
-        if let Some(cached) = entry.eval {
-            return cached;
+        if let Some(cached_raw) = entry.eval {
+            return EvalScores::from_raw(side_to_move, cached_raw);
         }
     }
-    let val = nnue_state.evaluate(Color::White);
-    ctx.tt.store_eval(zob, val);
-    val
+    let oriented = nnue_state.evaluate(side_to_move);
+    let scores = EvalScores::from_oriented(side_to_move, oriented);
+    ctx.tt.store_eval(zob, scores.raw);
+    scores
 }
 
 #[inline]
@@ -754,7 +779,6 @@ fn negamax_it(
     beta: i32,
     ctx: &mut ThreadContext,
     nnue_state: &mut NNUEState,
-    color: i32,
     ply_from_root: i32,
     is_pv_node: bool,
 ) -> SearchScore {
@@ -782,7 +806,6 @@ fn negamax_it(
             beta,
             QUIESCE_REMAIN,
             ctx,
-            color,
             ply_from_root,
             nnue_state,
         ));
@@ -835,7 +858,6 @@ fn negamax_it(
                 -beta + 1,
                 ctx,
                 nnue_state,
-                -color,
                 ply_from_root + 1,
                 false,
             );
@@ -862,8 +884,8 @@ fn negamax_it(
     let alpha_orig = alpha;
 
     let (static_eval, static_eval_raw) = if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-        let raw = cache_eval(board, ctx, nnue_state);
-        (Some(color * raw), Some(raw))
+        let eval = cache_eval(board, ctx, nnue_state);
+        (Some(eval.oriented), Some(eval.raw))
     } else {
         (None, None)
     };
@@ -993,7 +1015,6 @@ fn negamax_it(
                 -alpha,
                 ctx,
                 nnue_state,
-                -color,
                 ply_from_root + 1,
                 false,
             ) {
@@ -1012,7 +1033,6 @@ fn negamax_it(
                             -alpha,
                             ctx,
                             nnue_state,
-                            -color,
                             ply_from_root + 1,
                             child_is_pv_node,
                         ) {
@@ -1035,7 +1055,6 @@ fn negamax_it(
                 -alpha,
                 ctx,
                 nnue_state,
-                -color,
                 ply_from_root + 1,
                 child_is_pv_node,
             ) {
@@ -1189,7 +1208,6 @@ fn root_search_with_window(
     let mut best_value = NEG_INFINITY;
     let mut best_move = None;
     let mut aborted = false;
-    let color = if board.side_to_move() == Color::White { 1 } else { -1 };
 
     let mut out = io::stdout();
 
@@ -1218,7 +1236,6 @@ fn root_search_with_window(
             -alpha,
             ctx,
             nnue_state,
-            -color,
             1, // one ply from root after making mv
             is_pv_node,
         );
