@@ -37,7 +37,7 @@ struct EngineOptions {
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        Self { threads: 1 }
+        Self { threads: 4 }
     }
 }
 
@@ -532,7 +532,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 RepetitionTable::new(key.get_hash()),
                 Arc::clone(&transpo_table),
                 None,
-                1,
+                EngineOptions::default().threads,
             )
         });
 
@@ -606,7 +606,7 @@ pub fn compute_best_from_fen(
         max_depth,
         Arc::clone(&transpo_table),
         repetition_table,
-        1,
+        EngineOptions::default().threads,
     );
 
     Ok((outcome.best_move, outcome.score))
