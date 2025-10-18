@@ -70,14 +70,15 @@ impl Default for CompressedTTEntry {
 
 impl CompressedTTEntry {
     fn load(&self) -> (u64, u64) {
-        let key = self.key.load(Ordering::Relaxed);
-        let data = self.data.load(Ordering::Relaxed);
-        (key, data)
+        let key_xor = self.key.load(Ordering::Acquire);
+        let data = self.data.load(Ordering::Acquire);
+        (key_xor ^ data, data)
     }
 
     fn store(&self, key: u64, data: u64) {
+        let key_xor = key ^ data;
         self.data.store(data, Ordering::Relaxed);
-        self.key.store(key, Ordering::Relaxed);
+        self.key.store(key_xor, Ordering::Release);
     }
 
     fn store_entry(&self, entry: TTEntry) {
