@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicU64;
-use chess::ChessMove;
+use chess::{ChessMove, File, Piece, Rank, Square};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TTFlag {
@@ -14,6 +14,11 @@ impl Default for TTFlag {
     }
 }
 
+/// Uncompressed representation of a single TTEntry
+/// This use globally the same representation as Viridithas engine for PackedInfo (Age/Flag/PV)
+/// but using the full zobrish hash of 64 bits
+///
+/// The total packed representation is 128 bits, stored as below
 /// key -> 64b          : 64b
 /// best_move -> 16b    : 80b
 /// score -> 16b        : 96b
@@ -54,18 +59,186 @@ pub struct CompressedTTEntry {
     pub data: AtomicU64,
 }
 
-//impl From<(u64, u64)> for TTEntry {}
+impl Default for CompressedTTEntry {
+    fn default() -> Self {
+        Self {
+            key: AtomicU64::new(0),
+            data: AtomicU64::new(0),
+        }
+    }
+}
 
+impl CompressedTTEntry {
+    fn load(&self) -> (u64, u64) {
+        let key = self.key.load(Ordering::Relaxed);
+        let data = self.data.load(Ordering::Relaxed);
+        (key, data)
+    }
+
+    fn store(&self, key: u64, data: u64) {
+        self.data.store(data, Ordering::Relaxed);
+        self.key.store(key, Ordering::Relaxed);
+    }
+
+    fn store_entry(&self, entry: TTEntry) {
+        let (key, data) = entry.into();
+        self.store(key, data);
+    }
+}
 
 const TT_DEFAULT_MB: usize = 32;
 const TT_REPLACE_OFFSET: usize = 2;
+
+const MOVE_NONE: u16 = 0xFFFF;
+const EVAL_NONE: u16 = 0x8000;
+
+const SCORE_SHIFT: u64 = 16;
+const DEPTH_SHIFT: u64 = 32;
+const FLAG_SHIFT: u64 = 39;
+const EVAL_SHIFT: u64 = 41;
+const AGE_SHIFT: u64 = 57;
+const PV_SHIFT: u64 = 63;
+
+const MOVE_MASK: u64 = 0xFFFF;
+const SCORE_MASK: u64 = 0xFFFF;
+const DEPTH_MASK: u64 = 0x7F;
+const FLAG_MASK: u64 = 0x3;
+const EVAL_MASK: u64 = 0xFFFF;
+const AGE_MASK: u64 = 0x3F;
+
+impl From<(u64, u64)> for TTEntry {
+    fn from(raw: (u64, u64)) -> Self {
+        let (key, data) = raw;
+        if key == 0 && data == 0 {
+            return TTEntry::default();
+        }
+
+        let best_move_bits = (data & MOVE_MASK) as u16;
+        let score_bits = ((data >> SCORE_SHIFT) & SCORE_MASK) as u16;
+        let depth_bits = ((data >> DEPTH_SHIFT) & DEPTH_MASK) as u8;
+        let flag_bits = ((data >> FLAG_SHIFT) & FLAG_MASK) as u8;
+        let eval_bits = ((data >> EVAL_SHIFT) & EVAL_MASK) as u16;
+        let age_bits = ((data >> AGE_SHIFT) & AGE_MASK) as u8;
+        let pv_bit = ((data >> PV_SHIFT) & 0x1) != 0;
+
+        TTEntry {
+            key,
+            best_move: decode_move(best_move_bits),
+            score: (score_bits as i16) as i32,
+            depth: depth_bits as i16 - 1,
+            flag: match flag_bits {
+                0 => TTFlag::Exact,
+                1 => TTFlag::Lower,
+                2 => TTFlag::Upper,
+                _ => TTFlag::Exact,
+            },
+            eval: if eval_bits == EVAL_NONE {
+                None
+            } else {
+                Some((eval_bits as i16) as i32)
+            },
+            age: age_bits,
+            pv: pv_bit,
+        }
+    }
+}
+
+impl From<TTEntry> for (u64, u64) {
+    fn from(entry: TTEntry) -> Self {
+        let age_bits = entry.age & AGE_MASK as u8;
+        let score_clamped = entry.score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let depth_clamped = entry.depth.clamp(-1, 126) + 1;
+        let eval_bits = match entry.eval {
+            Some(val) => {
+                let clamped = val.clamp(-32767, 32767) as i16;
+                clamped as u16
+            }
+            None => EVAL_NONE,
+        };
+
+        let mut data = 0u64;
+        data |= encode_move(entry.best_move) as u64;
+        data |= (score_clamped as u16 as u64) << SCORE_SHIFT;
+        data |= ((depth_clamped as u8 as u64) & DEPTH_MASK) << DEPTH_SHIFT;
+        data |= (encode_flag(entry.flag) as u64) << FLAG_SHIFT;
+        data |= (eval_bits as u64) << EVAL_SHIFT;
+        data |= ((age_bits as u64) & AGE_MASK) << AGE_SHIFT;
+        data |= (entry.pv as u64) << PV_SHIFT;
+
+        (entry.key, data)
+    }
+}
+
+fn encode_move(mv: Option<ChessMove>) -> u16 {
+    mv.map_or(MOVE_NONE, |mv| {
+        let from = mv.get_source().to_index() as u16 & 0x3F;
+        let to = mv.get_dest().to_index() as u16 & 0x3F;
+        let promo = encode_promotion(mv.get_promotion()) & 0xF;
+        from | (to << 6) | (promo << 12)
+    })
+}
+
+fn decode_move(bits: u16) -> Option<ChessMove> {
+    if bits == MOVE_NONE {
+        return None;
+    }
+
+    let from_idx = bits & 0x3F;
+    let to_idx = (bits >> 6) & 0x3F;
+    let promo_code = (bits >> 12) & 0xF;
+
+    let from = square_from_index(from_idx)?;
+    let to = square_from_index(to_idx)?;
+    let promotion = decode_promotion(promo_code);
+
+    Some(ChessMove::new(from, to, promotion))
+}
+
+fn encode_promotion(piece: Option<Piece>) -> u16 {
+    match piece {
+        None => 0,
+        Some(Piece::Knight) => 1,
+        Some(Piece::Bishop) => 2,
+        Some(Piece::Rook) => 3,
+        Some(Piece::Queen) => 4,
+        Some(_) => 0,
+    }
+}
+
+fn decode_promotion(code: u16) -> Option<Piece> {
+    match code {
+        0 => None,
+        1 => Some(Piece::Knight),
+        2 => Some(Piece::Bishop),
+        3 => Some(Piece::Rook),
+        4 => Some(Piece::Queen),
+        _ => None,
+    }
+}
+
+fn square_from_index(idx: u16) -> Option<Square> {
+    if idx >= 64 {
+        return None;
+    }
+    let rank = Rank::from_index((idx / 8) as usize);
+    let file = File::from_index((idx % 8) as usize);
+    Some(Square::make_square(rank, file))
+}
+
+fn encode_flag(flag: TTFlag) -> u8 {
+    match flag {
+        TTFlag::Exact => 0,
+        TTFlag::Lower => 1,
+        TTFlag::Upper => 2,
+    }
+}
 
 /// Direct-mapped transposition table.
 ///
 /// Each Zobrist key hashes to a single slot. Replacement is guided by the current search
 /// age, the node depth, and whether the stored value is part of the principal variation.
 pub struct TranspositionTable {
-    table: Vec<TTEntry>,
+    table: Vec<CompressedTTEntry>,
     age: u8,
 }
 
@@ -75,7 +248,7 @@ impl TranspositionTable {
     }
 
     pub fn with_mb(size_mb: usize) -> Self {
-        let bytes_per_slot = std::mem::size_of::<TTEntry>().max(1);
+        let bytes_per_slot = std::mem::size_of::<CompressedTTEntry>().max(1);
         let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_slot);
 
         let mut slots = 1usize;
@@ -88,7 +261,9 @@ impl TranspositionTable {
         }
 
         let mut table = Vec::with_capacity(slots);
-        table.resize(slots, TTEntry::default());
+        for _ in 0..slots {
+            table.push(CompressedTTEntry::default());
+        }
 
         Self { table, age: 0 }
     }
@@ -103,9 +278,11 @@ impl TranspositionTable {
 
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let idx = self.get_key(key);
-        let stored = self.table[idx];
-        if stored.key == key {
-            Some(Self::visible_entry(stored))
+        let slot = &self.table[idx];
+        let (stored_key, stored_data) = slot.load();
+        if stored_key == key {
+            let stored_entry = TTEntry::from((stored_key, stored_data));
+            Some(Self::visible_entry(stored_entry))
         } else {
             None
         }
@@ -122,28 +299,27 @@ impl TranspositionTable {
     ) {
         debug_assert!(!self.table.is_empty());
         let idx = self.get_key(key);
-        let entry = &mut self.table[idx];
+        let slot = &self.table[idx];
+        let (stored_key, stored_data) = slot.load();
+        let mut current_entry = TTEntry::from((stored_key, stored_data));
         let pv = flag == TTFlag::Exact;
-        let same_position = entry.key == key;
-        let previous_entry = if same_position { Some(*entry) } else { None };
-        let previous_age = entry.age;
+        let same_position = stored_key == key;
+        let previous_entry = if same_position {
+            Some(current_entry)
+        } else {
+            None
+        };
+        let previous_age = current_entry.age;
+        let age_now = self.age & 0x3F;
 
         let old_depth = previous_entry.map_or(0, |entry| entry.depth.max(0) as usize);
 
-        let should_replace = self.age != previous_age
+        let should_replace = age_now != previous_age
             || !same_position
             || flag == TTFlag::Exact
             || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(pv) > old_depth;
 
         if !should_replace {
-            if let Some(mv) = best_move {
-                entry.best_move = Some(mv);
-            }
-            if let Some(eval_val) = eval {
-                entry.eval = Some(eval_val);
-            }
-            entry.age = self.age;
-            entry.pv |= pv;
             return;
         }
 
@@ -158,40 +334,18 @@ impl TranspositionTable {
             None => previous_entry.and_then(|entry| entry.eval),
         };
 
-        *entry = TTEntry {
+        let new_entry = TTEntry {
             depth,
             score,
             flag,
             best_move,
             eval: final_eval,
             key,
-            age: self.age,
+            age: age_now,
             pv,
         };
-    }
 
-    pub fn store_eval(&mut self, key: u64, eval: i32) {
-        debug_assert!(!self.table.is_empty());
-        let idx = self.get_key(key);
-        let entry = &mut self.table[idx];
-        let same_position = entry.key == key;
-
-        if same_position {
-            entry.eval = Some(eval);
-            entry.age = self.age;
-            return;
-        }
-
-        *entry = TTEntry {
-            depth: -1,
-            score: 0,
-            flag: TTFlag::Exact,
-            best_move: None,
-            eval: Some(eval),
-            key,
-            age: self.age,
-            pv: false,
-        };
+        slot.store_entry(new_entry);
     }
 
     pub fn bump_generation(&mut self) {
@@ -199,8 +353,8 @@ impl TranspositionTable {
     }
 
     pub fn clear(&mut self) {
-        for entry in &mut self.table {
-            *entry = TTEntry::default();
+        for slot in &self.table {
+            slot.store(0, 0);
         }
     }
 }
