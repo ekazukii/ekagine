@@ -1,12 +1,4 @@
-//! Clustered transposition table tuned for chess search.
-//!
-//! We keep the implementation here instead of relying on `HashMap` so we can control
-//! memory layout and replacement. Probing the TT happens at almost every node, so
-//! predictable cache-friendly access beats a generic hashmap even with a custom hasher.
-//!
-//! Chess engines also benefit from custom replacement rules (depth/age/PV-aware) and
-//! avoiding allocator churn. A fixed bucket array lets us do both.
-
+use std::sync::atomic::AtomicU64;
 use chess::ChessMove;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,36 +14,59 @@ impl Default for TTFlag {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// key -> 64b          : 64b
+/// best_move -> 16b    : 80b
+/// score -> 16b        : 96b
+/// depth -> 7b         : 103b
+/// flag -> 2b          : 105b
+/// eval -> 16v         : 121b
+/// age -> 6b           : 127b
+/// pv -> 1b            : 128b
+#[derive(Clone, Copy, Debug)]
 pub struct TTEntry {
-    pub depth: i16,
-    pub score: i32,
-    pub flag: TTFlag,
+    pub key: u64,
     pub best_move: Option<ChessMove>,
+    pub score: i32,
+    pub depth: i16,
+    pub flag: TTFlag,
     pub eval: Option<i32>,
+    pub age: u8,
+    pub pv: bool,
 }
 
-const TT_BUCKET_SIZE: usize = 4;
+impl Default for TTEntry {
+    fn default() -> Self {
+        TTEntry {
+            depth: 0,
+            score: 0,
+            flag: TTFlag::Exact,
+            best_move: None,
+            eval: None,
+            key: 0,
+            age: 0,
+            pv: false,
+        }
+    }
+}
+
+pub struct CompressedTTEntry {
+    pub key: AtomicU64,
+    pub data: AtomicU64,
+}
+
+//impl From<(u64, u64)> for TTEntry {}
+
+
 const TT_DEFAULT_MB: usize = 32;
+const TT_REPLACE_OFFSET: usize = 2;
 
-#[derive(Clone, Copy, Debug, Default)]
-struct TTSlot {
-    key: u64,
-    entry: TTEntry,
-    generation: u8,
-    is_pv: bool,
-    used: bool,
-}
-
-/// Fixed-size clustered transposition table.
+/// Direct-mapped transposition table.
 ///
-/// We hash the 64-bit Zobrist key onto a single bucket and scan at most four slots. This
-/// keeps the probe O(1) and cache-friendly, while the bucketed replacement policy lets us
-/// hang on to deep or PV-critical entries without allocating or resizing.
+/// Each Zobrist key hashes to a single slot. Replacement is guided by the current search
+/// age, the node depth, and whether the stored value is part of the principal variation.
 pub struct TranspositionTable {
-    buckets: Vec<[TTSlot; TT_BUCKET_SIZE]>,
-    mask: usize,
-    generation: u8,
+    table: Vec<TTEntry>,
+    age: u8,
 }
 
 impl TranspositionTable {
@@ -60,54 +75,40 @@ impl TranspositionTable {
     }
 
     pub fn with_mb(size_mb: usize) -> Self {
-        let bytes_per_bucket = TT_BUCKET_SIZE * std::mem::size_of::<TTSlot>();
-        let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_bucket);
+        let bytes_per_slot = std::mem::size_of::<TTEntry>().max(1);
+        let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_slot);
 
-        let mut buckets = 1usize;
-        while buckets * bytes_per_bucket < requested_bytes {
-            buckets <<= 1;
-            if buckets == 0 {
-                buckets = 1;
+        let mut slots = 1usize;
+        while slots.saturating_mul(bytes_per_slot) < requested_bytes {
+            slots <<= 1;
+            if slots == 0 {
+                slots = 1;
                 break;
             }
         }
 
-        let mask = buckets - 1;
-        let mut table = Vec::with_capacity(buckets);
-        for _ in 0..buckets {
-            table.push([TTSlot::default(); TT_BUCKET_SIZE]);
-        }
+        let mut table = Vec::with_capacity(slots);
+        table.resize(slots, TTEntry::default());
 
-        Self {
-            buckets: table,
-            mask,
-            generation: 0,
-        }
+        Self { table, age: 0 }
     }
 
     #[inline]
-    fn bucket_index(&self, key: u64) -> usize {
-        (key as usize) & self.mask
-    }
+    fn get_key(&self, hash: u64) -> usize {
+        let key = hash as u128;
+        let len = self.table.len() as u128;
 
-    #[inline]
-    fn bucket(&self, key: u64) -> &[TTSlot; TT_BUCKET_SIZE] {
-        &self.buckets[self.bucket_index(key)]
-    }
-
-    #[inline]
-    fn bucket_mut(&mut self, key: u64) -> &mut [TTSlot; TT_BUCKET_SIZE] {
-        let idx = self.bucket_index(key);
-        &mut self.buckets[idx]
+        ((key * len) >> 64) as usize
     }
 
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        for slot in self.bucket(key) {
-            if slot.used && slot.key == key {
-                return Some(slot.entry);
-            }
+        let idx = self.get_key(key);
+        let stored = self.table[idx];
+        if stored.key == key {
+            Some(Self::visible_entry(stored))
+        } else {
+            None
         }
-        None
     }
 
     pub fn store(
@@ -116,119 +117,106 @@ impl TranspositionTable {
         depth: i16,
         score: i32,
         flag: TTFlag,
-        best_move: Option<ChessMove>,
+        mut best_move: Option<ChessMove>,
         eval: Option<i32>,
     ) {
-        let is_pv = flag == TTFlag::Exact;
-        let generation = self.generation;
-        let bucket = self.bucket_mut(key);
+        debug_assert!(!self.table.is_empty());
+        let idx = self.get_key(key);
+        let entry = &mut self.table[idx];
+        let pv = flag == TTFlag::Exact;
+        let same_position = entry.key == key;
+        let previous_entry = if same_position { Some(*entry) } else { None };
+        let previous_age = entry.age;
 
-        if let Some(slot) = bucket.iter_mut().find(|slot| slot.used && slot.key == key) {
-            let should_replace = depth > slot.entry.depth
-                || (flag == TTFlag::Exact && slot.entry.flag != TTFlag::Exact)
-                || (depth == slot.entry.depth && flag == TTFlag::Exact);
+        let old_depth = previous_entry.map_or(0, |entry| entry.depth.max(0) as usize);
 
-            if should_replace {
-                slot.entry.depth = depth;
-                slot.entry.score = score;
-                slot.entry.flag = flag;
-            }
+        let should_replace = self.age != previous_age
+            || !same_position
+            || flag == TTFlag::Exact
+            || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(pv) > old_depth;
 
+        if !should_replace {
             if let Some(mv) = best_move {
-                slot.entry.best_move = Some(mv);
+                entry.best_move = Some(mv);
             }
-
             if let Some(eval_val) = eval {
-                slot.entry.eval = Some(eval_val);
+                entry.eval = Some(eval_val);
             }
-
-            slot.generation = generation;
-            slot.is_pv |= is_pv;
+            entry.age = self.age;
+            entry.pv |= pv;
             return;
         }
 
-        // No direct match: pick a victim within the bucket. Replacement is driven by
-        // age/depth/PV priority so good data survives while stale nodes get evicted.
-        let target_idx = Self::select_replacement(bucket, generation, is_pv);
-        let slot = &mut bucket[target_idx];
-        slot.used = true;
-        slot.key = key;
-        slot.entry = TTEntry {
+        if best_move.is_none() {
+            if let Some(entry) = previous_entry {
+                best_move = entry.best_move;
+            }
+        }
+
+        let final_eval = match eval {
+            Some(val) => Some(val),
+            None => previous_entry.and_then(|entry| entry.eval),
+        };
+
+        *entry = TTEntry {
             depth,
             score,
             flag,
             best_move,
-            eval,
+            eval: final_eval,
+            key,
+            age: self.age,
+            pv,
         };
-        slot.generation = generation;
-        slot.is_pv = is_pv;
     }
 
     pub fn store_eval(&mut self, key: u64, eval: i32) {
-        let generation = self.generation;
-        let bucket = self.bucket_mut(key);
-        if let Some(slot) = bucket.iter_mut().find(|slot| slot.used && slot.key == key) {
-            slot.entry.eval = Some(eval);
-            slot.generation = generation;
+        debug_assert!(!self.table.is_empty());
+        let idx = self.get_key(key);
+        let entry = &mut self.table[idx];
+        let same_position = entry.key == key;
+
+        if same_position {
+            entry.eval = Some(eval);
+            entry.age = self.age;
             return;
         }
 
-        let target_idx = Self::select_replacement(bucket, generation, false);
-        let slot = &mut bucket[target_idx];
-        slot.used = true;
-        slot.key = key;
-        slot.entry = TTEntry {
+        *entry = TTEntry {
             depth: -1,
             score: 0,
             flag: TTFlag::Exact,
             best_move: None,
             eval: Some(eval),
+            key,
+            age: self.age,
+            pv: false,
         };
-        slot.generation = generation;
-        slot.is_pv = false;
-    }
-
-    fn select_replacement(
-        bucket: &[TTSlot; TT_BUCKET_SIZE],
-        generation: u8,
-        prefer_pv: bool,
-    ) -> usize {
-        let mut target_idx = 0;
-        let mut best_score = i32::MIN;
-
-        for (i, slot) in bucket.iter().enumerate() {
-            if !slot.used {
-                return i;
-            }
-
-            let age = generation.wrapping_sub(slot.generation) as i32;
-            let depth_penalty = slot.entry.depth.max(0) as i32;
-            let pv_penalty = if slot.is_pv { 48 } else { 0 };
-            let mut score = age * 64 - depth_penalty - pv_penalty;
-
-            // If we are about to write a PV node, lean toward evicting non-PV data.
-            if prefer_pv && slot.is_pv {
-                score -= 64;
-            }
-
-            if score > best_score {
-                best_score = score;
-                target_idx = i;
-            }
-        }
-
-        target_idx
     }
 
     pub fn bump_generation(&mut self) {
-        // Each root iteration increments the generation. Older entries age out naturally
-        // in replacements, which approximates an LRU without extra bookkeeping.
-        self.generation = self.generation.wrapping_add(1);
+        self.age = self.age.wrapping_add(1);
     }
 
     pub fn clear(&mut self) {
-        for bucket in &mut self.buckets {
-            *bucket = [TTSlot::default(); TT_BUCKET_SIZE];
+        for entry in &mut self.table {
+            *entry = TTEntry::default();
+        }
+    }
+}
+
+impl TranspositionTable {
+    #[inline]
+    fn visible_entry(entry: TTEntry) -> TTEntry {
+        TTEntry {
+            key: 0,
+            depth: entry.depth,
+            score: entry.score,
+            flag: entry.flag,
+            best_move: entry.best_move,
+            eval: entry.eval,
+            age: 0,
+            pv: false,
         }
     }
 }
