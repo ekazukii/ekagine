@@ -1,5 +1,5 @@
 use chess::{ChessMove, File, Piece, Rank, Square};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TTFlag {
@@ -53,34 +53,137 @@ impl Default for TTEntry {
         }
     }
 }
-
+// ================= 128-bit atomic variant for AArch64 + LSE =================
+#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+#[repr(C, align(16))]
 pub struct CompressedTTEntry {
-    pub key: AtomicU64,
-    pub data: AtomicU64,
+    // Two adjacent u64 words, 16-byte aligned. Accessed atomically via CASP*.
+    pair: core::cell::UnsafeCell<[u64; 2]>,
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+impl Default for CompressedTTEntry {
+    #[inline]
+    fn default() -> Self {
+        Self { pair: core::cell::UnsafeCell::new([0, 0]) }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+unsafe impl Send for CompressedTTEntry {}
+#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+unsafe impl Sync for CompressedTTEntry {}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+impl CompressedTTEntry {
+    #[inline]
+    fn load(&self) -> (u64, u64) {
+        // Read a stable 128-bit snapshot using a CAS loop where desired == expected.
+        unsafe {
+            use core::arch::asm;
+            let addr = (*self.pair.get()).as_mut_ptr();
+
+            let mut exp_lo: u64 = 0;
+            let mut exp_hi: u64 = 0;
+
+            loop {
+                let des_lo = exp_lo;
+                let des_hi = exp_hi;
+
+                asm!(
+                // CASPAL: acquire on load, release on store
+                "caspal x0, x1, x2, x3, [{addr}]",
+                inlateout("x0") exp_lo, // expected low  -> observed low
+                inlateout("x1") exp_hi, // expected high -> observed high
+                in("x2") des_lo,        // desired low   == expected low
+                in("x3") des_hi,        // desired high  == expected high
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+                );
+
+                if exp_lo == des_lo && exp_hi == des_hi {
+                    return (exp_lo, exp_hi);
+                }
+                // else: retry with the newly observed value now in exp_lo/exp_hi
+            }
+        }
+    }
+
+    #[inline]
+    fn store(&self, key: u64, data: u64) {
+        // Atomic 128-bit store using a CAS loop.
+        unsafe {
+            use core::arch::asm;
+            let addr = (*self.pair.get()).as_mut_ptr();
+
+            let mut exp_lo: u64 = 0;
+            let mut exp_hi: u64 = 0;
+
+            loop {
+                let mut obs_lo = exp_lo;
+                let mut obs_hi = exp_hi;
+
+                asm!(
+                "caspal x0, x1, x2, x3, [{addr}]",
+                inlateout("x0") obs_lo, // expected low  -> observed low
+                inlateout("x1") obs_hi, // expected high -> observed high
+                in("x2") key,           // desired low
+                in("x3") data,          // desired high
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+                );
+
+                if obs_lo == exp_lo && obs_hi == exp_hi {
+                    return;
+                }
+                exp_lo = obs_lo;
+                exp_hi = obs_hi;
+            }
+        }
+    }
+
+    #[inline]
+    fn store_entry(&self, entry: TTEntry) {
+        let (key, data) = entry.into();
+        self.store(key, data);
+    }
+}
+
+
+// ================= fallback: with 2x AtomicU64 + XOR trick =============
+#[cfg(not(all(target_arch = "aarch64", target_feature = "lse")))]
+pub struct CompressedTTEntry {
+    pub key: std::sync::atomic::AtomicU64,
+    pub data: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "lse")))]
 impl Default for CompressedTTEntry {
     fn default() -> Self {
         Self {
-            key: AtomicU64::new(0),
-            data: AtomicU64::new(0),
+            key: std::sync::atomic::AtomicU64::new(0),
+            data: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
 
+#[cfg(not(all(target_arch = "aarch64", target_feature = "lse")))]
 impl CompressedTTEntry {
+    #[inline]
     fn load(&self) -> (u64, u64) {
         let key_xor = self.key.load(Ordering::Acquire);
         let data = self.data.load(Ordering::Acquire);
         (key_xor ^ data, data)
     }
 
+    #[inline]
     fn store(&self, key: u64, data: u64) {
         let key_xor = key ^ data;
         self.data.store(data, Ordering::Relaxed);
         self.key.store(key_xor, Ordering::Release);
     }
 
+    #[inline]
     fn store_entry(&self, entry: TTEntry) {
         let (key, data) = entry.into();
         self.store(key, data);
