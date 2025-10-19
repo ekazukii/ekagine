@@ -53,15 +53,15 @@ impl Default for TTEntry {
         }
     }
 }
-// ================= 128-bit atomic variant for AArch64 + LSE =================
-#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+
+// ================= AArch64 LSE2 128-bit load/store =================
+#[cfg(all(target_arch = "aarch64", target_feature = "lse2"))]
 #[repr(C, align(16))]
 pub struct CompressedTTEntry {
-    // Two adjacent u64 words, 16-byte aligned. Accessed atomically via CASP*.
     pair: core::cell::UnsafeCell<[u64; 2]>,
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "lse2"))]
 impl Default for CompressedTTEntry {
     #[inline]
     fn default() -> Self {
@@ -69,75 +69,79 @@ impl Default for CompressedTTEntry {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "lse2"))]
 unsafe impl Send for CompressedTTEntry {}
-#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "lse2"))]
 unsafe impl Sync for CompressedTTEntry {}
 
-#[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "lse2"))]
 impl CompressedTTEntry {
     #[inline]
     fn load(&self) -> (u64, u64) {
-        // Read a stable 128-bit snapshot using a CAS loop where desired == expected.
         unsafe {
             use core::arch::asm;
-            let addr = (*self.pair.get()).as_mut_ptr();
+            let addr = (*self.pair.get()).as_ptr();
 
-            let mut exp_lo: u64 = 0;
-            let mut exp_hi: u64 = 0;
-
-            loop {
-                let des_lo = exp_lo;
-                let des_hi = exp_hi;
-
+            #[cfg(target_feature = "rcpc3")]
+            {
+                // LDIAPP: acquire ordered pair load (no extra barrier needed)
+                let mut lo: u64;
+                let mut hi: u64;
                 asm!(
-                // CASPAL: acquire on load, release on store
-                "caspal x0, x1, x2, x3, [{addr}]",
-                inlateout("x0") exp_lo, // expected low  -> observed low
-                inlateout("x1") exp_hi, // expected high -> observed high
-                in("x2") des_lo,        // desired low   == expected low
-                in("x3") des_hi,        // desired high  == expected high
+                "ldiapp x0, x1, [{addr}]",
+                out("x0") lo,
+                out("x1") hi,
                 addr = in(reg) addr,
                 options(nostack, preserves_flags)
                 );
-
-                if exp_lo == des_lo && exp_hi == des_hi {
-                    return (exp_lo, exp_hi);
-                }
-                // else: retry with the newly observed value now in exp_lo/exp_hi
+                (lo, hi)
+            }
+            #[cfg(not(target_feature = "rcpc3"))]
+            {
+                // Fallback: plain LDP + acquire barrier
+                let mut lo: u64;
+                let mut hi: u64;
+                asm!(
+                "ldp x0, x1, [{addr}]",
+                "dmb ishld",                 // acquire
+                out("x0") lo,
+                out("x1") hi,
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+                );
+                (lo, hi)
             }
         }
     }
 
     #[inline]
     fn store(&self, key: u64, data: u64) {
-        // Atomic 128-bit store using a CAS loop.
         unsafe {
             use core::arch::asm;
             let addr = (*self.pair.get()).as_mut_ptr();
 
-            let mut exp_lo: u64 = 0;
-            let mut exp_hi: u64 = 0;
-
-            loop {
-                let mut obs_lo = exp_lo;
-                let mut obs_hi = exp_hi;
-
+            #[cfg(target_feature = "rcpc3")]
+            {
+                // STILP: release ordered pair store
                 asm!(
-                "caspal x0, x1, x2, x3, [{addr}]",
-                inlateout("x0") obs_lo, // expected low  -> observed low
-                inlateout("x1") obs_hi, // expected high -> observed high
-                in("x2") key,           // desired low
-                in("x3") data,          // desired high
+                "stilp x0, x1, [{addr}]",
+                in("x0") key,
+                in("x1") data,
                 addr = in(reg) addr,
                 options(nostack, preserves_flags)
                 );
-
-                if obs_lo == exp_lo && obs_hi == exp_hi {
-                    return;
-                }
-                exp_lo = obs_lo;
-                exp_hi = obs_hi;
+            }
+            #[cfg(not(target_feature = "rcpc3"))]
+            {
+                // Fallback: full barrier then STP for release semantics
+                asm!(
+                "dmb ish",                   // release
+                "stp x0, x1, [{addr}]",
+                in("x0") key,
+                in("x1") data,
+                addr = in(reg) addr,
+                options(nostack, preserves_flags)
+                );
             }
         }
     }
@@ -149,15 +153,14 @@ impl CompressedTTEntry {
     }
 }
 
-
-// ================= fallback: with 2x AtomicU64 + XOR trick =============
-#[cfg(not(all(target_arch = "aarch64", target_feature = "lse")))]
+// ================= fallback: 2x AtomicU64 XOR version =================
+#[cfg(not(all(target_arch = "aarch64", target_feature = "lse2")))]
 pub struct CompressedTTEntry {
     pub key: std::sync::atomic::AtomicU64,
     pub data: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "lse")))]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "lse2")))]
 impl Default for CompressedTTEntry {
     fn default() -> Self {
         Self {
@@ -167,7 +170,7 @@ impl Default for CompressedTTEntry {
     }
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "lse")))]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "lse2")))]
 impl CompressedTTEntry {
     #[inline]
     fn load(&self) -> (u64, u64) {
@@ -175,20 +178,19 @@ impl CompressedTTEntry {
         let data = self.data.load(Ordering::Acquire);
         (key_xor ^ data, data)
     }
-
     #[inline]
     fn store(&self, key: u64, data: u64) {
         let key_xor = key ^ data;
         self.data.store(data, Ordering::Relaxed);
         self.key.store(key_xor, Ordering::Release);
     }
-
     #[inline]
     fn store_entry(&self, entry: TTEntry) {
         let (key, data) = entry.into();
         self.store(key, data);
     }
 }
+
 
 const TT_DEFAULT_MB: usize = 32;
 const TT_REPLACE_OFFSET: usize = 2;
