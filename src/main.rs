@@ -37,7 +37,7 @@ struct EngineOptions {
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        Self { threads: 4 }
+        Self { threads: 1 }
     }
 }
 
