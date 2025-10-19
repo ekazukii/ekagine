@@ -62,6 +62,7 @@ version = "0.6.0"
 dependencies = [
  "chess",
  "lazy_static",
+ "libc",
  "once_cell",
  "serde",
  "serde_json",

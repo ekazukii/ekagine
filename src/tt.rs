@@ -1,5 +1,6 @@
 use chess::{ChessMove, File, Piece, Rank, Square};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use crate::has_lse2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TTFlag {
@@ -54,38 +55,134 @@ impl Default for TTEntry {
     }
 }
 
-pub struct CompressedTTEntry {
-    pub key: AtomicU64,
-    pub data: AtomicU64,
+// ------------------------ Fast path using LSE2 ------------------------
+#[repr(C, align(16))]
+struct Lse2Impl {
+    pair: core::cell::UnsafeCell<[u64; 2]>,
 }
-
-impl Default for CompressedTTEntry {
+impl Default for Lse2Impl {
+    #[inline]
     fn default() -> Self {
-        Self {
-            key: AtomicU64::new(0),
-            data: AtomicU64::new(0),
+        Self { pair: core::cell::UnsafeCell::new([0, 0]) }
+    }
+}
+unsafe impl Send for Lse2Impl {}
+unsafe impl Sync for Lse2Impl {}
+
+impl Lse2Impl {
+    #[inline]
+    fn load(&self) -> (u64, u64) {
+        unsafe {
+            use core::arch::asm;
+            let addr = (*self.pair.get()).as_ptr();
+            let mut lo: u64;
+            let mut hi: u64;
+            // Acquire load: DMB ISHLD after LDP
+            asm!(
+            "ldp {lo}, {hi}, [{addr}]",
+            "dmb ishld",
+            lo = out(reg) lo,
+            hi = out(reg) hi,
+            addr = in(reg) addr,
+            options(nostack, preserves_flags)
+            );
+            (lo, hi)
+        }
+    }
+
+    #[inline]
+    fn store(&self, key: u64, data: u64) {
+        unsafe {
+            use core::arch::asm;
+            let addr = (*self.pair.get()).as_mut_ptr();
+            // Release store: DMB ISH before STP
+            asm!(
+            "dmb ish",
+            "stp {key}, {data}, [{addr}]",
+            key = in(reg) key,
+            data = in(reg) data,
+            addr = in(reg) addr,
+            options(nostack, preserves_flags)
+            );
         }
     }
 }
 
-impl CompressedTTEntry {
+// ------------------------ Fallback XOR scheme ------------------------
+
+struct FallbackImpl {
+    key: AtomicU64,
+    data: AtomicU64,
+}
+impl Default for FallbackImpl {
+    #[inline]
+    fn default() -> Self {
+        Self { key: AtomicU64::new(0), data: AtomicU64::new(0) }
+    }
+}
+impl FallbackImpl {
+    #[inline]
     fn load(&self) -> (u64, u64) {
         let key_xor = self.key.load(Ordering::Acquire);
         let data = self.data.load(Ordering::Acquire);
         (key_xor ^ data, data)
     }
-
+    #[inline]
     fn store(&self, key: u64, data: u64) {
         let key_xor = key ^ data;
         self.data.store(data, Ordering::Relaxed);
         self.key.store(key_xor, Ordering::Release);
     }
+}
 
-    fn store_entry(&self, entry: TTEntry) {
+// ------------------------ Public type with runtime dispatch ------------------------
+
+enum Backend {
+    Lse2(Lse2Impl),
+    Fallback(FallbackImpl),
+}
+
+pub struct CompressedTTEntry(Backend);
+
+impl Default for CompressedTTEntry {
+    #[inline]
+    fn default() -> Self {
+        if has_lse2() {
+            CompressedTTEntry(Backend::Lse2(Lse2Impl::default()))
+        } else {
+            CompressedTTEntry(Backend::Fallback(FallbackImpl::default()))
+        }
+    }
+}
+
+unsafe impl Send for CompressedTTEntry {}
+unsafe impl Sync for CompressedTTEntry {}
+
+impl CompressedTTEntry {
+    #[inline]
+    pub fn load(&self) -> (u64, u64) {
+        match &self.0 {
+            Backend::Lse2(x) => x.load(),
+            Backend::Fallback(x) => x.load(),
+        }
+    }
+
+    #[inline]
+    pub fn store(&self, key: u64, data: u64) {
+        match &self.0 {
+            Backend::Lse2(x) => x.store(key, data),
+            Backend::Fallback(x) => x.store(key, data),
+        }
+    }
+
+    #[inline]
+    pub fn store_entry(&self, entry: TTEntry) {
         let (key, data) = entry.into();
         self.store(key, data);
     }
 }
+
+
 
 const TT_DEFAULT_MB: usize = 32;
 const TT_REPLACE_OFFSET: usize = 2;

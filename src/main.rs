@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 type StopFlag = Arc<AtomicBool>;
@@ -612,6 +612,50 @@ pub fn compute_best_from_fen(
     Ok((outcome.best_move, outcome.score))
 }
 
+
+// ------------------------ LSE2 runtime detect ------------------------
+
+static HAS_LSE2: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+pub fn has_lse2() -> bool {
+    *HAS_LSE2.get_or_init(detect_lse2)
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn detect_lse2() -> bool {
+    unsafe { sysctlbyname_i32(b"hw.optional.arm.FEAT_LSE2\0").unwrap_or(0) != 0 }
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+fn detect_lse2() -> bool {
+    false
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+unsafe fn sysctlbyname_i32(name: &[u8]) -> Option<i32> {
+    use core::ffi::c_void;
+    use libc::{c_char, size_t, sysctlbyname};
+
+    debug_assert!(name.last() == Some(&0)); // NUL-terminated
+
+    let mut value: i32 = 0;
+    let mut size: size_t = core::mem::size_of::<i32>() as size_t;
+
+    let ret = sysctlbyname(
+        name.as_ptr() as *const c_char,
+        // oldp
+        &mut value as *mut i32 as *mut c_void,
+        // oldlenp
+        &mut size as *mut size_t,
+        // newp
+        core::ptr::null_mut::<c_void>(),
+        // newlen
+        0,
+    );
+    if ret == 0 { Some(value) } else { None }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -625,6 +669,11 @@ fn main() {
     match args[1].as_str() {
         "--version" => {
             println!("Version: {}", VERSION);
+            #[cfg(all(target_arch = "aarch64", target_feature = "lse"))]
+            println!("Using LSE instruction set");
+            if has_lse2() {
+                println!("Using LSE2 instruction set");
+            }
         }
 
         "--uci" => {
