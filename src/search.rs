@@ -342,9 +342,10 @@ fn cache_eval(
             return cached;
         }
     }
-    let val = nnue_state.evaluate(Color::White);
-    transpo_table.store_eval(zob, val);
-    val
+    //let val = nnue_state.evaluate(Color::White);
+    //transpo_table.store_eval(zob, val);
+    //val
+    nnue_state.evaluate(Color::White)
 }
 
 #[inline]
