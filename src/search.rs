@@ -262,7 +262,6 @@ fn quiesce_negamax_it(
     remain_quiet: usize,
     transpo_table: &TranspositionTable,
     repetition_table: &mut RepetitionTable,
-    color: i32, // +1 if White to move in this node, −1 otherwise
     ply_from_root: i32,
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
@@ -272,10 +271,10 @@ fn quiesce_negamax_it(
     stats.record_depth(ply_from_root);
     stats.qnodes += 1;
     if remain_quiet == 0 {
-        return color * cache_eval(board, transpo_table, nnue_state);
+        return cache_eval(board, transpo_table, nnue_state);
     }
 
-    let stand_pat = color * cache_eval(board, transpo_table, nnue_state);
+    let stand_pat = cache_eval(board, transpo_table, nnue_state);
     if stand_pat >= beta {
         stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -309,7 +308,6 @@ fn quiesce_negamax_it(
             remain_quiet - 1,
             transpo_table,
             repetition_table,
-            -color,
             ply_from_root + 1,
             stats,
             nnue_state,
@@ -338,10 +336,7 @@ fn cache_eval(board: &Board, transpo_table: &TranspositionTable, nnue_state: &NN
             return cached;
         }
     }
-    //let val = nnue_state.evaluate(Color::White);
-    //transpo_table.store_eval(zob, val);
-    //val
-    nnue_state.evaluate(Color::White)
+    nnue_state.evaluate(board.side_to_move())
 }
 
 #[inline]
@@ -756,7 +751,6 @@ fn negamax_it(
     repetition_table: &mut RepetitionTable,
     killers: &mut KillerTable,
     nnue_state: &mut NNUEState,
-    color: i32,
     stop: &StopFlag,
     ply_from_root: i32,
     is_pv_node: bool,
@@ -787,7 +781,6 @@ fn negamax_it(
             QUIESCE_REMAIN,
             transpo_table,
             repetition_table,
-            color,
             ply_from_root,
             stats,
             nnue_state,
@@ -847,7 +840,6 @@ fn negamax_it(
                 repetition_table,
                 killers,
                 nnue_state,
-                -color,
                 stop,
                 ply_from_root + 1,
                 false,
@@ -877,8 +869,8 @@ fn negamax_it(
 
     let (static_eval, static_eval_raw) =
         if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let raw = cache_eval(board, transpo_table, nnue_state);
-            (Some(color * raw), Some(raw))
+            let eval = cache_eval(board, transpo_table, nnue_state);
+            (Some(eval), Some(eval))
         } else {
             (None, None)
         };
@@ -1012,7 +1004,6 @@ fn negamax_it(
                 repetition_table,
                 killers,
                 nnue_state,
-                -color,
                 stop,
                 ply_from_root + 1,
                 false,
@@ -1035,7 +1026,6 @@ fn negamax_it(
                             repetition_table,
                             killers,
                             nnue_state,
-                            -color,
                             stop,
                             ply_from_root + 1,
                             child_is_pv_node,
@@ -1062,7 +1052,6 @@ fn negamax_it(
                 repetition_table,
                 killers,
                 nnue_state,
-                -color,
                 stop,
                 ply_from_root + 1,
                 child_is_pv_node,
@@ -1236,11 +1225,6 @@ fn root_search_with_window(
     let mut best_value = NEG_INFINITY;
     let mut best_move = None;
     let mut aborted = false;
-    let color = if board.side_to_move() == Color::White {
-        1
-    } else {
-        -1
-    };
 
     let mut killer_table = KillerTable::new(max_depth + 4);
     let mut out = io::stdout();
@@ -1272,7 +1256,6 @@ fn root_search_with_window(
             repetition_table,
             &mut killer_table,
             nnue_state,
-            -color,
             stop,
             1, // one ply from root after making mv
             is_pv_node,
