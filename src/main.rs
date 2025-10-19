@@ -111,17 +111,18 @@ impl RepetitionTable {
 
     fn is_in_threefold_scenario(&self, board: &Board) -> bool {
         let target = board.get_hash();
-        for &hash in self
-            .history
-            .iter()
-            .rev()
-            .skip(1)
-            .take((self.ply_since_last_hmclock.last().unwrap_or(&0) + 1) as usize)
-        {
+        let hm_limit = self.ply_since_last_hmclock.last().copied().unwrap_or(0) as usize;
+
+        let mut occurrences = 1; // include current position
+        for &hash in self.history.iter().rev().skip(1).take(hm_limit + 1) {
             if hash == target {
-                return true;
+                occurrences += 1;
+                if occurrences >= 3 {
+                    return true;
+                }
             }
         }
+
         false
     }
 }
