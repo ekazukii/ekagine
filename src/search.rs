@@ -2,7 +2,7 @@ use crate::movegen::IncrementalMoveGen;
 use crate::nnue::NNUEState;
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
-    NEG_INFINITY, POS_INFINITY, QUIESCE_REMAIN,
+    NEG_INFINITY, POS_INFINITY,
 };
 use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
@@ -260,16 +260,12 @@ fn quiesce_negamax_it(
     board: &Board,
     mut alpha: i32,
     beta: i32,
-    remain_quiet: usize,
     ply_from_root: i32,
 ) -> i32 {
     debug_assert!(!ctx.repetition.is_in_threefold_scenario(board));
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
-    if remain_quiet == 0 {
-        return cache_eval(board, ctx.tt, &*ctx.nnue);
-    }
 
     let stand_pat = cache_eval(board, ctx.tt, &*ctx.nnue);
     if stand_pat >= beta {
@@ -303,7 +299,6 @@ fn quiesce_negamax_it(
             &new_board,
             -beta,
             -alpha,
-            remain_quiet - 1,
             ply_from_root + 1,
         );
         board_pop(&new_board, ctx.repetition);
@@ -765,7 +760,6 @@ fn negamax_it(
             board,
             alpha,
             beta,
-            QUIESCE_REMAIN,
             ply_from_root,
         ));
     }
