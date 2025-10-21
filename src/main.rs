@@ -8,6 +8,7 @@ mod movegen;
 mod nnue;
 mod search;
 mod tt;
+mod position;
 
 use crate::search::{
     best_move_interruptible, best_move_using_iterative_deepening, uci_score_string, SearchStats,
@@ -55,6 +56,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
+use crate::position::perft_from_start_timed;
 
 pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
     if matches!(board.piece_on(mv.get_source()), Some(Piece::Pawn)) {
@@ -640,6 +642,10 @@ fn main() {
                 Ok(hash_map) => benchmark_evaluation(&hash_map),
                 Err(err) => eprintln!("Failed to open {}: {}", filepath, err),
             }
+        }
+
+        "--perft" => {
+            perft_from_start_timed(5);
         }
 
         "--best" => {
