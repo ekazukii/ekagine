@@ -267,7 +267,7 @@ fn quiesce_negamax_it(
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
 
-    let stand_pat = cache_eval(board, ctx.tt, &*ctx.nnue);
+    let stand_pat = ctx.nnue.evaluate(board.side_to_move());
     if stand_pat >= beta {
         ctx.stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -314,18 +314,6 @@ fn quiesce_negamax_it(
     }
 
     alpha
-}
-
-/// Cached evaluation: if threefold, return 0, else look up in transposition table.
-/// If not found, compute via `eval_board`, insert into the table, and return.
-fn cache_eval(board: &Board, transpo_table: &TranspositionTable, nnue_state: &NNUEState) -> i32 {
-    let zob = board.get_hash();
-    if let Some(entry) = transpo_table.probe(zob) {
-        if let Some(cached) = entry.eval {
-            return cached;
-        }
-    }
-    nnue_state.evaluate(board.side_to_move())
 }
 
 #[inline]
@@ -834,7 +822,7 @@ fn negamax_it(
 
     let (static_eval, static_eval_raw) =
         if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let eval = cache_eval(board, ctx.tt, &*ctx.nnue);
+            let eval = ctx.nnue.evaluate(board.side_to_move());
             (Some(eval), Some(eval))
         } else {
             (None, None)
