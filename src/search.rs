@@ -39,6 +39,7 @@ pub struct SearchStats {
     pub incremental_move_gen_inits: u64,
     pub incremental_move_gen_capture_lists: u64,
     pub effective_branching_factor: f64,
+    pub late_move_pruning: u64,
     pub depth: u64,
 }
 
@@ -67,6 +68,7 @@ impl SearchStats {
             incremental_move_gen_capture_lists: self
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
+            late_move_pruning: self.late_move_pruning.saturating_sub(other.late_move_pruning),
             effective_branching_factor: 0.0,
             depth: self.depth,
         }
@@ -100,7 +102,7 @@ impl SearchStats {
 
     pub(crate) fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} late_move_pruning={} ebf={:.2} depth={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -115,6 +117,7 @@ impl SearchStats {
             self.lmr_researches,
             self.incremental_move_gen_inits,
             self.incremental_move_gen_capture_lists,
+            self.late_move_pruning,
             self.effective_branching_factor,
             self.depth,
         )
@@ -884,8 +887,9 @@ fn negamax_it(
             // Late move pruning
             if incremental_move_gen.is_in_late_move_phase() && move_idx > 0 {
                 // LPM Classic
-                if move_idx > lmp_margin {
-                    break;
+                if depth <= 8 && move_idx > lmp_margin {
+                    ctx.stats.late_move_pruning += 1;
+                    //break;
                 }
             }
         }
