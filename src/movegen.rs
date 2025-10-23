@@ -1,6 +1,6 @@
 use crate::search::see_for_sort;
 use crate::TranspositionTable;
-use chess::{BitBoard, Board, ChessMove, MoveGen};
+use chess::{BitBoard, Board, ChessMove, MoveGen, EMPTY};
 use smallvec::SmallVec;
 
 type MoveList = SmallVec<[ChessMove; 64]>;
@@ -19,6 +19,7 @@ pub struct IncrementalMoveGen<'a> {
     board: &'a Board,
     tt_move: Option<ChessMove>,
     killer_moves: [Option<ChessMove>; 2],
+    move_gen_iter: MoveGen,
     phase: MoveGenPhase,
     has_legal_moves: bool,
     capture_gen_pending: bool,
@@ -60,6 +61,7 @@ impl<'a> IncrementalMoveGen<'a> {
             capture_gen_pending: false,
             captures_generated: false,
             quiet_generated: false,
+            move_gen_iter: probe_iter,
             good_captures: MoveList::new(),
             bad_captures: MoveList::new(),
             killer_quiet: MoveList::new(),
@@ -85,13 +87,12 @@ impl<'a> IncrementalMoveGen<'a> {
             capture_mask |= BitBoard::from_square(ep_sq);
         }
 
-        let mut gen = MoveGen::new_legal(self.board);
-        gen.set_iterator_mask(capture_mask);
+        self.move_gen_iter.set_iterator_mask(capture_mask);
 
         let mut good_scored: SmallVec<[(ChessMove, i32); 32]> = SmallVec::new();
         let mut bad_scored: SmallVec<[(ChessMove, i32); 32]> = SmallVec::new();
 
-        for mv in gen {
+        for mv in self.move_gen_iter.by_ref() {
             if Some(mv) == self.tt_move {
                 continue;
             }
@@ -125,8 +126,8 @@ impl<'a> IncrementalMoveGen<'a> {
         let mut bad_quiet: MoveList = MoveList::new();
         let mut killer_seen = [false; 2];
 
-        let gen = MoveGen::new_legal(self.board);
-        for mv in gen {
+        self.move_gen_iter.set_iterator_mask(!EMPTY);
+        for mv in self.move_gen_iter.by_ref() {
             if Some(mv) == self.tt_move {
                 continue;
             }
