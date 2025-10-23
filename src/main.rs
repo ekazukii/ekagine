@@ -590,8 +590,6 @@ const NEG_INFINITY: i32 = -100_000_000;
 const POS_INFINITY: i32 = 100_000_000;
 const PV_WIDTH: usize = 1; // keep up to X moves per position for ordering
 
-const QUIESCE_REMAIN: usize = 15;
-
 pub fn compute_best_from_fen(
     fen: &str,
     max_depth: usize,
