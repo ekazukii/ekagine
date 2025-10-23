@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
-use std::os::macos::raw::stat;
 
 enum SearchScore {
     CANCELLED,
@@ -859,7 +858,6 @@ fn negamax_it(
         ctx.stats.reverse_futility_prunes += 1;
         return SearchScore::EVAL(beta);
     }
-
 
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
