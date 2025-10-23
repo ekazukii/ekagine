@@ -840,8 +840,12 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
-    let stand_pat = cache_eval(board, ctx.tt, &*ctx.nnue);
-    tt_eval_hint = Some(stand_pat);
+    let (stand_pat, tt_eval_hint) = if depth < 6 {
+        let stand_pat = cache_eval(board, ctx.tt, &*ctx.nnue);
+        (stand_pat, Some(stand_pat))
+    } else {
+        (0, None)
+    };
 
     let can_prune = !is_pv_node && !in_check;
     if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
@@ -881,14 +885,14 @@ fn negamax_it(
         // Pre-move pruning
         if can_prune && best_value < MATE_THRESHOLD {
             // Late move pruning
-            if incremental_move_gen.is_in_late_move_phase() {
+            if incremental_move_gen.is_in_late_move_phase() && move_idx > 0 {
                 // LPM Classic
                 if move_idx > lmp_margin {
                     break;
                 }
 
                 // Futility pruning
-                if depth < 6 && alpha < MATE_THRESHOLD && fp_margin <= alpha && move_idx > 1 {
+                if depth < 6 && alpha < MATE_THRESHOLD && fp_margin <= alpha {
                     ctx.stats.futility_prunes += 1;
                     break;
                 }
