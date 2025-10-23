@@ -838,37 +838,27 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
-    let (static_eval, static_eval_raw) =
-        if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let eval = cache_eval(board, ctx.tt, &*ctx.nnue);
-            (Some(eval), Some(eval))
-        } else {
-            (None, None)
-        };
-
-    if let Some(raw) = static_eval_raw {
-        tt_eval_hint = Some(raw);
-    }
-
-    if let Some(stand_pat) = static_eval {
-        if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
-            && !is_pv_node
-            && alpha != NEG_INFINITY
-            && beta != POS_INFINITY
-            && !is_mate_score(beta)
-            && !is_mate_score(stand_pat)
-            && stand_pat >= beta.saturating_add(reverse_futility_margin(depth_remaining))
-        {
-            ctx.stats.reverse_futility_prunes += 1;
-            return SearchScore::EVAL(beta);
-        }
-    }
-
-    let static_eval_for_futility = if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH {
-        static_eval
+    let can_prune = !is_pv_node && !in_check;
+    let (stand_pat, tt_eval_hint) = if depth < 6 {
+        let stand_pat = cache_eval(board, ctx.tt, &*ctx.nnue);
+        (stand_pat, Some(stand_pat))
     } else {
-        None
+        (0, None)
     };
+
+
+    if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
+        && !is_pv_node
+        && alpha != NEG_INFINITY
+        && beta != POS_INFINITY
+        && !is_mate_score(beta)
+        && !is_mate_score(stand_pat)
+        && stand_pat >= beta.saturating_add(reverse_futility_margin(depth_remaining))
+    {
+        ctx.stats.reverse_futility_prunes += 1;
+        return SearchScore::EVAL(beta);
+    }
+
 
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
@@ -882,11 +872,24 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
+    let lmp_margin = (2 + depth * depth) as usize;
     let mut move_idx: usize = 0;
     while let Some(mv) = incremental_move_gen.next() {
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
+
+        // Pre-move pruning
+        if can_prune && best_value < MATE_THRESHOLD {
+            // Late move pruning
+            if incremental_move_gen.is_in_late_move_phase() && move_idx > 0 {
+                // LPM Classic
+                if move_idx > lmp_margin {
+                    break;
+                }
+            }
+        }
+
         let new_board = board_do_move(board, mv, ctx.repetition);
 
         let is_capture =
@@ -905,22 +908,20 @@ fn negamax_it(
             extension = 1;
         }
 
-        if let Some(stand_pat) = static_eval_for_futility {
-            if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH
-                && !is_capture
-                && !gives_check
-                && !is_first_move
-                && alpha != NEG_INFINITY
-                && beta != POS_INFINITY
-                && !is_mate_score(alpha)
-            {
-                let margin = futility_margin(depth_remaining);
-                if stand_pat + margin <= alpha {
-                    ctx.stats.futility_prunes += 1;
-                    move_idx += 1;
-                    ctx.repetition.pop();
-                    continue;
-                }
+        if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH
+            && !is_capture
+            && !gives_check
+            && !is_first_move
+            && alpha != NEG_INFINITY
+            && beta != POS_INFINITY
+            && !is_mate_score(alpha)
+        {
+            let margin = futility_margin(depth_remaining);
+            if stand_pat + margin <= alpha {
+                ctx.stats.futility_prunes += 1;
+                move_idx += 1;
+                ctx.repetition.pop();
+                continue;
             }
         }
 
