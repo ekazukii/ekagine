@@ -872,7 +872,7 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
-    let lmp_margin = (2 + depth * depth) as usize;
+    let lmp_margin = (4 + depth * depth) as usize;
     let mut move_idx: usize = 0;
     while let Some(mv) = incremental_move_gen.next() {
         if incremental_move_gen.take_capture_generation_event() {
