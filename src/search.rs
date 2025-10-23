@@ -883,13 +883,13 @@ fn negamax_it(
         }
 
         // Pre-move pruning
-        if can_prune && best_value < MATE_THRESHOLD {
+        if can_prune && best_move_opt.is_some() {
             // Late move pruning
             if incremental_move_gen.is_in_late_move_phase() && move_idx > 0 {
                 // LPM Classic
                 if depth <= 8 && move_idx > lmp_margin {
                     ctx.stats.late_move_pruning += 1;
-                    //break;
+                    break;
                 }
             }
         }
