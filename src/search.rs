@@ -855,17 +855,15 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
 
-    let (static_eval, static_eval_raw) =
+    let static_eval =
         if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
             let eval = ctx.nnue.evaluate(board.side_to_move());
-            (Some(eval), Some(eval))
+            tt_eval_hint = Some(eval);
+            Some(eval)
         } else {
-            (None, None)
+            None
         };
 
-    if let Some(raw) = static_eval_raw {
-        tt_eval_hint = Some(raw);
-    }
 
     if let Some(stand_pat) = static_eval {
         if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
@@ -881,12 +879,6 @@ fn negamax_it(
         }
     }
 
-    let static_eval_for_futility = if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH {
-        static_eval
-    } else {
-        None
-    };
-
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
     let killer_moves = ctx.killers.killers_for(ply_index);
@@ -899,17 +891,40 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
+    let (can_fp, fp_val) = if let Some(stand_pat) = static_eval {
+        let margin = futility_margin(depth_remaining);
+        (!in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH, stand_pat + margin)
+    } else {
+        (false, POS_INFINITY)
+    };
+
     let mut move_idx: usize = 0;
     while let Some(mv) = incremental_move_gen.next() {
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
-        let new_board = board_do_move(board, mv, ctx.repetition);
 
         let is_capture =
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
-        let gives_check = new_board.checkers().popcnt() > 0;
         let is_first_move = move_idx == 0;
+
+        if can_fp
+            && !is_capture
+            && !is_first_move
+            && alpha != NEG_INFINITY
+            && beta != POS_INFINITY
+            && !is_mate_score(alpha)
+            && fp_val <= alpha
+        {
+            ctx.stats.futility_prunes += 1;
+            move_idx += 1;
+            continue;
+        }
+
+        let new_board = board_do_move(board, mv, ctx.repetition);
+
+
+        let gives_check = new_board.checkers().popcnt() > 0;
         let child_is_pv_node = is_pv_node && is_first_move;
 
         let mut extension: i16 = 0;
@@ -920,25 +935,6 @@ fn negamax_it(
             && is_passed_pawn_push(board, &new_board, mv)
         {
             extension = 1;
-        }
-
-        if let Some(stand_pat) = static_eval_for_futility {
-            if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH
-                && !is_capture
-                && !gives_check
-                && !is_first_move
-                && alpha != NEG_INFINITY
-                && beta != POS_INFINITY
-                && !is_mate_score(alpha)
-            {
-                let margin = futility_margin(depth_remaining);
-                if stand_pat + margin <= alpha {
-                    ctx.stats.futility_prunes += 1;
-                    move_idx += 1;
-                    ctx.repetition.pop();
-                    continue;
-                }
-            }
         }
 
         let apply_lmr =
