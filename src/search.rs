@@ -875,8 +875,6 @@ fn negamax_it(
             let margin = futility_margin(depth_remaining);
             if eval + margin <= alpha {
                 ctx.stats.futility_prunes += 1;
-                move_idx += 1;
-                ctx.repetition.pop();
                 continue;
             }
         }
