@@ -26,6 +26,6 @@ jobs:
               \"timeControl\": \"10+0.1\",
               \"openingsUrl\": \"https://github.com/official-stockfish/books/raw/refs/heads/master/8moves_v3.pgn.zip\",
               \"targetNGames\": 10000,
-              \"batchSize\": 40,
+              \"batchSize\": 120,
               \"sprt\": { \"h0Elo\": -10, \"h1Elo\": 0, \"alpha\": 0.05, \"beta\": 0.05 }
             }"
