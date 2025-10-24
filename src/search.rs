@@ -267,7 +267,42 @@ fn quiesce_negamax_it(
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
 
-    let stand_pat = cache_eval(board, ctx.tt, &*ctx.nnue);
+    // Quiescence TT lookup
+    let hit = ctx.tt.probe(board.get_hash());
+    if let Some(tt_hit) = hit {
+        let tt_score = tt_score_on_load(tt_hit.score, ply_from_root);
+        match tt_hit.flag {
+            TTFlag::Exact => {
+                ctx.stats.tt_cutoff_exact += 1;
+                return tt_score;
+            }
+            TTFlag::Lower => {
+                if tt_hit.score >= beta {
+                    ctx.stats.tt_cutoff_lower += 1;
+                    ctx.stats.beta_cutoffs_quiescence += 1;
+                    return tt_score;
+                }
+            }
+            TTFlag::Upper => {
+                if tt_hit.score <= alpha {
+                    ctx.stats.tt_cutoff_upper += 1;
+                    return tt_score;
+                }
+            }
+        }
+    }
+
+    let in_check = board.checkers().popcnt() > 0;
+    let stand_pat = if in_check {
+        NEG_INFINITY
+    } else if let Some(ref tt_hit) = hit {
+        tt_hit
+            .eval
+            .unwrap_or_else(|| ctx.nnue.evaluate(board.side_to_move()))
+    } else {
+        ctx.nnue.evaluate(board.side_to_move())
+    };
+
     if stand_pat >= beta {
         ctx.stats.beta_cutoffs_quiescence += 1;
         return stand_pat;
@@ -285,7 +320,7 @@ fn quiesce_negamax_it(
         let captured_val = dest_piece
             .map(piece_value)
             .unwrap_or_else(|| piece_value(Piece::Pawn));
-        if stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
+        if !in_check && stand_pat + captured_val + QUIESCE_FUTILITY_MARGIN <= alpha {
             continue;
         }
         if see_for_sort(board, mv) < 0 {
@@ -308,18 +343,6 @@ fn quiesce_negamax_it(
     }
 
     alpha
-}
-
-/// Cached evaluation: if threefold, return 0, else look up in transposition table.
-/// If not found, compute via `eval_board`, insert into the table, and return.
-fn cache_eval(board: &Board, transpo_table: &TranspositionTable, nnue_state: &NNUEState) -> i32 {
-    let zob = board.get_hash();
-    if let Some(entry) = transpo_table.probe(zob) {
-        if let Some(cached) = entry.eval {
-            return cached;
-        }
-    }
-    nnue_state.evaluate(board.side_to_move())
 }
 
 #[inline]
