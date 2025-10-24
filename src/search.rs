@@ -294,13 +294,7 @@ fn quiesce_negamax_it(
         let new_board = board_do_move(board, mv, ctx.repetition);
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
-        let score = -quiesce_negamax_it(
-            ctx,
-            &new_board,
-            -beta,
-            -alpha,
-            ply_from_root + 1,
-        );
+        let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
         board_pop(&new_board, ctx.repetition);
         ctx.nnue.pop();
 
@@ -755,13 +749,7 @@ fn negamax_it(
     }
 
     if depth <= 0 {
-        return SearchScore::EVAL(quiesce_negamax_it(
-            ctx,
-            board,
-            alpha,
-            beta,
-            ply_from_root,
-        ));
+        return SearchScore::EVAL(quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root));
     }
 
     let depth_remaining = depth;
@@ -872,28 +860,13 @@ fn negamax_it(
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
-        let new_board = board_do_move(board, mv, ctx.repetition);
 
-        let is_capture =
-            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
-        let gives_check = new_board.checkers().popcnt() > 0;
+        let is_tactical = incremental_move_gen.is_tactical_phase();
         let is_first_move = move_idx == 0;
-        let child_is_pv_node = is_pv_node && is_first_move;
-
-        let mut extension: i16 = 0;
-        if gives_check && depth_remaining <= CHECK_EXTENSION_DEPTH_LIMIT && depth_remaining > 0 {
-            extension = 1;
-        } else if depth_remaining <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
-            && depth_remaining > 0
-            && is_passed_pawn_push(board, &new_board, mv)
-        {
-            extension = 1;
-        }
 
         if depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH
-            && !is_capture
+            && !is_tactical
             && !in_check
-            && !gives_check
             && !is_first_move
             && alpha != NEG_INFINITY
             && beta != POS_INFINITY
@@ -906,6 +879,22 @@ fn negamax_it(
                 ctx.repetition.pop();
                 continue;
             }
+        }
+
+        let new_board = board_do_move(board, mv, ctx.repetition);
+        let gives_check = new_board.checkers().popcnt() > 0;
+        let child_is_pv_node = is_pv_node && is_first_move;
+        let is_capture =
+            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
+
+        let mut extension: i16 = 0;
+        if gives_check && depth_remaining <= CHECK_EXTENSION_DEPTH_LIMIT && depth_remaining > 0 {
+            extension = 1;
+        } else if depth_remaining <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
+            && depth_remaining > 0
+            && is_passed_pawn_push(board, &new_board, mv)
+        {
+            extension = 1;
         }
 
         let apply_lmr =

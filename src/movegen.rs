@@ -176,6 +176,13 @@ impl<'a> IncrementalMoveGen<'a> {
     pub fn is_over(&self) -> bool {
         !self.has_legal_moves
     }
+
+    pub fn is_tactical_phase(&self) -> bool {
+        match self.phase {
+            MoveGenPhase::BadQuiet | MoveGenPhase::Done => false,
+            _ => true,
+        }
+    }
 }
 
 impl Iterator for IncrementalMoveGen<'_> {
