@@ -1,9 +1,11 @@
-use crate::search::see_for_sort;
+use crate::search::{see_for_sort, HistoryTable};
 use crate::TranspositionTable;
-use chess::{BitBoard, Board, ChessMove, MoveGen, EMPTY};
+use chess::{BitBoard, Board, ChessMove, Color, MoveGen, EMPTY};
 use smallvec::SmallVec;
 
 type MoveList = SmallVec<[ChessMove; 64]>;
+
+const PROMOTION_HISTORY_BONUS: i32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MoveGenPhase {
@@ -21,6 +23,7 @@ pub struct IncrementalMoveGen<'a> {
     killer_moves: [Option<ChessMove>; 2],
     move_gen_iter: MoveGen,
     phase: MoveGenPhase,
+    side_to_move: Color,
     has_legal_moves: bool,
     capture_gen_pending: bool,
     captures_generated: bool,
@@ -62,6 +65,7 @@ impl<'a> IncrementalMoveGen<'a> {
             captures_generated: false,
             quiet_generated: false,
             move_gen_iter: probe_iter,
+            side_to_move: board.side_to_move(),
             good_captures: MoveList::new(),
             bad_captures: MoveList::new(),
             killer_quiet: MoveList::new(),
@@ -115,15 +119,15 @@ impl<'a> IncrementalMoveGen<'a> {
             .extend(bad_scored.into_iter().map(|(mv, _)| mv));
     }
 
-    fn ensure_quiet(&mut self) {
+    fn ensure_quiet(&mut self, history: &HistoryTable) {
         if self.quiet_generated {
             return;
         }
         self.quiet_generated = true;
 
         let mut killer_hits: MoveList = MoveList::new();
-        let mut good_quiet: MoveList = MoveList::new();
-        let mut bad_quiet: MoveList = MoveList::new();
+        let mut good_scored: SmallVec<[(ChessMove, i32); 32]> = SmallVec::new();
+        let mut bad_scored: SmallVec<[(ChessMove, i32); 64]> = SmallVec::new();
         let mut killer_seen = [false; 2];
 
         self.move_gen_iter.set_iterator_mask(!EMPTY);
@@ -151,16 +155,22 @@ impl<'a> IncrementalMoveGen<'a> {
                 continue;
             }
 
+            let mut score = history.score(self.side_to_move, mv);
             if mv.get_promotion().is_some() {
-                good_quiet.push(mv);
+                score += PROMOTION_HISTORY_BONUS;
+                good_scored.push((mv, score));
             } else {
-                bad_quiet.push(mv);
+                bad_scored.push((mv, score));
             }
         }
 
         self.killer_quiet = killer_hits;
-        self.good_quiet = good_quiet;
-        self.bad_quiet = bad_quiet;
+        good_scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        bad_scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        self.good_quiet
+            .extend(good_scored.into_iter().map(|(mv, _)| mv));
+        self.bad_quiet
+            .extend(bad_scored.into_iter().map(|(mv, _)| mv));
     }
 
     pub fn take_capture_generation_event(&mut self) -> bool {
@@ -176,12 +186,8 @@ impl<'a> IncrementalMoveGen<'a> {
     pub fn is_over(&self) -> bool {
         !self.has_legal_moves
     }
-}
 
-impl Iterator for IncrementalMoveGen<'_> {
-    type Item = ChessMove;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub fn next(&mut self, history: &HistoryTable) -> Option<ChessMove> {
         loop {
             match self.phase {
                 MoveGenPhase::TTMove => {
@@ -200,7 +206,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                     self.phase = MoveGenPhase::GoodQuiet;
                 }
                 MoveGenPhase::GoodQuiet => {
-                    self.ensure_quiet();
+                    self.ensure_quiet(history);
                     if self.killer_quiet_idx < self.killer_quiet.len() {
                         let mv = self.killer_quiet[self.killer_quiet_idx];
                         self.killer_quiet_idx += 1;
@@ -223,7 +229,7 @@ impl Iterator for IncrementalMoveGen<'_> {
                     self.phase = MoveGenPhase::BadQuiet;
                 }
                 MoveGenPhase::BadQuiet => {
-                    self.ensure_quiet();
+                    self.ensure_quiet(history);
                     if self.bad_quiet_idx < self.bad_quiet.len() {
                         let mv = self.bad_quiet[self.bad_quiet_idx];
                         self.bad_quiet_idx += 1;
