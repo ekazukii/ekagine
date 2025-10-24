@@ -855,6 +855,7 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
+    let fmargin = futility_margin(depth_remaining);
     let mut move_idx: usize = 0;
     while let Some(mv) = incremental_move_gen.next() {
         if incremental_move_gen.take_capture_generation_event() {
@@ -872,9 +873,9 @@ fn negamax_it(
             && beta != POS_INFINITY
             && !is_mate_score(alpha)
         {
-            let margin = futility_margin(depth_remaining);
-            if eval + margin <= alpha {
+            if eval + fmargin <= alpha {
                 ctx.stats.futility_prunes += 1;
+                move_idx += 1;
                 continue;
             }
         }
