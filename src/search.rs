@@ -179,6 +179,76 @@ impl KillerTable {
     }
 }
 
+const HISTORY_CAP: i32 = 1 << 20;
+
+#[derive(Debug, Clone)]
+pub struct HistoryTable {
+    entries: [[[i32; 64]; 64]; 2],
+}
+
+impl HistoryTable {
+    pub fn new() -> Self {
+        Self {
+            entries: [[[0; 64]; 64]; 2],
+        }
+    }
+
+    #[inline]
+    pub fn score(&self, color: Color, mv: ChessMove) -> i32 {
+        let color_idx = color.to_index();
+        let from = mv.get_source().to_index() as usize;
+        let to = mv.get_dest().to_index() as usize;
+        self.entries[color_idx][from][to]
+    }
+
+    #[inline]
+    fn update(&mut self, color: Color, mv: ChessMove, delta: i32) {
+        let color_idx = color.to_index();
+        let from = mv.get_source().to_index() as usize;
+        let to = mv.get_dest().to_index() as usize;
+        let entry = &mut self.entries[color_idx][from][to];
+        *entry = (*entry + delta).clamp(-HISTORY_CAP, HISTORY_CAP);
+    }
+
+    pub fn reward(&mut self, color: Color, mv: ChessMove, depth: i16) {
+        let bonus = history_bonus(depth);
+        if bonus > 0 {
+            self.update(color, mv, bonus);
+        }
+    }
+
+    pub fn reward_soft(&mut self, color: Color, mv: ChessMove, depth: i16) {
+        let bonus = history_bonus(depth) / 2;
+        if bonus > 0 {
+            self.update(color, mv, bonus.max(1));
+        }
+    }
+
+    pub fn penalize(&mut self, color: Color, mv: ChessMove, depth: i16) {
+        let malus = history_malus(depth);
+        if malus > 0 {
+            self.update(color, mv, -malus);
+        }
+    }
+}
+
+impl Default for HistoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[inline]
+fn history_bonus(depth: i16) -> i32 {
+    let d = depth.max(1) as i32;
+    d * d
+}
+
+#[inline]
+fn history_malus(depth: i16) -> i32 {
+    history_bonus(depth).max(1) / 2
+}
+
 // ----------------------------------------------------------------------------
 // Mate distance scoring helpers
 // ----------------------------------------------------------------------------
@@ -329,13 +399,7 @@ fn quiesce_negamax_it(
         let new_board = board_do_move(board, mv, ctx.repetition);
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
-        let score = -quiesce_negamax_it(
-            ctx,
-            &new_board,
-            -beta,
-            -alpha,
-            ply_from_root + 1,
-        );
+        let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
         board_pop(&new_board, ctx.repetition);
         ctx.nnue.pop();
 
@@ -778,13 +842,7 @@ fn negamax_it(
     }
 
     if depth <= 0 {
-        return SearchScore::EVAL(quiesce_negamax_it(
-            ctx,
-            board,
-            alpha,
-            beta,
-            ply_from_root,
-        ));
+        return SearchScore::EVAL(quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root));
     }
 
     let depth_remaining = depth;
@@ -854,16 +912,15 @@ fn negamax_it(
     let mut best_value = NEG_INFINITY;
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
+    let mover = board.side_to_move();
 
-    let static_eval =
-        if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-            let eval = ctx.nnue.evaluate(board.side_to_move());
-            tt_eval_hint = Some(eval);
-            Some(eval)
-        } else {
-            None
-        };
-
+    let static_eval = if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
+        let eval = ctx.nnue.evaluate(board.side_to_move());
+        tt_eval_hint = Some(eval);
+        Some(eval)
+    } else {
+        None
+    };
 
     if let Some(stand_pat) = static_eval {
         if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
@@ -893,19 +950,23 @@ fn negamax_it(
 
     let (can_fp, fp_val) = if let Some(stand_pat) = static_eval {
         let margin = futility_margin(depth_remaining);
-        (!in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH, stand_pat + margin)
+        (
+            !in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH,
+            stand_pat + margin,
+        )
     } else {
         (false, POS_INFINITY)
     };
 
     let mut move_idx: usize = 0;
-    while let Some(mv) = incremental_move_gen.next() {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
 
         let is_capture =
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
+        let is_quiet = !is_capture;
         let is_first_move = move_idx == 0;
 
         if can_fp
@@ -922,7 +983,6 @@ fn negamax_it(
         }
 
         let new_board = board_do_move(board, mv, ctx.repetition);
-
 
         let gives_check = new_board.checkers().popcnt() > 0;
         let child_is_pv_node = is_pv_node && is_first_move;
@@ -1036,18 +1096,30 @@ fn negamax_it(
 
         let value = value_opt.unwrap();
 
-        if value > best_value {
+        let was_new_best = value > best_value;
+        if was_new_best {
             best_value = value;
             best_move_opt = Some(mv);
         }
 
         if value >= beta {
+            if is_quiet {
+                ctx.history.reward(mover, mv, depth_remaining);
+            }
             if !is_capture && !gives_check {
                 ctx.killers.record(ply_index, mv);
             }
             ctx.stats.beta_cutoffs += 1;
             ctx.repetition.pop();
             break;
+        }
+
+        if was_new_best {
+            if is_quiet {
+                ctx.history.reward_soft(mover, mv, depth_remaining);
+            }
+        } else if is_quiet {
+            ctx.history.penalize(mover, mv, depth_remaining);
         }
 
         if value > alpha {
@@ -1168,6 +1240,7 @@ fn root_search_with_window(
     stop: &StopFlag,
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
+    history_table: &mut HistoryTable,
     alpha_start: i32,
     beta_start: i32,
 ) -> RootSearchResult {
@@ -1194,32 +1267,38 @@ fn root_search_with_window(
         stats,
         repetition: repetition_table,
         killers: &mut killer_table,
+        history: history_table,
         nnue: nnue_state,
     };
     let mut out = io::stdout();
 
     let killer_moves = ctx.killers.killers_for(0);
     let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves);
+    let root_mover = board.side_to_move();
 
-    while let Some(mv) = incremental_move_gen.next() {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
         if should_stop(ctx.stop) {
             aborted = true;
             break;
         }
 
         let current_best = best_move.map(|bm| (bm, best_value));
+        let is_capture =
+            board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
+        let is_quiet = !is_capture;
         let new_board = board_do_move(board, mv, ctx.repetition);
         let is_pv_node = best_move.is_none();
         let mut child_depth = max_depth.saturating_sub(1);
 
         child_depth = child_depth.min(i16::MAX as usize);
+        let child_depth_i16 = child_depth as i16;
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
 
         let result = negamax_it(
             &mut ctx,
             &new_board,
-            child_depth as i16,
+            child_depth_i16,
             -beta,
             -alpha,
             1,
@@ -1236,6 +1315,7 @@ fn root_search_with_window(
             }
             SearchScore::EVAL(v) => {
                 let value = -v;
+                let was_new_best = value > best_value;
 
                 if value > best_value {
                     log_root_best_update(&mut out, max_depth, &mv, value, current_best);
@@ -1244,6 +1324,16 @@ fn root_search_with_window(
                 }
                 if value > alpha {
                     alpha = value;
+                }
+
+                if is_quiet {
+                    if value >= beta {
+                        ctx.history.reward(root_mover, mv, child_depth_i16);
+                    } else if was_new_best {
+                        ctx.history.reward_soft(root_mover, mv, child_depth_i16);
+                    } else {
+                        ctx.history.penalize(root_mover, mv, child_depth_i16);
+                    }
                 }
 
                 if alpha >= beta {
@@ -1308,6 +1398,7 @@ fn aspiration_root_search(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
+    history_table: &mut HistoryTable,
 ) -> RootSearchResult {
     if prev_score.is_none() {
         return root_search_with_window(
@@ -1318,6 +1409,7 @@ fn aspiration_root_search(
             stop,
             stats,
             nnue_state,
+            history_table,
             NEG_INFINITY,
             POS_INFINITY,
         );
@@ -1338,6 +1430,7 @@ fn aspiration_root_search(
             stop,
             stats,
             nnue_state,
+            history_table,
             alpha,
             beta,
         );
@@ -1376,6 +1469,7 @@ struct ThreadContext<'a> {
     stats: &'a mut SearchStats,
     repetition: &'a mut RepetitionTable,
     killers: &'a mut KillerTable,
+    history: &'a mut HistoryTable,
     nnue: &'a mut NNUEState,
 }
 
@@ -1396,6 +1490,7 @@ where
     let mut best_score = 0;
     let mut prev_score: Option<i32> = None;
     let mut stats_prev = *stats;
+    let mut history_table = HistoryTable::new();
 
     for depth in 1..=max_depth {
         if should_stop(stop) {
@@ -1414,6 +1509,7 @@ where
             stats,
             nnue_state,
             prev_score,
+            &mut history_table,
         );
 
         if let Some(bm) = result.best_move {
