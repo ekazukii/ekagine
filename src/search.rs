@@ -460,6 +460,7 @@ const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
+const SEE_PRUNE_MAX_DEPTH: i16 = 6;
 
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
@@ -968,6 +969,18 @@ fn negamax_it(
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let is_quiet = !is_capture;
         let is_first_move = move_idx == 0;
+
+        if is_capture
+            && depth_remaining <= SEE_PRUNE_MAX_DEPTH
+            && !is_pv_node
+            && !in_check
+            && !is_first_move
+        {
+            if static_exchange_eval(board, mv) < 0 {
+                move_idx += 1;
+                continue;
+            }
+        }
 
         if can_fp
             && !is_capture
