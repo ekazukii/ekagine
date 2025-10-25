@@ -4,7 +4,7 @@ use chess::{Board, ChessMove, Color, Piece, Square};
 /// Network is initialized at compile time from the 'net.bin' file in thie bins directory.
 /// The code is based on the code of Carp and Viridithas adpated to work with the chess crate
 /// Most likely this can be copy-pasted for any other engine that use the chess crate
-use std::alloc;
+use std::{alloc, array};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
@@ -261,6 +261,7 @@ impl NNUEState {
     /// with Squared CReLu and multiplies activation by weight. The result is the sum of all these
     /// with the bias.
     /// Since we are squaring activations, we need an extra quantization pass with QA.
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "neon")))]
     pub fn evaluate(&self, side: Color) -> Eval {
         let acc = &self.accumulator_stack[self.current_acc];
 
@@ -278,6 +279,62 @@ impl NNUEState {
         }
 
         ((out / QA + MODEL.output_bias as i32) * SCALE / QAB) as Eval
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_feature = "neon"))]
+    pub fn evaluate(&self, side: Color) -> Eval {
+        use std::arch::aarch64::*;
+        let acc = &self.accumulator_stack[self.current_acc];
+        let (us, them) = match side {
+            Color::White => (acc.white, acc.black),
+            Color::Black => (acc.black, acc.white),
+        };
+        pub type VecI16 = int16x8_t;
+        pub type VecI32 = int32x4_t;
+        pub const VEC_I16_SIZE: usize = size_of::<VecI16>() / size_of::<i16>();
+
+        unsafe {
+            let cr_min = vdupq_n_s16(CR_MIN);
+            let cr_max = vdupq_n_s16(CR_MAX);
+            let mut sum_us: [VecI32; 8] = [unsafe { vdupq_n_s32(0) }; 8];
+            let mut sum_them: [VecI32; 8] = [unsafe { vdupq_n_s32(0) }; 8];
+
+            let acc_us_ptr = us.as_ptr();
+            let acc_them_ptr = them.as_ptr();
+            let weights1_ptr = MODEL.output_weights.as_ptr();
+            let weights2_ptr = MODEL.output_weights.as_ptr().add(HIDDEN);
+
+            for i in (0..HIDDEN).step_by(8) {
+                let x1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_us_ptr.add(i * VEC_I16_SIZE)) });
+                let x2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_them_ptr.add(i * VEC_I16_SIZE)) });
+                let w1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights1_ptr.add(i * VEC_I16_SIZE)) });
+                let w2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights2_ptr.add(i * VEC_I16_SIZE)) });
+
+                let v1: [VecI16; 8] = array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x1[i], cr_min)) });
+                let v2: [VecI16; 8] = array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x2[i], cr_min)) });
+
+                let vw1: [VecI16; 8] = array::from_fn(|i| unsafe { vmulq_s16(v1[i], w1[i]) });
+                let vw2: [VecI16; 8] = array::from_fn(|i| unsafe { vmulq_s16(v2[i], w2[i]) });
+
+                let sum_lo_us: [VecI32; 8] =
+                    array::from_fn(|i| unsafe { vmlal_s16(sum_us[i], vget_low_s16(v1[i]), vget_low_s16(vw1[i])) });
+                sum_us = array::from_fn(|i| unsafe { vmlal_high_s16(sum_lo_us[i], v1[i], vw1[i]) });
+
+                let sum_lo_them: [VecI32; 8] =
+                    array::from_fn(|i| unsafe { vmlal_s16(sum_them[i], vget_low_s16(v2[i]), vget_low_s16(vw2[i])) });
+                sum_them = array::from_fn(|i| unsafe { vmlal_high_s16(sum_lo_them[i], v2[i], vw2[i]) });
+            }
+
+            let val: [VecI32; 8] = array::from_fn(|i| unsafe { vaddq_s32(sum_us[i], sum_them[i]) });
+
+            let mut sum = val[0];
+            for v in val.iter().take(8).skip(1) {
+                sum = unsafe { vaddq_s32(sum, *v) };
+            }
+            let out = vaddvq_s32(sum);
+
+            ((out / QA + MODEL.output_bias as i32) * SCALE / QAB) as Eval
+        }
     }
 }
 
