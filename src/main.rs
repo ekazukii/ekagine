@@ -242,7 +242,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v2.3.2");
+                send_message(&mut stdout, "id name Ekagine-v2.4.0");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(
                     &mut stdout,
@@ -532,7 +532,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 RepetitionTable::new(key.get_hash()),
                 Arc::clone(&transpo_table),
                 None,
-                EngineOptions::default().threads,
+                1,
             )
         });
 
