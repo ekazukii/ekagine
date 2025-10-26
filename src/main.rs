@@ -623,6 +623,10 @@ fn main() {
     match args[1].as_str() {
         "--version" => {
             println!("Version: {}", VERSION);
+            #[cfg(any(target_arch = "aarch64", target_feature = "neon"))]
+            {
+                println!("Compiled with NEON SIMD support");
+            }
         }
 
         "--uci" => {
