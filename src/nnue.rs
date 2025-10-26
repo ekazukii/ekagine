@@ -1,12 +1,12 @@
 use chess::{Board, ChessMove, Color, Piece, Square};
+use std::mem;
+use std::ops::{Deref, DerefMut};
 /// NNUE Implementation
 /// We use a simple architecture (768->1024)x2->1 perspective net architecture
 /// Network is initialized at compile time from the 'net.bin' file in thie bins directory.
 /// The code is based on the code of Carp and Viridithas adpated to work with the chess crate
 /// Most likely this can be copy-pasted for any other engine that use the chess crate
 use std::{alloc, array};
-use std::mem;
-use std::ops::{Deref, DerefMut};
 
 const MAX_DEPTH: usize = 128;
 
@@ -305,24 +305,37 @@ impl NNUEState {
             let weights2_ptr = MODEL.output_weights.as_ptr().add(HIDDEN);
 
             for index in (0..HIDDEN).step_by(8 * VEC_I16_SIZE) {
-                let x1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_us_ptr.add((i * VEC_I16_SIZE) + index)) });
-                let x2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_them_ptr.add((i * VEC_I16_SIZE) + index)) });
-                let w1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights1_ptr.add((i * VEC_I16_SIZE) + index)) });
-                let w2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights2_ptr.add((i * VEC_I16_SIZE) + index)) });
+                let x1: [VecI16; 8] = array::from_fn(|i| unsafe {
+                    vld1q_s16(acc_us_ptr.add((i * VEC_I16_SIZE) + index))
+                });
+                let x2: [VecI16; 8] = array::from_fn(|i| unsafe {
+                    vld1q_s16(acc_them_ptr.add((i * VEC_I16_SIZE) + index))
+                });
+                let w1: [VecI16; 8] = array::from_fn(|i| unsafe {
+                    vld1q_s16(weights1_ptr.add((i * VEC_I16_SIZE) + index))
+                });
+                let w2: [VecI16; 8] = array::from_fn(|i| unsafe {
+                    vld1q_s16(weights2_ptr.add((i * VEC_I16_SIZE) + index))
+                });
 
-                let v1: [VecI16; 8] = array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x1[i], cr_min)) });
-                let v2: [VecI16; 8] = array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x2[i], cr_min)) });
+                let v1: [VecI16; 8] =
+                    array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x1[i], cr_min)) });
+                let v2: [VecI16; 8] =
+                    array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x2[i], cr_min)) });
 
                 let vw1: [VecI16; 8] = array::from_fn(|i| unsafe { vmulq_s16(v1[i], w1[i]) });
                 let vw2: [VecI16; 8] = array::from_fn(|i| unsafe { vmulq_s16(v2[i], w2[i]) });
 
-                let sum_lo_us: [VecI32; 8] =
-                    array::from_fn(|i| unsafe { vmlal_s16(sum_us[i], vget_low_s16(v1[i]), vget_low_s16(vw1[i])) });
+                let sum_lo_us: [VecI32; 8] = array::from_fn(|i| unsafe {
+                    vmlal_s16(sum_us[i], vget_low_s16(v1[i]), vget_low_s16(vw1[i]))
+                });
                 sum_us = array::from_fn(|i| unsafe { vmlal_high_s16(sum_lo_us[i], v1[i], vw1[i]) });
 
-                let sum_lo_them: [VecI32; 8] =
-                    array::from_fn(|i| unsafe { vmlal_s16(sum_them[i], vget_low_s16(v2[i]), vget_low_s16(vw2[i])) });
-                sum_them = array::from_fn(|i| unsafe { vmlal_high_s16(sum_lo_them[i], v2[i], vw2[i]) });
+                let sum_lo_them: [VecI32; 8] = array::from_fn(|i| unsafe {
+                    vmlal_s16(sum_them[i], vget_low_s16(v2[i]), vget_low_s16(vw2[i]))
+                });
+                sum_them =
+                    array::from_fn(|i| unsafe { vmlal_high_s16(sum_lo_them[i], v2[i], vw2[i]) });
             }
 
             let val: [VecI32; 8] = array::from_fn(|i| unsafe { vaddq_s32(sum_us[i], sum_them[i]) });

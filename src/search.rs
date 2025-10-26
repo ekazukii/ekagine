@@ -848,10 +848,10 @@ fn negamax_it(
 
     let depth_remaining = depth;
     let zob = board.get_hash();
-    let mut tt_eval_hint = None;
-    if let Some(entry) = ctx.tt.probe(zob) {
+
+    let tt_hit = ctx.tt.probe(zob);
+    if let Some(entry) = tt_hit {
         ctx.stats.tt_hits += 1;
-        tt_eval_hint = entry.eval;
         if entry.depth >= depth_remaining {
             let tt_score = tt_score_on_load(entry.score, ply_from_root);
             match entry.flag {
@@ -910,31 +910,32 @@ fn negamax_it(
         }
     }
 
+    let eval = if let Some(hit) = tt_hit {
+        if let Some(tt_eval) = hit.eval {
+            tt_eval
+        } else {
+            ctx.nnue.evaluate(board.side_to_move())
+        }
+    } else {
+        ctx.nnue.evaluate(board.side_to_move())
+    };
+
     let mut best_value = NEG_INFINITY;
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
     let mover = board.side_to_move();
 
-    let static_eval = if !in_check && depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH {
-        let eval = ctx.nnue.evaluate(board.side_to_move());
-        tt_eval_hint = Some(eval);
-        Some(eval)
-    } else {
-        None
-    };
-
-    if let Some(stand_pat) = static_eval {
-        if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
-            && !is_pv_node
-            && alpha != NEG_INFINITY
-            && beta != POS_INFINITY
-            && !is_mate_score(beta)
-            && !is_mate_score(stand_pat)
-            && stand_pat >= beta.saturating_add(reverse_futility_margin(depth_remaining))
-        {
-            ctx.stats.reverse_futility_prunes += 1;
-            return SearchScore::EVAL(beta);
-        }
+    if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
+        && !in_check
+        && !is_pv_node
+        && alpha != NEG_INFINITY
+        && beta != POS_INFINITY
+        && !is_mate_score(beta)
+        && !is_mate_score(eval)
+        && eval >= beta.saturating_add(reverse_futility_margin(depth_remaining))
+    {
+        ctx.stats.reverse_futility_prunes += 1;
+        return SearchScore::EVAL(beta);
     }
 
     ctx.stats.incremental_move_gen_inits += 1;
@@ -949,14 +950,11 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
-    let (can_fp, fp_val) = if let Some(stand_pat) = static_eval {
-        let margin = futility_margin(depth_remaining);
-        (
-            !in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH,
-            stand_pat + margin,
-        )
+    let can_fp = !in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH;
+    let fp_val = if can_fp {
+        eval + futility_margin(depth_remaining)
     } else {
-        (false, POS_INFINITY)
+        POS_INFINITY
     };
 
     let mut move_idx: usize = 0;
@@ -1161,7 +1159,7 @@ fn negamax_it(
         stored,
         bound,
         best_move_opt,
-        tt_eval_hint,
+        Some(eval),
     );
 
     SearchScore::EVAL(best_value)
