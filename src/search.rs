@@ -876,13 +876,25 @@ fn negamax_it(
         }
     }
 
+    let eval = if let Some(hit) = tt_hit {
+        if let Some(tt_eval) = hit.eval {
+            tt_eval
+        } else {
+            ctx.nnue.evaluate(board.side_to_move())
+        }
+    } else {
+        ctx.nnue.evaluate(board.side_to_move())
+    };
+    ctx.search_stack.set(ply_from_root as usize, eval);
+    let is_improving = ctx.search_stack.is_improving(ply_from_root as usize, eval);
+
     let in_check = board.checkers().popcnt() > 0;
     if !is_pv_node
         && !in_check
         && depth_remaining >= 2
         && has_non_pawn_material(board, board.side_to_move())
     {
-        let r: i16 = if depth_remaining >= 6 { 3 } else { 2 };
+        let r: i16 = if depth_remaining >= 6 { 3 } else { 2 } + if is_improving { 1 } else { 0 };
         if let Some(nboard) = board_do_null_move(board, ctx.repetition) {
             ctx.nnue.push();
             let result = negamax_it(
@@ -910,16 +922,6 @@ fn negamax_it(
         }
     }
 
-    let eval = if let Some(hit) = tt_hit {
-        if let Some(tt_eval) = hit.eval {
-            tt_eval
-        } else {
-            ctx.nnue.evaluate(board.side_to_move())
-        }
-    } else {
-        ctx.nnue.evaluate(board.side_to_move())
-    };
-
     let mut best_value = NEG_INFINITY;
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
@@ -932,7 +934,7 @@ fn negamax_it(
         && beta != POS_INFINITY
         && !is_mate_score(beta)
         && !is_mate_score(eval)
-        && eval >= beta.saturating_add(reverse_futility_margin(depth_remaining))
+        && eval >= beta.saturating_add(reverse_futility_margin(depth_remaining)) / if is_improving { 2 } else { 1 }
     {
         ctx.stats.reverse_futility_prunes += 1;
         return SearchScore::EVAL(beta);
@@ -1252,6 +1254,7 @@ fn root_search_with_window(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     history_table: &mut HistoryTable,
+    search_stack: &mut SearchStack,
     alpha_start: i32,
     beta_start: i32,
 ) -> RootSearchResult {
@@ -1280,6 +1283,7 @@ fn root_search_with_window(
         killers: &mut killer_table,
         history: history_table,
         nnue: nnue_state,
+        search_stack,
     };
     let mut out = io::stdout();
 
@@ -1410,6 +1414,7 @@ fn aspiration_root_search(
     nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
+    search_stack: &mut SearchStack
 ) -> RootSearchResult {
     if prev_score.is_none() {
         return root_search_with_window(
@@ -1421,6 +1426,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            search_stack,
             NEG_INFINITY,
             POS_INFINITY,
         );
@@ -1442,6 +1448,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            search_stack,
             alpha,
             beta,
         );
@@ -1482,6 +1489,37 @@ struct ThreadContext<'a> {
     killers: &'a mut KillerTable,
     history: &'a mut HistoryTable,
     nnue: &'a mut NNUEState,
+    search_stack: &'a mut SearchStack
+}
+
+// TODO: Refactor to keep info about last move
+#[derive(Copy, Clone)]
+struct SearchStackEntry {
+    eval: i32,
+}
+
+struct SearchStack {
+    entries: [SearchStackEntry; 64]
+}
+
+impl SearchStack {
+    fn new() -> Self {
+        Self {
+            entries: [SearchStackEntry { eval: 0 }; 64],
+        }
+    }
+
+    fn get(&self, ply: usize) -> &SearchStackEntry {
+        &self.entries[ply]
+    }
+
+    fn set(&mut self, ply: usize, eval: i32) {
+        self.entries[ply].eval = eval;
+    }
+
+    fn is_improving(&self, ply: usize, new_eval: i32) -> bool {
+        ply > 1 && new_eval > self.entries[ply - 2].eval
+    }
 }
 
 fn iterative_deepening_loop<F>(
@@ -1502,6 +1540,7 @@ where
     let mut prev_score: Option<i32> = None;
     let mut stats_prev = *stats;
     let mut history_table = HistoryTable::new();
+    let mut search_stack = SearchStack::new();
 
     for depth in 1..=max_depth {
         if should_stop(stop) {
@@ -1521,6 +1560,7 @@ where
             nnue_state,
             prev_score,
             &mut history_table,
+            &mut search_stack
         );
 
         if let Some(bm) = result.best_move {
