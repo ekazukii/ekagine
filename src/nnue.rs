@@ -286,8 +286,8 @@ impl NNUEState {
         use std::arch::aarch64::*;
         let acc = &self.accumulator_stack[self.current_acc];
         let (us, them) = match side {
-            Color::White => (acc.white, acc.black),
-            Color::Black => (acc.black, acc.white),
+            Color::White => (&acc.white, &acc.black),
+            Color::Black => (&acc.black, &acc.white),
         };
         pub type VecI16 = int16x8_t;
         pub type VecI32 = int32x4_t;
@@ -304,11 +304,11 @@ impl NNUEState {
             let weights1_ptr = MODEL.output_weights.as_ptr();
             let weights2_ptr = MODEL.output_weights.as_ptr().add(HIDDEN);
 
-            for i in (0..HIDDEN).step_by(8) {
-                let x1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_us_ptr.add(i * VEC_I16_SIZE)) });
-                let x2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_them_ptr.add(i * VEC_I16_SIZE)) });
-                let w1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights1_ptr.add(i * VEC_I16_SIZE)) });
-                let w2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights2_ptr.add(i * VEC_I16_SIZE)) });
+            for index in (0..HIDDEN).step_by(8 * VEC_I16_SIZE) {
+                let x1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_us_ptr.add((i * VEC_I16_SIZE) + index)) });
+                let x2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(acc_them_ptr.add((i * VEC_I16_SIZE) + index)) });
+                let w1: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights1_ptr.add((i * VEC_I16_SIZE) + index)) });
+                let w2: [VecI16; 8] = array::from_fn(|i| unsafe { vld1q_s16(weights2_ptr.add((i * VEC_I16_SIZE) + index)) });
 
                 let v1: [VecI16; 8] = array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x1[i], cr_min)) });
                 let v2: [VecI16; 8] = array::from_fn(|i| unsafe { vminq_s16(cr_max, vmaxq_s16(x2[i], cr_min)) });
@@ -579,5 +579,26 @@ mod tests {
         state.apply_move(&board, mv);
 
         assert_accumulators_equal(&state, state.current_acc, &rebuilt, 0);
+    }
+
+    #[test]
+    fn test_evaluate_specific_fen_snapshot() {
+        let board = Board::from_str("1Q2q3/4P3/p1P1n3/5pb1/3p3p/KP5P/3k4/4R1N1 w - - 0 1").unwrap();
+        let state = NNUEState::from_board(&board);
+
+        let eval_white = state.evaluate(Color::White);
+        let eval_black = state.evaluate(Color::Black);
+
+        const EXPECTED_WHITE: Eval = 945;
+        const EXPECTED_BLACK: Eval = -783;
+
+        assert_eq!(
+            eval_white, EXPECTED_WHITE,
+            "snapshot mismatch for white POV (current {eval_white})"
+        );
+        assert_eq!(
+            eval_black, EXPECTED_BLACK,
+            "snapshot mismatch for black POV (current {eval_black})"
+        );
     }
 }
