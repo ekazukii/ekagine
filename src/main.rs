@@ -7,11 +7,9 @@ mod eval;
 mod movegen;
 mod nnue;
 mod search;
-mod tt;
+mod tables;
 
-use crate::search::{
-    best_move_interruptible, best_move_using_iterative_deepening, uci_score_string, SearchStats,
-};
+use crate::search::{best_move, uci_score_string, SearchStats};
 use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
@@ -54,7 +52,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Search Tables keyed by the built‐in Zobrist hash (u64).
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub use tt::{TTEntry, TTFlag, TranspositionTable};
+pub use tables::{TTEntry, TTFlag, TranspositionTable};
 
 pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
     if matches!(board.piece_on(mv.get_source()), Some(Piece::Pawn)) {
@@ -242,7 +240,7 @@ fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                send_message(&mut stdout, "id name Ekagine-v2.5.3");
+                send_message(&mut stdout, "id name Ekagine-v2.5.4");
                 send_message(&mut stdout, "id author BaptisteLoison");
                 send_message(
                     &mut stdout,
@@ -320,11 +318,13 @@ fn uci_loop() {
                         match depth_token.parse::<usize>() {
                             Ok(depth) if depth > 0 => {
                                 let search_start = Instant::now();
-                                let outcome = best_move_using_iterative_deepening(
+                                let outcome = best_move(
                                     &board,
                                     depth,
                                     Arc::clone(&transpo_table),
                                     repetition_table.clone(),
+                                    None,
+                                    None,
                                     options.threads,
                                 );
                                 let elapsed = search_start.elapsed();
@@ -385,12 +385,12 @@ fn uci_loop() {
 
                 let time_budget = choose_time_for_move(&tokens, board.side_to_move());
 
-                let outcome = best_move_interruptible(
+                let outcome = best_move(
                     &board,
-                    time_budget,
                     99,
-                    repetition_table.clone(),
                     Arc::clone(&transpo_table),
+                    repetition_table.clone(),
+                    Some(time_budget),
                     Some(&mut stdout),
                     options.threads,
                 );
@@ -525,12 +525,12 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
     for (key, val) in fen_to_stockfish.iter() {
         let (outcome, duration) = time_fn(|| {
             let transpo_table = Arc::new(TranspositionTable::new());
-            best_move_interruptible(
+            best_move(
                 key,
-                Duration::from_millis(90),
                 1000,
-                RepetitionTable::new(key.get_hash()),
                 Arc::clone(&transpo_table),
+                RepetitionTable::new(key.get_hash()),
+                Some(Duration::from_millis(90)),
                 None,
                 1,
             )
@@ -599,11 +599,13 @@ pub fn compute_best_from_fen(
     let transpo_table = Arc::new(TranspositionTable::new());
     let repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
 
-    let outcome = best_move_using_iterative_deepening(
+    let outcome = best_move(
         &board,
         max_depth,
         Arc::clone(&transpo_table),
         repetition_table,
+        None,
+        None,
         EngineOptions::default().threads,
     );
 

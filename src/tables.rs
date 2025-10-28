@@ -1,4 +1,4 @@
-use chess::{ChessMove, File, Piece, Rank, Square};
+use chess::{ChessMove, Color, File, Piece, Rank, Square};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,4 +384,116 @@ impl Default for TranspositionTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------
+
+const MAX_KILLER_MOVES: usize = 2;
+
+#[derive(Debug, Clone)]
+pub struct KillerTable {
+    moves: Vec<[Option<ChessMove>; MAX_KILLER_MOVES]>,
+}
+
+impl KillerTable {
+    pub fn new(initial_depth: usize) -> Self {
+        let depth = initial_depth.max(1);
+        KillerTable {
+            moves: vec![[None; MAX_KILLER_MOVES]; depth],
+        }
+    }
+
+    fn ensure_capacity(&mut self, ply: usize) {
+        if ply >= self.moves.len() {
+            self.moves.resize(ply + 1, [None; MAX_KILLER_MOVES]);
+        }
+    }
+
+    pub fn killers_for(&mut self, ply: usize) -> [Option<ChessMove>; MAX_KILLER_MOVES] {
+        self.ensure_capacity(ply);
+        self.moves[ply]
+    }
+
+    pub fn record(&mut self, ply: usize, mv: ChessMove) {
+        self.ensure_capacity(ply);
+        let entry = &mut self.moves[ply];
+        if entry.iter().any(|existing| *existing == Some(mv)) {
+            if entry[1] == Some(mv) {
+                entry.swap(0, 1);
+            }
+            return;
+        }
+        entry[1] = entry[0];
+        entry[0] = Some(mv);
+    }
+}
+
+const HISTORY_CAP: i32 = 1 << 20;
+
+#[derive(Debug, Clone)]
+pub struct HistoryTable {
+    entries: [[[i32; 64]; 64]; 2],
+}
+
+impl HistoryTable {
+    pub fn new() -> Self {
+        Self {
+            entries: [[[0; 64]; 64]; 2],
+        }
+    }
+
+    #[inline]
+    pub fn score(&self, color: Color, mv: ChessMove) -> i32 {
+        let color_idx = color.to_index();
+        let from = mv.get_source().to_index() as usize;
+        let to = mv.get_dest().to_index() as usize;
+        self.entries[color_idx][from][to]
+    }
+
+    #[inline]
+    fn update(&mut self, color: Color, mv: ChessMove, delta: i32) {
+        let color_idx = color.to_index();
+        let from = mv.get_source().to_index() as usize;
+        let to = mv.get_dest().to_index() as usize;
+        let entry = &mut self.entries[color_idx][from][to];
+        *entry = (*entry + delta).clamp(-HISTORY_CAP, HISTORY_CAP);
+    }
+
+    pub fn reward(&mut self, color: Color, mv: ChessMove, depth: i16) {
+        let bonus = history_bonus(depth);
+        if bonus > 0 {
+            self.update(color, mv, bonus);
+        }
+    }
+
+    pub fn reward_soft(&mut self, color: Color, mv: ChessMove, depth: i16) {
+        let bonus = history_bonus(depth) / 2;
+        if bonus > 0 {
+            self.update(color, mv, bonus.max(1));
+        }
+    }
+
+    pub fn penalize(&mut self, color: Color, mv: ChessMove, depth: i16) {
+        let malus = history_malus(depth);
+        if malus > 0 {
+            self.update(color, mv, -malus);
+        }
+    }
+}
+
+impl Default for HistoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[inline]
+fn history_bonus(depth: i16) -> i32 {
+    let d = depth.max(1) as i32;
+    d * d
+}
+
+#[inline]
+fn history_malus(depth: i16) -> i32 {
+    history_bonus(depth).max(1) / 2
 }

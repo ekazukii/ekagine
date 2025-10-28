@@ -1,5 +1,8 @@
-use crate::movegen::IncrementalMoveGen;
+use crate::movegen::{
+    is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
+};
 use crate::nnue::NNUEState;
+use crate::tables::{HistoryTable, KillerTable};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
@@ -137,116 +140,6 @@ impl SearchOutcome {
             stats,
         }
     }
-}
-
-const MAX_KILLER_MOVES: usize = 2;
-
-#[derive(Debug, Clone)]
-struct KillerTable {
-    moves: Vec<[Option<ChessMove>; MAX_KILLER_MOVES]>,
-}
-
-impl KillerTable {
-    fn new(initial_depth: usize) -> Self {
-        let depth = initial_depth.max(1);
-        KillerTable {
-            moves: vec![[None; MAX_KILLER_MOVES]; depth],
-        }
-    }
-
-    fn ensure_capacity(&mut self, ply: usize) {
-        if ply >= self.moves.len() {
-            self.moves.resize(ply + 1, [None; MAX_KILLER_MOVES]);
-        }
-    }
-
-    fn killers_for(&mut self, ply: usize) -> [Option<ChessMove>; MAX_KILLER_MOVES] {
-        self.ensure_capacity(ply);
-        self.moves[ply]
-    }
-
-    fn record(&mut self, ply: usize, mv: ChessMove) {
-        self.ensure_capacity(ply);
-        let entry = &mut self.moves[ply];
-        if entry.iter().any(|existing| *existing == Some(mv)) {
-            if entry[1] == Some(mv) {
-                entry.swap(0, 1);
-            }
-            return;
-        }
-        entry[1] = entry[0];
-        entry[0] = Some(mv);
-    }
-}
-
-const HISTORY_CAP: i32 = 1 << 20;
-
-#[derive(Debug, Clone)]
-pub struct HistoryTable {
-    entries: [[[i32; 64]; 64]; 2],
-}
-
-impl HistoryTable {
-    pub fn new() -> Self {
-        Self {
-            entries: [[[0; 64]; 64]; 2],
-        }
-    }
-
-    #[inline]
-    pub fn score(&self, color: Color, mv: ChessMove) -> i32 {
-        let color_idx = color.to_index();
-        let from = mv.get_source().to_index() as usize;
-        let to = mv.get_dest().to_index() as usize;
-        self.entries[color_idx][from][to]
-    }
-
-    #[inline]
-    fn update(&mut self, color: Color, mv: ChessMove, delta: i32) {
-        let color_idx = color.to_index();
-        let from = mv.get_source().to_index() as usize;
-        let to = mv.get_dest().to_index() as usize;
-        let entry = &mut self.entries[color_idx][from][to];
-        *entry = (*entry + delta).clamp(-HISTORY_CAP, HISTORY_CAP);
-    }
-
-    pub fn reward(&mut self, color: Color, mv: ChessMove, depth: i16) {
-        let bonus = history_bonus(depth);
-        if bonus > 0 {
-            self.update(color, mv, bonus);
-        }
-    }
-
-    pub fn reward_soft(&mut self, color: Color, mv: ChessMove, depth: i16) {
-        let bonus = history_bonus(depth) / 2;
-        if bonus > 0 {
-            self.update(color, mv, bonus.max(1));
-        }
-    }
-
-    pub fn penalize(&mut self, color: Color, mv: ChessMove, depth: i16) {
-        let malus = history_malus(depth);
-        if malus > 0 {
-            self.update(color, mv, -malus);
-        }
-    }
-}
-
-impl Default for HistoryTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[inline]
-fn history_bonus(depth: i16) -> i32 {
-    let d = depth.max(1) as i32;
-    d * d
-}
-
-#[inline]
-fn history_malus(depth: i16) -> i32 {
-    history_bonus(depth).max(1) / 2
 }
 
 // ----------------------------------------------------------------------------
@@ -474,259 +367,6 @@ fn reverse_futility_margin(depth: i16) -> i32 {
     0 + FUTILITY_MARGIN_PER_DEPTH * depth
 }
 
-const PIECE_ORDER: [Piece; 6] = [
-    Piece::Pawn,
-    Piece::Knight,
-    Piece::Bishop,
-    Piece::Rook,
-    Piece::Queen,
-    Piece::King,
-];
-
-#[inline]
-fn opposite_color(color: Color) -> Color {
-    match color {
-        Color::White => Color::Black,
-        Color::Black => Color::White,
-    }
-}
-
-#[inline]
-fn piece_value(piece: Piece) -> i32 {
-    match piece {
-        Piece::Pawn => 100,
-        Piece::Knight => 300,
-        Piece::Bishop => 300,
-        Piece::Rook => 500,
-        Piece::Queen => 900,
-        Piece::King => 10_000,
-    }
-}
-
-#[inline]
-fn pawn_attackers_to(square: Square, pawns: BitBoard, color: Color) -> BitBoard {
-    let mut attackers = BitBoard::new(0);
-    match color {
-        Color::White => {
-            if let Some(down) = square.down() {
-                if let Some(left) = down.left() {
-                    let bb = BitBoard::from_square(left);
-                    if (pawns & bb).0 != 0 {
-                        attackers |= bb;
-                    }
-                }
-                if let Some(right) = down.right() {
-                    let bb = BitBoard::from_square(right);
-                    if (pawns & bb).0 != 0 {
-                        attackers |= bb;
-                    }
-                }
-            }
-        }
-        Color::Black => {
-            if let Some(up) = square.up() {
-                if let Some(left) = up.left() {
-                    let bb = BitBoard::from_square(left);
-                    if (pawns & bb).0 != 0 {
-                        attackers |= bb;
-                    }
-                }
-                if let Some(right) = up.right() {
-                    let bb = BitBoard::from_square(right);
-                    if (pawns & bb).0 != 0 {
-                        attackers |= bb;
-                    }
-                }
-            }
-        }
-    }
-    attackers
-}
-
-fn compute_attackers_to(
-    square: Square,
-    occ: BitBoard,
-    piece_bb: &[[BitBoard; 6]; 2],
-) -> [BitBoard; 2] {
-    let mut attackers = [BitBoard::new(0); 2];
-
-    for color in [Color::White, Color::Black] {
-        let idx = color.to_index();
-        let pawns = piece_bb[idx][Piece::Pawn.to_index() as usize];
-        let knights = piece_bb[idx][Piece::Knight.to_index() as usize];
-        let bishops = piece_bb[idx][Piece::Bishop.to_index() as usize];
-        let rooks = piece_bb[idx][Piece::Rook.to_index() as usize];
-        let queens = piece_bb[idx][Piece::Queen.to_index() as usize];
-        let kings = piece_bb[idx][Piece::King.to_index() as usize];
-
-        let mut attack = BitBoard::new(0);
-        attack |= pawn_attackers_to(square, pawns, color);
-        attack |= get_knight_moves(square) & knights;
-        attack |= get_bishop_moves(square, occ) & (bishops | queens);
-        attack |= get_rook_moves(square, occ) & (rooks | queens);
-        attack |= get_king_moves(square) & kings;
-        attackers[idx] = attack;
-    }
-
-    attackers
-}
-
-fn select_least_valuable_attacker(
-    color_idx: usize,
-    attack_mask: BitBoard,
-    piece_bb: &[[BitBoard; 6]; 2],
-) -> Option<(Piece, Square)> {
-    for piece in PIECE_ORDER.iter() {
-        let idx = piece.to_index() as usize;
-        let candidates = piece_bb[color_idx][idx] & attack_mask;
-        if candidates.0 != 0 {
-            let sq = candidates.to_square();
-            return Some((*piece, sq));
-        }
-    }
-    None
-}
-
-pub fn see_for_sort(board: &Board, mv: ChessMove) -> i32 {
-    let captured_val = board
-        .piece_on(mv.get_dest())
-        .map(piece_value)
-        .unwrap_or_else(|| piece_value(Piece::Pawn));
-
-    let current_val = match mv.get_promotion() {
-        Some(prom) => piece_value(prom) - piece_value(Piece::Pawn),
-        None => piece_value(board.piece_on(mv.get_source()).unwrap()),
-    };
-
-    // If first capture is already good or equal no need to go later
-    if captured_val >= current_val {
-        return captured_val - current_val;
-    }
-
-    // For "bad" captures we check if really bad with static exchange evaluation
-    static_exchange_eval(board, mv)
-}
-
-fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
-    let from = mv.get_source();
-    let to = mv.get_dest();
-
-    let moving_piece = match board.piece_on(from) {
-        Some(p) => p,
-        None => return 0,
-    };
-    let captured_piece = if is_en_passant_capture(board, mv) {
-        Some(Piece::Pawn)
-    } else {
-        board.piece_on(to)
-    };
-    if captured_piece.is_none() {
-        return 0;
-    }
-    let captured_piece = captured_piece.unwrap();
-
-    let mut occ = *board.combined();
-    let mut piece_bb = [[BitBoard::new(0); 6]; 2];
-    for piece in PIECE_ORDER.iter() {
-        let idx = piece.to_index() as usize;
-        let bb = *board.pieces(*piece);
-        piece_bb[Color::White.to_index()][idx] = bb & *board.color_combined(Color::White);
-        piece_bb[Color::Black.to_index()][idx] = bb & *board.color_combined(Color::Black);
-    }
-
-    let us = board.side_to_move();
-    let them = opposite_color(us);
-    let us_idx = us.to_index();
-    let them_idx = them.to_index();
-
-    let from_bb = BitBoard::from_square(from);
-    let to_bb = BitBoard::from_square(to);
-
-    // Remove moving piece from its origin square
-    piece_bb[us_idx][moving_piece.to_index() as usize] &= !from_bb;
-    occ &= !from_bb;
-
-    // Remove captured piece
-    if is_en_passant_capture(board, mv) {
-        if let Some(capture_sq) = to.backward(us) {
-            let cap_bb = BitBoard::from_square(capture_sq);
-            piece_bb[them_idx][Piece::Pawn.to_index() as usize] &= !cap_bb;
-            occ &= !cap_bb;
-        }
-    } else {
-        piece_bb[them_idx][captured_piece.to_index() as usize] &= !to_bb;
-        occ &= !to_bb;
-    }
-
-    // Place moving piece on the destination square (handle promotion)
-    let mut current_piece = mv.get_promotion().unwrap_or(moving_piece);
-    piece_bb[us_idx][current_piece.to_index() as usize] |= to_bb;
-    occ |= to_bb;
-
-    let mut gain = [0i32; 32];
-    gain[0] = piece_value(captured_piece);
-
-    let mut attackers = compute_attackers_to(to, occ, &piece_bb);
-    let mut depth = 0usize;
-    let mut side_idx = them_idx;
-
-    while depth < gain.len() - 1 {
-        let attack_mask = attackers[side_idx] & occ;
-        if attack_mask.0 == 0 {
-            break;
-        }
-
-        depth += 1;
-        let captured_value = piece_value(current_piece);
-
-        let (att_piece, att_square) =
-            match select_least_valuable_attacker(side_idx, attack_mask, &piece_bb) {
-                Some(v) => v,
-                None => break,
-            };
-
-        gain[depth] = captured_value - gain[depth - 1];
-        if gain[depth] < 0 {
-            break;
-        }
-
-        let captured_side_idx = 1 - side_idx;
-        piece_bb[captured_side_idx][current_piece.to_index() as usize] &= !to_bb;
-        occ &= !to_bb;
-
-        let att_bb = BitBoard::from_square(att_square);
-        piece_bb[side_idx][att_piece.to_index() as usize] &= !att_bb;
-        occ &= !att_bb;
-
-        piece_bb[side_idx][att_piece.to_index() as usize] |= to_bb;
-        occ |= to_bb;
-
-        current_piece = att_piece;
-        attackers = compute_attackers_to(to, occ, &piece_bb);
-        side_idx ^= 1;
-    }
-
-    while depth > 0 {
-        gain[depth - 1] = -cmp::max(-gain[depth - 1], gain[depth]);
-        depth -= 1;
-    }
-
-    gain[0]
-}
-
-#[inline]
-fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
-    // En passant is a pawn move to the ep square capturing a pawn that isn't on dest.
-    // chess::Board exposes the en-passant target square via `en_passant()` in recent versions.
-    // We conservatively detect: moving piece is a pawn, destination equals ep square.
-    if let Some(Piece::Pawn) = board.piece_on(mv.get_source()) {
-        if let Some(ep_sq) = board.en_passant() {
-            return mv.get_dest() == ep_sq;
-        }
-    }
-    false
-}
-
 #[inline]
 fn is_passed_pawn(board: &Board, square: Square, color: Color) -> bool {
     let enemy_color = match color {
@@ -934,7 +574,9 @@ fn negamax_it(
         && beta != POS_INFINITY
         && !is_mate_score(beta)
         && !is_mate_score(eval)
-        && eval >= beta.saturating_add(reverse_futility_margin(depth_remaining)) / if is_improving { 2 } else { 1 }
+        && eval
+            >= beta.saturating_add(reverse_futility_margin(depth_remaining))
+                / if is_improving { 2 } else { 1 }
     {
         ctx.stats.reverse_futility_prunes += 1;
         return SearchScore::EVAL(beta);
@@ -1414,7 +1056,7 @@ fn aspiration_root_search(
     nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
-    search_stack: &mut SearchStack
+    search_stack: &mut SearchStack,
 ) -> RootSearchResult {
     if prev_score.is_none() {
         return root_search_with_window(
@@ -1489,7 +1131,7 @@ struct ThreadContext<'a> {
     killers: &'a mut KillerTable,
     history: &'a mut HistoryTable,
     nnue: &'a mut NNUEState,
-    search_stack: &'a mut SearchStack
+    search_stack: &'a mut SearchStack,
 }
 
 // TODO: Refactor to keep info about last move
@@ -1499,7 +1141,7 @@ struct SearchStackEntry {
 }
 
 struct SearchStack {
-    entries: [SearchStackEntry; 64]
+    entries: [SearchStackEntry; 64],
 }
 
 impl SearchStack {
@@ -1560,7 +1202,7 @@ where
             nnue_state,
             prev_score,
             &mut history_table,
-            &mut search_stack
+            &mut search_stack,
         );
 
         if let Some(bm) = result.best_move {
@@ -1646,71 +1288,24 @@ fn join_helper_threads(handles: Vec<thread::JoinHandle<()>>) {
     }
 }
 
-/// Compute the best move of a board from a depth limit
+/// Iterative-deepening search that can be optionally bounded by time and/or depth.
+/// If `stdout_opt` is `Some(&mut Stdout)` the routine prints Stockfish-compatible
+/// "info ..." lines through `send_message` during the search.
 #[allow(clippy::too_many_arguments)]
-pub fn best_move_using_iterative_deepening(
+pub fn best_move(
     board: &Board,
     max_depth: usize,
     transpo_table: Arc<TranspositionTable>,
     repetition_table: RepetitionTable,
-    threads: usize,
-) -> SearchOutcome {
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut stats = SearchStats::default();
-    let mut nnue_state = NNUEState::from_board(board);
-    let mut local_repetition = repetition_table.clone();
-
-    let helper_handles = spawn_lazy_smp_helpers(
-        board,
-        max_depth,
-        &transpo_table,
-        repetition_table,
-        threads,
-        &stop,
-    );
-
-    let (best_move, best_score) = iterative_deepening_loop(
-        board,
-        max_depth,
-        transpo_table.as_ref(),
-        &mut local_repetition,
-        &stop,
-        &mut stats,
-        nnue_state.as_mut(),
-        |_| {},
-    );
-
-    stop.store(true, Ordering::Relaxed);
-    join_helper_threads(helper_handles);
-
-    SearchOutcome::new(best_move, best_score, stats)
-}
-
-/// Iterative-deepening search that can be stopped by a time budget.
-/// If `stdout_opt` is `Some(&mut Stdout)` the routine prints Stockfish-
-/// compatible "info ..." lines through your existing `send_message`.
-///
-/// * `board`          – starting position
-/// * `time_budget`    – wall-clock budget (hard stop)
-/// * `max_depth_cap`  – fail-safe depth limit (e.g. 99)
-/// * `stdout_opt`     – `Some(&mut std::io::Stdout)` to enable printing /
-///                      logging, or `None` to run silently.
-///
-/// Returns `(best_move, score_in_cp)`
-pub fn best_move_interruptible(
-    board: &Board,
-    time_budget: Duration,
-    max_depth_cap: usize,
-    repetition_table: RepetitionTable,
-    transpo_table: Arc<TranspositionTable>,
+    time_budget: Option<Duration>,
     mut stdout_opt: Option<&mut Stdout>,
     threads: usize,
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
-    {
+    if let Some(budget) = time_budget {
         let stop_clone = stop.clone();
         thread::spawn(move || {
-            thread::sleep(time_budget);
+            thread::sleep(budget);
             stop_clone.store(true, Ordering::Relaxed);
         });
     }
@@ -1721,7 +1316,7 @@ pub fn best_move_interruptible(
 
     let helper_handles = spawn_lazy_smp_helpers(
         board,
-        max_depth_cap,
+        max_depth,
         &transpo_table,
         repetition_table,
         threads,
@@ -1731,7 +1326,7 @@ pub fn best_move_interruptible(
     let t0 = Instant::now();
     let (best_move, best_score) = iterative_deepening_loop(
         board,
-        max_depth_cap,
+        max_depth,
         transpo_table.as_ref(),
         &mut local_repetition,
         &stop,
@@ -1746,7 +1341,7 @@ pub fn best_move_interruptible(
                 let nodes = report.stats_delta.nodes;
                 let time_ms = t0.elapsed().as_millis() as u64;
                 let nps = if time_ms > 0 {
-                    nodes * 1_000 / time_ms
+                    nodes.saturating_mul(1_000) / time_ms
                 } else {
                     0
                 };
