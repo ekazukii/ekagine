@@ -38,6 +38,7 @@ pub struct SearchStats {
     pub null_move_prunes: u64,
     pub futility_prunes: u64,
     pub reverse_futility_prunes: u64,
+    pub late_move_prunes: u64,
     pub lmr_researches: u64,
     pub incremental_move_gen_inits: u64,
     pub incremental_move_gen_capture_lists: u64,
@@ -63,6 +64,7 @@ impl SearchStats {
             reverse_futility_prunes: self
                 .reverse_futility_prunes
                 .saturating_sub(other.reverse_futility_prunes),
+            late_move_prunes: self.late_move_prunes.saturating_sub(other.late_move_prunes),
             lmr_researches: self.lmr_researches.saturating_sub(other.lmr_researches),
             incremental_move_gen_inits: self
                 .incremental_move_gen_inits
@@ -103,7 +105,7 @@ impl SearchStats {
 
     pub(crate) fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} late_move_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -115,6 +117,7 @@ impl SearchStats {
             self.null_move_prunes,
             self.futility_prunes,
             self.reverse_futility_prunes,
+            self.late_move_prunes,
             self.lmr_researches,
             self.incremental_move_gen_inits,
             self.incremental_move_gen_capture_lists,
@@ -354,6 +357,9 @@ const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
+const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
+const LATE_MOVE_PRUNING_BASE: usize = 4;
+const LATE_MOVE_PRUNING_SCALE: usize = 2;
 
 #[inline]
 fn futility_margin(depth: i16) -> i32 {
@@ -365,6 +371,12 @@ fn futility_margin(depth: i16) -> i32 {
 fn reverse_futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
     0 + FUTILITY_MARGIN_PER_DEPTH * depth
+}
+
+#[inline]
+fn late_move_pruning_threshold(depth: i16) -> usize {
+    let depth = depth.max(0) as usize;
+    LATE_MOVE_PRUNING_BASE + depth * LATE_MOVE_PRUNING_SCALE
 }
 
 #[inline]
@@ -611,6 +623,7 @@ fn negamax_it(
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let is_quiet = !is_capture;
         let is_first_move = move_idx == 0;
+        let is_promotion = mv.get_promotion().is_some();
 
         if is_capture
             && depth_remaining <= SEE_PRUNE_MAX_DEPTH
@@ -650,6 +663,24 @@ fn negamax_it(
             && is_passed_pawn_push(board, &new_board, mv)
         {
             extension = 1;
+        }
+
+        if !is_pv_node
+            && !is_first_move
+            && extension == 0
+            && !in_check
+            && !gives_check
+            && !is_capture
+            && !is_promotion
+            && depth_remaining <= LATE_MOVE_PRUNING_MAX_DEPTH
+        {
+            let lmp_limit = late_move_pruning_threshold(depth_remaining);
+            if move_idx >= lmp_limit {
+                ctx.stats.late_move_prunes += 1;
+                ctx.repetition.pop();
+                move_idx += 1;
+                continue;
+            }
         }
 
         let apply_lmr =
