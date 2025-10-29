@@ -87,7 +87,7 @@ impl CompressedTTEntry {
     }
 }
 
-const TT_DEFAULT_MB: usize = 32;
+const TT_DEFAULT_MB: usize = 64;
 const TT_REPLACE_OFFSET: usize = 2;
 
 const MOVE_NONE: u16 = 0xFFFF;
