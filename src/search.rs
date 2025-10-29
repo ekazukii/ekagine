@@ -712,7 +712,7 @@ fn negamax_it(
                             -beta,
                             -alpha,
                             ply_from_root + 1,
-                            child_is_pv_node,
+                            is_pv_node,
                         ) {
                             SearchScore::CANCELLED => {}
                             SearchScore::EVAL(v2) => {
