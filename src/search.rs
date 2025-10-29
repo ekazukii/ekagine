@@ -574,12 +574,16 @@ fn negamax_it(
         && beta != POS_INFINITY
         && !is_mate_score(beta)
         && !is_mate_score(eval)
-        && eval
-            >= beta.saturating_add(reverse_futility_margin(depth_remaining))
-                / if is_improving { 2 } else { 1 }
     {
-        ctx.stats.reverse_futility_prunes += 1;
-        return SearchScore::EVAL(beta);
+        let mut margin = reverse_futility_margin(depth_remaining);
+        if is_improving {
+            margin /= 2;
+        }
+
+        if eval.saturating_sub(margin) >= beta {
+            ctx.stats.reverse_futility_prunes += 1;
+            return SearchScore::EVAL(beta);
+        }
     }
 
     ctx.stats.incremental_move_gen_inits += 1;
