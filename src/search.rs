@@ -233,8 +233,11 @@ fn quiesce_negamax_it(
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
 
+    let zob = board.get_hash();
+    let in_check = board.checkers().popcnt() > 0;
+
     // Quiescence TT lookup
-    let hit = ctx.tt.probe(board.get_hash());
+    let hit = ctx.tt.probe(zob);
     if let Some(tt_hit) = hit {
         let tt_score = tt_score_on_load(tt_hit.score, ply_from_root);
         match tt_hit.flag {
@@ -258,16 +261,23 @@ fn quiesce_negamax_it(
         }
     }
 
-    let in_check = board.checkers().popcnt() > 0;
-    let stand_pat = if in_check {
-        NEG_INFINITY
+    let static_eval = if in_check {
+        None
     } else if let Some(ref tt_hit) = hit {
-        tt_hit
-            .eval
-            .unwrap_or_else(|| ctx.nnue.evaluate(board.side_to_move()))
+        Some(
+            tt_hit
+                .eval
+                .unwrap_or_else(|| ctx.nnue.evaluate(board.side_to_move())),
+        )
     } else {
-        ctx.nnue.evaluate(board.side_to_move())
+        Some(ctx.nnue.evaluate(board.side_to_move()))
     };
+
+    let stand_pat = static_eval.unwrap_or(NEG_INFINITY);
+
+    let alpha_orig = alpha;
+    let mut best_value = stand_pat;
+    let mut best_move_opt: Option<ChessMove> = None;
 
     if stand_pat >= beta {
         ctx.stats.beta_cutoffs_quiescence += 1;
@@ -299,15 +309,37 @@ fn quiesce_negamax_it(
         board_pop(&new_board, ctx.repetition);
         ctx.nnue.pop();
 
-        if score >= beta {
-            ctx.stats.beta_cutoffs_quiescence += 1;
-            return score;
-        }
         if score > alpha {
             alpha = score;
+            best_move_opt = Some(mv);
+        }
+
+        if score > best_value {
+            best_value = score;
+        }
+
+        if score >= beta {
+            ctx.stats.beta_cutoffs_quiescence += 1;
+            alpha = score;
+            break;
         }
     }
+    let bound = if best_value >= beta {
+        TTFlag::Lower
+    } else if best_value > alpha_orig {
+        TTFlag::Exact
+    } else {
+        TTFlag::Upper
+    };
 
+    ctx.tt.store(
+        zob,
+        0,
+        tt_score_on_store(best_value, ply_from_root),
+        bound,
+        best_move_opt,
+        static_eval,
+    );
     alpha
 }
 
