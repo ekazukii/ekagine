@@ -9,7 +9,7 @@ mod nnue;
 mod search;
 mod tables;
 
-use crate::search::{best_move, uci_score_string, SearchStats};
+use crate::search::{best_move, uci_score_string, SearchStats, TimePlan};
 use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
@@ -151,75 +151,155 @@ fn send_message(stdout: &mut Stdout, message: &str) {
     writeln!(stdout, "{}", message).unwrap();
 }
 
-/// Decide how long to think for this move.
-///
-/// `tokens`  – slice starting with `"go"`, exactly what you split from stdin
-/// `side`    – `board.side_to_move()`
-///
-/// * If the GUI sent `go movetime N`, we honour that exactly.
-/// * Otherwise we look at `wtime/btime`, `winc/binc`, and (optionally)
-///   `movestogo` and give you a sensible **milliseconds** budget
-///   with a small safety margin so you don't flag.
-pub fn choose_time_for_move(tokens: &[&str], side: Color) -> Duration {
-    // Defaults
-    let mut wtime: u64 = 0;
-    let mut btime: u64 = 0;
-    let mut winc: u64 = 0;
-    let mut binc: u64 = 0;
-    let mut movestogo: u64 = 30; // assume 30 moves left if not specified
-    let mut movetime: Option<u64> = None;
+#[derive(Default, Clone)]
+struct EngineState {
+    last_think_time: Option<Duration>,
+}
 
-    let mut i = 1; // skip the "go" token itself
+#[derive(Default)]
+struct ParsedGo {
+    wtime: Option<u64>,
+    btime: Option<u64>,
+    winc: Option<u64>,
+    binc: Option<u64>,
+    movestogo: Option<u64>,
+    movetime: Option<u64>,
+    ponder: bool,
+    infinite: bool,
+}
+
+fn estimate_moves_to_go(board: &Board) -> u64 {
+    let piece_count = board.combined().popcnt();
+    match piece_count {
+        n if n >= 24 => 28,
+        n if n >= 16 => 20,
+        n if n >= 10 => 14,
+        _ => 10,
+    }
+}
+
+fn parse_go_tokens(tokens: &[&str]) -> ParsedGo {
+    let mut parsed = ParsedGo::default();
+    let mut i = 1; // skip "go"
     while i < tokens.len() {
         match tokens[i] {
             "movetime" => {
                 i += 1;
-                movetime = tokens.get(i).and_then(|v| v.parse().ok());
+                parsed.movetime = tokens.get(i).and_then(|v| v.parse().ok());
             }
             "wtime" => {
                 i += 1;
-                wtime = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                parsed.wtime = tokens.get(i).and_then(|v| v.parse().ok());
             }
             "btime" => {
                 i += 1;
-                btime = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                parsed.btime = tokens.get(i).and_then(|v| v.parse().ok());
             }
             "winc" => {
                 i += 1;
-                winc = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                parsed.winc = tokens.get(i).and_then(|v| v.parse().ok());
             }
             "binc" => {
                 i += 1;
-                binc = tokens.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
+                parsed.binc = tokens.get(i).and_then(|v| v.parse().ok());
             }
             "movestogo" => {
                 i += 1;
-                movestogo = tokens
-                    .get(i)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(movestogo);
+                parsed.movestogo = tokens.get(i).and_then(|v| v.parse().ok());
             }
+            "ponder" => parsed.ponder = true,
+            "infinite" => parsed.infinite = true,
             _ => {}
         }
         i += 1;
     }
+    parsed
+}
 
-    if let Some(ms) = movetime {
-        let ms_with_margin = ms - 10;
-        return Duration::from_millis(ms_with_margin.max(10));
+fn plan_time_for_move(
+    tokens: &[&str],
+    side: Color,
+    board: &Board,
+    state: &EngineState,
+) -> Option<TimePlan> {
+    let parsed = parse_go_tokens(tokens);
+
+    if parsed.infinite || parsed.ponder {
+        return Some(TimePlan::infinite());
     }
 
-    let (time_left, increment) = match side {
-        Color::White => (wtime, winc),
-        Color::Black => (btime, binc),
+    if let Some(ms) = parsed.movetime {
+        let capped = ms.max(1);
+        return Some(TimePlan::fixed(Duration::from_millis(capped)));
+    }
+
+    let (time_left_opt, increment_opt) = match side {
+        Color::White => (parsed.wtime, parsed.winc),
+        Color::Black => (parsed.btime, parsed.binc),
     };
 
-    const SAFETY_MS: u64 = 50;
+    let time_left = time_left_opt.unwrap_or(0);
+    let increment = increment_opt.unwrap_or(0);
 
-    let base = time_left.saturating_sub(SAFETY_MS) / movestogo.max(1);
-    let budget = base + increment / 2;
+    if time_left == 0 && increment == 0 {
+        return Some(TimePlan::fixed(Duration::from_millis(5)));
+    }
 
-    Duration::from_millis(budget.max(10))
+    let moves_remaining = parsed
+        .movestogo
+        .filter(|m| *m > 0)
+        .unwrap_or_else(|| estimate_moves_to_go(board));
+
+    const MIN_RESERVE_MS: u64 = 40;
+    const RESERVE_DIVISOR: u64 = 20;
+    const MIN_THINK_MS: u64 = 5;
+    const SOFT_GUARD_MS: u64 = 8;
+    const HARD_GUARD_MS: u64 = 2;
+
+    let mut reserve = time_left / RESERVE_DIVISOR;
+    if reserve < MIN_RESERVE_MS {
+        reserve = MIN_RESERVE_MS;
+    }
+    if reserve > time_left / 2 {
+        reserve = time_left / 2;
+    }
+
+    let mut usable = time_left.saturating_sub(reserve);
+    if usable < MIN_THINK_MS {
+        usable = time_left.max(increment);
+    }
+    if usable < MIN_THINK_MS {
+        usable = MIN_THINK_MS;
+    }
+
+    let moves = moves_remaining.max(1);
+    let per_move = usable / moves;
+    let inc_share = (increment * 7) / 10;
+
+    let mut soft_ms = per_move.saturating_add(inc_share).max(MIN_THINK_MS);
+    if soft_ms + SOFT_GUARD_MS > usable {
+        soft_ms = usable.saturating_sub(SOFT_GUARD_MS).max(MIN_THINK_MS);
+    }
+
+    if let Some(prev) = state.last_think_time {
+        let prev_ms = prev.as_millis() as u64;
+        // Smooth towards recent usage without exceeding usable budget.
+        soft_ms = ((soft_ms + prev_ms) / 2).clamp(MIN_THINK_MS, usable);
+    }
+
+    let mut hard_ms = soft_ms
+        .saturating_add(per_move / 2)
+        .saturating_add(increment / 2)
+        .saturating_add(5);
+    if hard_ms > usable {
+        hard_ms = usable.saturating_sub(HARD_GUARD_MS).max(soft_ms);
+    }
+
+    Some(TimePlan {
+        soft_limit: Some(Duration::from_millis(soft_ms)),
+        hard_limit: Some(Duration::from_millis(hard_ms.max(soft_ms))),
+        infinite: false,
+    })
 }
 
 fn uci_loop() {
@@ -229,6 +309,7 @@ fn uci_loop() {
     let transpo_table = Arc::new(TranspositionTable::new());
     let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
     let mut options = EngineOptions::default();
+    let mut engine_state = EngineState::default();
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
@@ -261,6 +342,7 @@ fn uci_loop() {
                 transpo_table.clear();
                 repetition_table.clear();
                 repetition_table.init(board.get_hash());
+                engine_state = EngineState::default();
             }
             "setoption" => {
                 if let Some(name_idx) = tokens.iter().position(|&t| t.eq_ignore_ascii_case("name"))
@@ -300,6 +382,7 @@ fn uci_loop() {
                 }
 
                 repetition_table.init(board.get_hash());
+                engine_state.last_think_time = None;
 
                 if i < tokens.len() && tokens[i] == "moves" {
                     i += 1;
@@ -372,6 +455,7 @@ fn uci_loop() {
                                     send_message(&mut stdout, "bestmove 0000");
                                 }
 
+                                engine_state.last_think_time = Some(elapsed);
                                 continue;
                             }
                             Ok(_) | Err(_) => {
@@ -383,17 +467,30 @@ fn uci_loop() {
                     }
                 }
 
-                let time_budget = choose_time_for_move(&tokens, board.side_to_move());
-
+                let time_plan =
+                    plan_time_for_move(&tokens, board.side_to_move(), &board, &engine_state);
+                if let Some(plan) = time_plan.as_ref() {
+                    let info = if plan.infinite {
+                        "info string time plan mode=infinite".to_string()
+                    } else {
+                        let soft = plan.soft_limit.map(|d| d.as_millis()).unwrap_or_default();
+                        let hard = plan.hard_limit.map(|d| d.as_millis()).unwrap_or_default();
+                        format!("info string time plan soft={}ms hard={}ms", soft, hard)
+                    };
+                    send_message(&mut stdout, &info);
+                }
+                let search_start = Instant::now();
                 let outcome = best_move(
                     &board,
                     99,
                     Arc::clone(&transpo_table),
                     repetition_table.clone(),
-                    Some(time_budget),
+                    time_plan.clone(),
                     Some(&mut stdout),
                     options.threads,
                 );
+                let elapsed = search_start.elapsed();
+                engine_state.last_think_time = Some(elapsed);
                 if let Some(mv) = outcome.best_move {
                     send_message(&mut stdout, format!("bestmove {}", mv).as_str());
                 } else {
@@ -530,7 +627,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 1000,
                 Arc::clone(&transpo_table),
                 RepetitionTable::new(key.get_hash()),
-                Some(Duration::from_millis(90)),
+                Some(TimePlan::fixed(Duration::from_millis(90))),
                 None,
                 1,
             )

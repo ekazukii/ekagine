@@ -20,6 +20,105 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
+#[derive(Debug, Clone)]
+pub struct TimePlan {
+    pub soft_limit: Option<Duration>,
+    pub hard_limit: Option<Duration>,
+    pub infinite: bool,
+}
+
+impl TimePlan {
+    pub fn fixed(duration: Duration) -> Self {
+        let guard_soft = Duration::from_millis(10);
+        let guard_hard = Duration::from_millis(2);
+        let soft = if duration > guard_soft {
+            duration.saturating_sub(guard_soft)
+        } else {
+            duration
+        };
+        let hard = if duration > guard_hard {
+            duration.saturating_sub(guard_hard)
+        } else {
+            duration
+        };
+
+        Self {
+            soft_limit: Some(soft),
+            hard_limit: Some(hard.max(soft)),
+            infinite: false,
+        }
+    }
+
+    pub fn infinite() -> Self {
+        Self {
+            soft_limit: None,
+            hard_limit: None,
+            infinite: true,
+        }
+    }
+
+    fn has_deadlines(&self) -> bool {
+        self.soft_limit.is_some() || self.hard_limit.is_some()
+    }
+}
+
+struct TimeManagerHandle {
+    soft_deadline: Option<Instant>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl TimeManagerHandle {
+    fn new(stop: &StopFlag, plan: &TimePlan, start: Instant) -> Option<Self> {
+        if !plan.has_deadlines() {
+            return None;
+        }
+
+        let soft_deadline = plan.soft_limit.map(|d| start + d);
+        let hard_deadline = plan.hard_limit.map(|d| start + d);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        if let Some(deadline) = hard_deadline {
+            let cancel_clone = Arc::clone(&cancel);
+            let stop_clone = stop.clone();
+            thread::spawn(move || loop {
+                if cancel_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let now = Instant::now();
+                if now >= deadline {
+                    stop_clone.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    thread::yield_now();
+                } else {
+                    let sleep_for = remaining.min(Duration::from_millis(5));
+                    thread::sleep(sleep_for);
+                }
+            });
+        }
+
+        Some(Self {
+            soft_deadline,
+            cancel,
+        })
+    }
+
+    fn soft_limit_reached(&self, now: Instant) -> bool {
+        if let Some(deadline) = self.soft_deadline {
+            return now >= deadline;
+        }
+        false
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 enum SearchScore {
     CANCELLED,
     EVAL(i32),
@@ -1239,6 +1338,7 @@ fn iterative_deepening_loop<F>(
     stop: &StopFlag,
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
+    time_manager: Option<&TimeManagerHandle>,
     mut on_iteration: F,
 ) -> (Option<ChessMove>, i32)
 where
@@ -1300,6 +1400,13 @@ where
         if report.result.aborted {
             break;
         }
+
+        if let Some(manager) = time_manager {
+            if manager.soft_limit_reached(Instant::now()) {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
     }
 
     (best_move, best_score)
@@ -1341,6 +1448,7 @@ fn spawn_lazy_smp_helpers(
                 &stop_clone,
                 &mut local_stats,
                 nnue_state.as_mut(),
+                None,
                 |_| {},
             );
         }));
@@ -1364,18 +1472,15 @@ pub fn best_move(
     max_depth: usize,
     transpo_table: Arc<TranspositionTable>,
     repetition_table: RepetitionTable,
-    time_budget: Option<Duration>,
+    time_plan: Option<TimePlan>,
     mut stdout_opt: Option<&mut Stdout>,
     threads: usize,
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
-    if let Some(budget) = time_budget {
-        let stop_clone = stop.clone();
-        thread::spawn(move || {
-            thread::sleep(budget);
-            stop_clone.store(true, Ordering::Relaxed);
-        });
-    }
+    let search_start = Instant::now();
+    let time_manager = time_plan
+        .as_ref()
+        .and_then(|plan| TimeManagerHandle::new(&stop, plan, search_start));
 
     let mut stats = SearchStats::default();
     let mut nnue_state = NNUEState::from_board(board);
@@ -1399,6 +1504,7 @@ pub fn best_move(
         &stop,
         &mut stats,
         nnue_state.as_mut(),
+        time_manager.as_ref(),
         |report| {
             if report.result.aborted {
                 return;
@@ -1437,6 +1543,9 @@ pub fn best_move(
     }
 
     stop.store(true, Ordering::Relaxed);
+    if let Some(manager) = &time_manager {
+        manager.cancel();
+    }
     join_helper_threads(helper_handles);
 
     SearchOutcome::new(best_move, best_score, stats)
