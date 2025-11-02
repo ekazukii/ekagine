@@ -760,13 +760,13 @@ fn negamax_it(
         let is_first_move = move_idx == 0;
         let is_promotion = mv.get_promotion().is_some();
 
-        if is_capture
-            && depth_remaining <= SEE_PRUNE_MAX_DEPTH
+        if depth_remaining <= SEE_PRUNE_MAX_DEPTH
             && !is_pv_node
             && !in_check
             && !is_first_move
         {
-            if static_exchange_eval(board, mv) < 0 {
+            let threshold = if is_capture { -150 } else { -50 } * depth_remaining as i32;
+            if static_exchange_eval(board, mv) < threshold {
                 move_idx += 1;
                 continue;
             }
