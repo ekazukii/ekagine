@@ -497,3 +497,59 @@ fn history_bonus(depth: i16) -> i32 {
 fn history_malus(depth: i16) -> i32 {
     history_bonus(depth).max(1) / 2
 }
+
+const CORRECTION_HISTORY_CAP: i32 = 1 << 14;
+const CORRECTION_HISTORY_DECAY: i32 = 32;
+const CORRECTION_HISTORY_DIFF_CAP: i32 = 400;
+const CORRECTION_HISTORY_DEPTH_CAP: i32 = 8;
+
+#[derive(Debug, Clone)]
+pub struct CorrectionHistoryTable {
+    entries: [[[i32; 64]; 6]; 2],
+}
+
+impl CorrectionHistoryTable {
+    pub fn new() -> Self {
+        Self {
+            entries: [[[0; 64]; 6]; 2],
+        }
+    }
+
+    #[inline]
+    pub fn value(&self, color: Color, piece: Piece, to: Square) -> i32 {
+        let color_idx = color.to_index();
+        let piece_idx = piece.to_index() as usize;
+        let to_idx = to.to_index() as usize;
+        self.entries[color_idx][piece_idx][to_idx]
+    }
+
+    pub fn record(&mut self, color: Color, piece: Piece, to: Square, diff: i32, depth: i16) {
+        let color_idx = color.to_index();
+        let piece_idx = piece.to_index() as usize;
+        let to_idx = to.to_index() as usize;
+        let entry = &mut self.entries[color_idx][piece_idx][to_idx];
+
+        let depth_scale = depth.max(1) as i32;
+        let weighted_depth = depth_scale.min(CORRECTION_HISTORY_DEPTH_CAP);
+        let target =
+            diff.clamp(-CORRECTION_HISTORY_DIFF_CAP, CORRECTION_HISTORY_DIFF_CAP) * weighted_depth;
+
+        let delta = target - *entry;
+        if delta == 0 {
+            return;
+        }
+
+        let mut adjustment = delta / CORRECTION_HISTORY_DECAY;
+        if adjustment == 0 {
+            adjustment = delta.signum();
+        }
+
+        *entry = (*entry + adjustment).clamp(-CORRECTION_HISTORY_CAP, CORRECTION_HISTORY_CAP);
+    }
+}
+
+impl Default for CorrectionHistoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

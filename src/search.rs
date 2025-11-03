@@ -2,7 +2,7 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
-use crate::tables::{HistoryTable, KillerTable};
+use crate::tables::{CorrectionHistoryTable, HistoryTable, KillerTable};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
@@ -291,6 +291,28 @@ fn tt_score_on_load(score: i32, ply_from_root: i32) -> i32 {
         }
     } else {
         score
+    }
+}
+
+#[inline]
+fn update_correction_history_for_move(
+    correction: &mut CorrectionHistoryTable,
+    board: &Board,
+    mover: Color,
+    mv: ChessMove,
+    static_eval: i32,
+    node_value: i32,
+    depth: i16,
+) {
+    if mv.get_promotion().is_some() {
+        return;
+    }
+    if is_mate_score(static_eval) || is_mate_score(node_value) {
+        return;
+    }
+    if let Some(piece) = board.piece_on(mv.get_source()) {
+        let diff = node_value - static_eval;
+        correction.record(mover, piece, mv.get_dest(), diff, depth);
     }
 }
 
@@ -748,7 +770,7 @@ fn negamax_it(
     };
 
     let mut move_idx: usize = 0;
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.correction) {
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
@@ -916,6 +938,18 @@ fn negamax_it(
 
         let value = value_opt.unwrap();
 
+        if is_quiet {
+            update_correction_history_for_move(
+                ctx.correction,
+                board,
+                mover,
+                mv,
+                eval,
+                value,
+                depth_remaining,
+            );
+        }
+
         let was_new_best = value > best_value;
         if was_new_best {
             best_value = value;
@@ -1061,6 +1095,7 @@ fn root_search_with_window(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     history_table: &mut HistoryTable,
+    correction_history: &mut CorrectionHistoryTable,
     search_stack: &mut SearchStack,
     alpha_start: i32,
     beta_start: i32,
@@ -1089,6 +1124,7 @@ fn root_search_with_window(
         repetition: repetition_table,
         killers: &mut killer_table,
         history: history_table,
+        correction: correction_history,
         nnue: nnue_state,
         search_stack,
     };
@@ -1097,8 +1133,10 @@ fn root_search_with_window(
     let killer_moves = ctx.killers.killers_for(0);
     let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves);
     let root_mover = board.side_to_move();
+    let root_eval = ctx.nnue.evaluate(root_mover);
+    ctx.search_stack.set(0, root_eval);
 
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.correction) {
         if should_stop(ctx.stop) {
             aborted = true;
             break;
@@ -1138,6 +1176,18 @@ fn root_search_with_window(
             SearchScore::EVAL(v) => {
                 let value = -v;
                 let was_new_best = value > best_value;
+
+                if is_quiet {
+                    update_correction_history_for_move(
+                        ctx.correction,
+                        board,
+                        root_mover,
+                        mv,
+                        root_eval,
+                        value,
+                        child_depth_i16,
+                    );
+                }
 
                 if value > best_value {
                     log_root_best_update(&mut out, max_depth, &mv, value, current_best);
@@ -1221,6 +1271,7 @@ fn aspiration_root_search(
     nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
+    correction_history: &mut CorrectionHistoryTable,
     search_stack: &mut SearchStack,
 ) -> RootSearchResult {
     if prev_score.is_none() {
@@ -1233,6 +1284,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            correction_history,
             search_stack,
             NEG_INFINITY,
             POS_INFINITY,
@@ -1255,6 +1307,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            correction_history,
             search_stack,
             alpha,
             beta,
@@ -1295,6 +1348,7 @@ struct ThreadContext<'a> {
     repetition: &'a mut RepetitionTable,
     killers: &'a mut KillerTable,
     history: &'a mut HistoryTable,
+    correction: &'a mut CorrectionHistoryTable,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
 }
@@ -1348,6 +1402,7 @@ where
     let mut prev_score: Option<i32> = None;
     let mut stats_prev = *stats;
     let mut history_table = HistoryTable::new();
+    let mut correction_history = CorrectionHistoryTable::new();
     let mut search_stack = SearchStack::new();
 
     for depth in 1..=max_depth {
@@ -1368,6 +1423,7 @@ where
             nnue_state,
             prev_score,
             &mut history_table,
+            &mut correction_history,
             &mut search_stack,
         );
 

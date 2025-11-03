@@ -1,4 +1,4 @@
-use crate::tables::HistoryTable;
+use crate::tables::{CorrectionHistoryTable, HistoryTable};
 use crate::TranspositionTable;
 use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove,
@@ -123,7 +123,7 @@ impl<'a> IncrementalMoveGen<'a> {
             .extend(bad_scored.into_iter().map(|(mv, _)| mv));
     }
 
-    fn ensure_quiet(&mut self, history: &HistoryTable) {
+    fn ensure_quiet(&mut self, history: &HistoryTable, correction: &CorrectionHistoryTable) {
         if self.quiet_generated {
             return;
         }
@@ -160,6 +160,9 @@ impl<'a> IncrementalMoveGen<'a> {
             }
 
             let mut score = history.score(self.side_to_move, mv);
+            if let Some(piece) = self.board.piece_on(mv.get_source()) {
+                score += correction.value(self.side_to_move, piece, mv.get_dest());
+            }
             if mv.get_promotion().is_some() {
                 score += PROMOTION_HISTORY_BONUS;
                 good_scored.push((mv, score));
@@ -191,7 +194,11 @@ impl<'a> IncrementalMoveGen<'a> {
         !self.has_legal_moves
     }
 
-    pub fn next(&mut self, history: &HistoryTable) -> Option<ChessMove> {
+    pub fn next(
+        &mut self,
+        history: &HistoryTable,
+        correction: &CorrectionHistoryTable,
+    ) -> Option<ChessMove> {
         loop {
             match self.phase {
                 MoveGenPhase::TTMove => {
@@ -210,7 +217,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::GoodQuiet;
                 }
                 MoveGenPhase::GoodQuiet => {
-                    self.ensure_quiet(history);
+                    self.ensure_quiet(history, correction);
                     if self.killer_quiet_idx < self.killer_quiet.len() {
                         let mv = self.killer_quiet[self.killer_quiet_idx];
                         self.killer_quiet_idx += 1;
@@ -233,7 +240,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::BadQuiet;
                 }
                 MoveGenPhase::BadQuiet => {
-                    self.ensure_quiet(history);
+                    self.ensure_quiet(history, correction);
                     if self.bad_quiet_idx < self.bad_quiet.len() {
                         let mv = self.bad_quiet[self.bad_quiet_idx];
                         self.bad_quiet_idx += 1;
