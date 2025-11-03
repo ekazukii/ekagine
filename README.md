@@ -5,6 +5,8 @@ strong tactical play powered by NNUE evaluation and a modern alpha-beta search
 stack. The code base is organized for experimentation and includes the same
 core techniques used by contemporary tournament engines.
 
+The engine is not yet tested or ranked on ccrl, but I estimate it to be more or less 2800 elo
+
 If you already have a lichess account, you can challenge it online at:
 <https://lichess.org/@/ekagine>.
 
@@ -60,9 +62,6 @@ Banksia) to play games.
 ```bash
 cargo test
 ```
-
-This executes the included unit tests covering NNUE incremental updates and
-search helpers. Add your own tests as you expand the engine.
 
 Continuous testing is handled on a custom SPRT infrastructure at
 <https://ssprt.ekazuki.fr> (read-only access). Each pull request triggers a
