@@ -388,11 +388,7 @@ fn quiesce_negamax_it(
 
     let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
     for (mv, _val) in get_captures(board) {
-
-        if !in_check
-            && futility <= alpha
-            && see_for_sort(board, mv) < 0
-        {
+        if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
             if best_value < futility {
                 best_value = futility;
             }

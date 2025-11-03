@@ -713,7 +713,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} [--uci] [--benchmark [FILE]] [--best <FEN> [DEPTH]]",
+            "Usage: {} [--uci] [--benchmark <FILE>] [--best <FEN> [DEPTH]]",
             args[0]
         );
         std::process::exit(1);
@@ -733,10 +733,14 @@ fn main() {
         }
 
         "--benchmark" => {
-            let filepath = args
-                .get(2)
-                .map(|s| s.as_str())
-                .unwrap_or("/Users/ekazuki/Downloads/lichess_db_eval_1000.jsonl");
+            let filepath = match args.get(2) {
+                Some(path) => path,
+                None => {
+                    eprintln!("Usage: {} --benchmark <FILE>", args[0]);
+                    std::process::exit(1);
+                }
+            };
+
             match process_file(filepath) {
                 Ok(hash_map) => benchmark_evaluation(&hash_map),
                 Err(err) => eprintln!("Failed to open {}: {}", filepath, err),
@@ -768,37 +772,10 @@ fn main() {
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             eprintln!(
-                "Usage: {} [--version] [--uci] [--benchmark [FILE]] [--best <FEN> [DEPTH]]",
+                "Usage: {} [--version] [--uci] [--benchmark <FILE>] [--best <FEN> [DEPTH]]",
                 args[0]
             );
             std::process::exit(1);
         }
     }
 }
-
-// 1rbqkb1r/pppp1ppp/2n1p3/8/3PP1n1/4BN1P/PPP2PP1/RN1QKB1R w KQk - 0 5
-// Coup de tour bizarre
-
-// WTF Is that ?
-//1rbqkb1r/pppp1ppp/2n1p3/6N1/3PP1n1/4B2P/PPP2PP1/RN1QKB1R b KQk - 0 6
-
-//[Event "*"]
-// [Site "*"]
-// [Date "2025.06.07"]
-// [Time "20:40:25"]
-// [Round "*"]
-// [White "Rust v7"]
-// [Black "hm::Human"]
-// [Result "*"]
-// [ECO "C50"]
-// [Opening "Giuoco Piano"]
-// [TimeControl "movetime: 10"]
-// [PlyCount "27"]
-//
-// 1.Nc3 {+0.0/8 10029 1523284}  e5 2.Nf3 {+0.1/8 10032 2023131; A00: Dunst (Sleipner, Heinrichsen) opening}  Nc6
-// 3.e4 {+0.4/7 10029 1888261}  Nf6 4.Bc4 {+0.2/6 10022 1044219}  Bc5
-// 5.Ng5 {+0.6/7 10026 659867; C50: Giuoco Piano, four knights variation}  d5 6.exd5 {+0.8/8 10034 2793299}  b5
-// 7.Bxb5 {+4.7/8 10033 4095069}  Nxd5 8.Bxc6+ {+8.4/9 10023 903031}  Ke7
-// 9.Nxd5+ {+10.2/9 10027 815727}  Qxd5 10.Bxd5 {+14.2/8 10038 3199286}  Bf5
-// 11.Bxa8 {+17.6/8 10034 2886168}  Rxa8 12.Qf3 {+18.9/9 10036 1075835}  g6
-// 13.Qxa8 {+20.8/9 10037 1966843}  Kf6 14.Qh8+ {+24.9/9 10039 1753891}
