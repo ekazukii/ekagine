@@ -487,7 +487,7 @@ const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 3;
 
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 4;
-const SEE_PRUNE_MAX_DEPTH: i16 = 6;
+const SEE_PRUNE_MAX_DEPTH: i16 = 9;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
 const LATE_MOVE_PRUNING_BASE: usize = 4;
 const LATE_MOVE_PRUNING_SCALE: usize = 2;
@@ -760,11 +760,7 @@ fn negamax_it(
         let is_first_move = move_idx == 0;
         let is_promotion = mv.get_promotion().is_some();
 
-        if depth_remaining <= SEE_PRUNE_MAX_DEPTH
-            && !is_pv_node
-            && !in_check
-            && !is_first_move
-        {
+        if depth_remaining <= SEE_PRUNE_MAX_DEPTH && !is_first_move && alpha != NEG_INFINITY && beta != POS_INFINITY && !is_mate_score(alpha) {
             let threshold = if is_capture { -150 } else { -50 } * depth_remaining as i32;
             if static_exchange_eval(board, mv) < threshold {
                 move_idx += 1;
