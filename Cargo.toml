@@ -10,6 +10,8 @@ lazy_static = "1.5.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 smallvec = "1.15.1"
+shakmaty-syzygy = "0.27.0"
+shakmaty = "0.29.4"
 
 [build]
 target = "aarch64-apple-darwin"

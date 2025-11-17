@@ -7,9 +7,11 @@ mod eval;
 mod movegen;
 mod nnue;
 mod search;
+mod tablebase;
 mod tables;
 
 use crate::search::{best_move, uci_score_string, SearchStats, TimePlan};
+use crate::tablebase::Tablebase;
 use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
@@ -31,11 +33,21 @@ const MAX_THREADS: usize = 64;
 #[derive(Clone, Debug)]
 struct EngineOptions {
     threads: usize,
+    syzygy_path: String,
+    syzygy_probe_limit: usize,
+    syzygy_use_rule50: bool,
+    tablebase: Option<Arc<Tablebase>>,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        Self { threads: 1 }
+        Self {
+            threads: 1,
+            syzygy_path: String::new(),
+            syzygy_probe_limit: 7,
+            syzygy_use_rule50: true,
+            tablebase: None,
+        }
     }
 }
 
@@ -43,6 +55,45 @@ impl EngineOptions {
     fn set_threads(&mut self, value: usize) {
         let clamped = value.clamp(1, MAX_THREADS);
         self.threads = clamped;
+    }
+
+    fn set_syzygy_path(&mut self, value: String) {
+        self.syzygy_path = value;
+        self.refresh_tablebase();
+    }
+
+    fn set_syzygy_probe_limit(&mut self, value: usize) {
+        self.syzygy_probe_limit = value.min(7);
+        self.refresh_tablebase();
+    }
+
+    fn set_syzygy_rule50(&mut self, value: bool) {
+        self.syzygy_use_rule50 = value;
+        self.refresh_tablebase();
+    }
+
+    fn refresh_tablebase(&mut self) {
+        if self.syzygy_path.is_empty() {
+            self.tablebase = None;
+            return;
+        }
+
+        let paths = self
+            .syzygy_path
+            .split(';')
+            .filter(|p| !p.is_empty())
+            .map(|p| std::path::PathBuf::from(p))
+            .collect::<Vec<_>>();
+
+        if paths.is_empty() {
+            self.tablebase = None;
+        } else {
+            self.tablebase = Some(Arc::new(Tablebase::new(
+                paths,
+                self.syzygy_probe_limit,
+                self.syzygy_use_rule50,
+            )));
+        }
     }
 }
 
@@ -105,6 +156,10 @@ impl RepetitionTable {
     pub fn pop(&mut self) -> Option<u64> {
         self.ply_since_last_hmclock.pop();
         self.history.pop()
+    }
+
+    pub fn current_halfmove_clock(&self) -> u32 {
+        *self.ply_since_last_hmclock.last().unwrap_or(&0)
     }
 
     fn is_in_threefold_scenario(&self, board: &Board) -> bool {
@@ -332,6 +387,23 @@ fn uci_loop() {
                     )
                     .as_str(),
                 );
+                send_message(&mut stdout, "option name SyzygyPath type string default ");
+                send_message(
+                    &mut stdout,
+                    format!(
+                        "option name SyzygyProbeLimit type spin default {} min 0 max 7",
+                        EngineOptions::default().syzygy_probe_limit
+                    )
+                    .as_str(),
+                );
+                send_message(
+                    &mut stdout,
+                    format!(
+                        "option name Syzygy50MoveRule type check default {}",
+                        EngineOptions::default().syzygy_use_rule50 as u8
+                    )
+                    .as_str(),
+                );
                 send_message(&mut stdout, "uciok");
             }
             "isready" => {
@@ -363,6 +435,31 @@ fn uci_loop() {
                                     );
                                     send_message(&mut stdout, &warn);
                                 }
+                            } else if name.eq_ignore_ascii_case("SyzygyPath") {
+                                options.set_syzygy_path(value_str);
+                                let info = format!(
+                                    "info string syzygy path set ({} paths)",
+                                    options
+                                        .tablebase
+                                        .as_ref()
+                                        .map(|tb| tb.path_count())
+                                        .unwrap_or(0)
+                                );
+                                send_message(&mut stdout, &info);
+                            } else if name.eq_ignore_ascii_case("SyzygyProbeLimit") {
+                                if let Ok(parsed) = value_str.parse::<usize>() {
+                                    options.set_syzygy_probe_limit(parsed);
+                                } else {
+                                    let warn = format!(
+                                        "info string invalid value '{}' for SyzygyProbeLimit",
+                                        value_str
+                                    );
+                                    send_message(&mut stdout, &warn);
+                                }
+                            } else if name.eq_ignore_ascii_case("Syzygy50MoveRule") {
+                                let lowered = value_str.to_ascii_lowercase();
+                                let val = matches!(lowered.as_str(), "true" | "1" | "on" | "yes");
+                                options.set_syzygy_rule50(val);
                             }
                         }
                     }
@@ -377,7 +474,13 @@ fn uci_loop() {
                     i += 1;
                 } else if i < tokens.len() && tokens[i] == "fen" {
                     let fen = tokens[i + 1..i + 7].join(" ");
-                    board = Board::from_str(&fen).unwrap();
+                    board = match Board::from_str(&fen) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            send_message(&mut stdout, format!("info string invalid FEN: {}", e).as_str());
+                            board
+                        }
+                    };
                     i += 7;
                 }
 
@@ -408,6 +511,7 @@ fn uci_loop() {
                                     repetition_table.clone(),
                                     None,
                                     None,
+                                    options.tablebase.clone(),
                                     options.threads,
                                 );
                                 let elapsed = search_start.elapsed();
@@ -487,6 +591,7 @@ fn uci_loop() {
                     repetition_table.clone(),
                     time_plan.clone(),
                     Some(&mut stdout),
+                    options.tablebase.clone(),
                     options.threads,
                 );
                 let elapsed = search_start.elapsed();
@@ -629,6 +734,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 RepetitionTable::new(key.get_hash()),
                 Some(TimePlan::fixed(Duration::from_millis(90))),
                 None,
+                None,
                 1,
             )
         });
@@ -701,6 +807,7 @@ pub fn compute_best_from_fen(
         max_depth,
         Arc::clone(&transpo_table),
         repetition_table,
+        None,
         None,
         None,
         EngineOptions::default().threads,
