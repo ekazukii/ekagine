@@ -210,8 +210,7 @@ impl NNUEState {
         let to_file = to.get_file().to_index() as i32;
         let is_castling = piece == Piece::King && (from_file - to_file).abs() == 2;
         if is_castling {
-            self.manual_update::<OFF>(Piece::King, color, from);
-            self.manual_update::<ON>(Piece::King, color, to);
+            self.move_update(piece, color, from, to);
 
             let (rook_from, rook_to) = match (color, to) {
                 (Color::White, Square::G1) => (Square::H1, Square::F1),
@@ -221,8 +220,7 @@ impl NNUEState {
                 _ => panic!("unexpected castling destination"),
             };
 
-            self.manual_update::<OFF>(Piece::Rook, color, rook_from);
-            self.manual_update::<ON>(Piece::Rook, color, rook_to);
+            self.move_update(Piece::Rook, color, rook_from, rook_to);
             return;
         }
 
