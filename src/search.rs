@@ -11,6 +11,7 @@ use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
     BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
 };
+use lazy_static::lazy_static;
 use smallvec::SmallVec;
 use std::cmp;
 use std::io::Stdout;
@@ -509,6 +510,44 @@ fn late_move_pruning_threshold(depth: i16) -> usize {
     LATE_MOVE_PRUNING_BASE + depth * LATE_MOVE_PRUNING_SCALE
 }
 
+// Late Move Reduction (LMR) table and constants
+const LMR_MAX_DEPTH: usize = 64;
+const LMR_MAX_MOVES: usize = 64;
+const LMR_BASE: f64 = 0.75;
+const LMR_DIVISOR: f64 = 2.25;
+
+lazy_static! {
+    static ref LMR_TABLE: [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] = compute_lmr_table();
+}
+
+fn compute_lmr_table() -> [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] {
+    let mut table = [[0i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH];
+    for depth in 1..LMR_MAX_DEPTH {
+        for move_idx in 1..LMR_MAX_MOVES {
+            let reduction = LMR_BASE +
+                (depth as f64).ln() * (move_idx as f64).ln() / LMR_DIVISOR;
+            table[depth][move_idx] = reduction.round() as i16;
+        }
+    }
+    table
+}
+
+#[inline]
+fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool) -> i16 {
+    let d = (depth as usize).min(LMR_MAX_DEPTH - 1);
+    let m = move_idx.min(LMR_MAX_MOVES - 1);
+
+    let mut reduction = LMR_TABLE[d][m];
+
+    // Reduce less in PV nodes
+    if is_pv_node {
+        reduction = reduction.saturating_sub(1);
+    }
+
+    // Ensure minimum reduction of 1 when LMR applies
+    reduction.max(1)
+}
+
 #[inline]
 fn is_passed_pawn(board: &Board, square: Square, color: Color) -> bool {
     let enemy_color = match color {
@@ -820,11 +859,7 @@ fn negamax_it(
         let apply_lmr =
             depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
         let reduction: i16 = if apply_lmr {
-            if depth_remaining >= 6 {
-                2
-            } else {
-                1
-            }
+            lmr_reduction(depth_remaining, move_idx, is_pv_node)
         } else {
             0
         };
