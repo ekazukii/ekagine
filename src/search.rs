@@ -389,9 +389,6 @@ fn quiesce_negamax_it(
     let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
     for (mv, _val) in get_captures(board) {
         if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
-            if best_value < futility {
-                best_value = futility;
-            }
             continue;
         }
 
@@ -422,9 +419,9 @@ fn quiesce_negamax_it(
             break;
         }
     }
-    let bound = if best_value >= beta {
+    let bound = if alpha >= beta {
         TTFlag::Lower
-    } else if best_value > alpha_orig {
+    } else if alpha > alpha_orig {
         TTFlag::Exact
     } else {
         TTFlag::Upper
@@ -433,7 +430,7 @@ fn quiesce_negamax_it(
     ctx.tt.store(
         zob,
         0,
-        tt_score_on_store(best_value, ply_from_root),
+        tt_score_on_store(alpha, ply_from_root),
         bound,
         best_move_opt,
         static_eval,
