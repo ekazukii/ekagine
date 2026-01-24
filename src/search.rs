@@ -2,6 +2,7 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
+use crate::tablebase::{wdl_to_score, Tablebase};
 use crate::tables::{HistoryTable, KillerTable};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
@@ -268,6 +269,11 @@ fn mated_in_plies(ply: i32) -> i32 {
     -MATE_VALUE + ply
 }
 
+#[inline]
+fn eligible_for_tablebase(tb: &Tablebase, board: &Board) -> bool {
+    board.combined().popcnt() as usize <= tb.probe_limit()
+}
+
 // Adjust mate scores when storing/loading from TT to remain comparable
 #[inline]
 fn tt_score_on_store(score: i32, ply_from_root: i32) -> i32 {
@@ -332,6 +338,19 @@ fn quiesce_negamax_it(
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
+
+    let halfmove_clock = ctx.repetition.current_halfmove_clock();
+    if halfmove_clock >= 100 && ctx.tablebase.as_ref().map_or(true, |tb| tb.use_rule50()) {
+        return 0;
+    }
+
+    if let Some(tb) = ctx.tablebase.as_ref() {
+        if eligible_for_tablebase(tb, board) {
+            if let Some(probe) = tb.probe_wdl(board, halfmove_clock) {
+                return wdl_to_score(probe.wdl, board.side_to_move(), ply_from_root, MATE_VALUE);
+            }
+        }
+    }
 
     let zob = board.get_hash();
     let in_check = board.checkers().popcnt() > 0;
@@ -655,6 +674,21 @@ fn negamax_it(
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.nodes += 1;
+
+    let halfmove_clock = ctx.repetition.current_halfmove_clock();
+    if halfmove_clock >= 100 && ctx.tablebase.as_ref().map_or(true, |tb| tb.use_rule50()) {
+        return SearchScore::EVAL(0);
+    }
+
+    if let Some(tb) = ctx.tablebase.as_ref() {
+        if eligible_for_tablebase(tb, board) {
+            if let Some(probe) = tb.probe_wdl(board, halfmove_clock) {
+                let score =
+                    wdl_to_score(probe.wdl, board.side_to_move(), ply_from_root, MATE_VALUE);
+                return SearchScore::EVAL(score);
+            }
+        }
+    }
 
     if ctx.repetition.is_in_threefold_scenario(board) {
         return SearchScore::EVAL(0);
@@ -1094,6 +1128,7 @@ fn root_search_with_window(
     nnue_state: &mut NNUEState,
     history_table: &mut HistoryTable,
     search_stack: &mut SearchStack,
+    tablebase: Option<Arc<Tablebase>>,
     alpha_start: i32,
     beta_start: i32,
 ) -> RootSearchResult {
@@ -1113,6 +1148,32 @@ fn root_search_with_window(
     let mut best_move = None;
     let mut aborted = false;
 
+    let halfmove_clock = repetition_table.current_halfmove_clock();
+    if halfmove_clock >= 100 && tablebase.as_ref().map_or(true, |tb| tb.use_rule50()) {
+        return RootSearchResult {
+            best_move: None,
+            score: 0,
+            fail_low: false,
+            fail_high: false,
+            aborted: false,
+        };
+    }
+
+    if let Some(tb) = tablebase.as_ref() {
+        if eligible_for_tablebase(tb, board) {
+            if let Some(probe) = tb.probe_root(board, halfmove_clock) {
+                let score = wdl_to_score(probe.wdl, board.side_to_move(), 0, MATE_VALUE);
+                return RootSearchResult {
+                    best_move: probe.best_move,
+                    score,
+                    fail_low: score <= alpha,
+                    fail_high: score >= beta,
+                    aborted: false,
+                };
+            }
+        }
+    }
+
     let mut killer_table = KillerTable::new(max_depth + 4);
     let mut ctx = ThreadContext {
         tt: transpo_table,
@@ -1123,6 +1184,7 @@ fn root_search_with_window(
         history: history_table,
         nnue: nnue_state,
         search_stack,
+        tablebase: tablebase.clone(),
     };
     let mut out = io::stdout();
 
@@ -1254,6 +1316,7 @@ fn aspiration_root_search(
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
     search_stack: &mut SearchStack,
+    tablebase: Option<Arc<Tablebase>>,
 ) -> RootSearchResult {
     if prev_score.is_none() {
         return root_search_with_window(
@@ -1266,6 +1329,7 @@ fn aspiration_root_search(
             nnue_state,
             history_table,
             search_stack,
+            tablebase.clone(),
             NEG_INFINITY,
             POS_INFINITY,
         );
@@ -1288,6 +1352,7 @@ fn aspiration_root_search(
             nnue_state,
             history_table,
             search_stack,
+            tablebase.clone(),
             alpha,
             beta,
         );
@@ -1329,6 +1394,7 @@ struct ThreadContext<'a> {
     history: &'a mut HistoryTable,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
+    tablebase: Option<Arc<Tablebase>>,
 }
 
 // TODO: Refactor to keep info about last move
@@ -1370,6 +1436,7 @@ fn iterative_deepening_loop<F>(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     time_manager: Option<&TimeManagerHandle>,
+    tablebase: Option<Arc<Tablebase>>,
     mut on_iteration: F,
 ) -> (Option<ChessMove>, i32)
 where
@@ -1401,6 +1468,7 @@ where
             prev_score,
             &mut history_table,
             &mut search_stack,
+            tablebase.clone(),
         );
 
         if let Some(bm) = result.best_move {
@@ -1450,6 +1518,7 @@ fn spawn_lazy_smp_helpers(
     repetition_table: RepetitionTable,
     threads: usize,
     stop: &StopFlag,
+    tablebase: Option<Arc<Tablebase>>,
 ) -> Vec<thread::JoinHandle<()>> {
     let worker_count = threads.saturating_sub(1);
     if worker_count == 0 {
@@ -1462,6 +1531,7 @@ fn spawn_lazy_smp_helpers(
         let tt_clone = Arc::clone(transpo_table);
         let stop_clone = stop.clone();
         let mut repetition_clone = repetition_table.clone();
+        let tb_clone = tablebase.clone();
         handles.push(thread::spawn(move || {
             // Light stagger to reduce identical search fronts
             if worker_id > 0 {
@@ -1480,6 +1550,7 @@ fn spawn_lazy_smp_helpers(
                 &mut local_stats,
                 nnue_state.as_mut(),
                 None,
+                tb_clone,
                 |_| {},
             );
         }));
@@ -1505,6 +1576,7 @@ pub fn best_move(
     repetition_table: RepetitionTable,
     time_plan: Option<TimePlan>,
     mut stdout_opt: Option<&mut Stdout>,
+    tablebase: Option<Arc<Tablebase>>,
     threads: usize,
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
@@ -1524,6 +1596,7 @@ pub fn best_move(
         repetition_table,
         threads,
         &stop,
+        tablebase.clone(),
     );
 
     let t0 = Instant::now();
@@ -1536,6 +1609,7 @@ pub fn best_move(
         &mut stats,
         nnue_state.as_mut(),
         time_manager.as_ref(),
+        tablebase.clone(),
         |report| {
             if report.result.aborted {
                 return;
