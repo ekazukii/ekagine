@@ -138,6 +138,7 @@ pub struct SearchStats {
     pub null_move_prunes: u64,
     pub futility_prunes: u64,
     pub reverse_futility_prunes: u64,
+    pub razoring_prunes: u64,
     pub late_move_prunes: u64,
     pub lmr_researches: u64,
     pub incremental_move_gen_inits: u64,
@@ -164,6 +165,7 @@ impl SearchStats {
             reverse_futility_prunes: self
                 .reverse_futility_prunes
                 .saturating_sub(other.reverse_futility_prunes),
+            razoring_prunes: self.razoring_prunes.saturating_sub(other.razoring_prunes),
             late_move_prunes: self.late_move_prunes.saturating_sub(other.late_move_prunes),
             lmr_researches: self.lmr_researches.saturating_sub(other.lmr_researches),
             incremental_move_gen_inits: self
@@ -482,6 +484,9 @@ const FUTILITY_MARGIN_BASE: i32 = 100;
 const FUTILITY_MARGIN_PER_DEPTH: i32 = 75;
 const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 4;
 
+const RAZORING_DEPTH: i16 = 1;
+const RAZORING_MARGIN: i32 = 300;
+
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
@@ -707,6 +712,24 @@ fn negamax_it(
     let is_improving = ctx.search_stack.is_improving(ply_from_root as usize, eval);
 
     let in_check = board.checkers().popcnt() > 0;
+
+    // Razoring: at depth 1, if eval is far below alpha, verify position is bad via qsearch
+    if depth_remaining == RAZORING_DEPTH
+        && !is_pv_node
+        && !in_check
+        && alpha > NEG_INFINITY + 1000
+        && beta < POS_INFINITY - 1000
+        && !is_mate_score(alpha)
+        && !is_mate_score(beta)
+        && eval + RAZORING_MARGIN < alpha
+    {
+        let razor_score = quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root);
+        if razor_score <= alpha {
+            ctx.stats.razoring_prunes += 1;
+            return SearchScore::EVAL(razor_score);
+        }
+    }
+
     if !is_pv_node
         && !in_check
         && depth_remaining >= 2
