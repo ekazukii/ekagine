@@ -2,7 +2,7 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
-use crate::tables::{HistoryTable, KillerTable};
+use crate::tables::{CountermoveTable, HistoryTable, KillerTable};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
@@ -767,7 +767,12 @@ fn negamax_it(
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
     let killer_moves = ctx.killers.killers_for(ply_index);
-    let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves);
+    let countermove = ctx
+        .search_stack
+        .get_prev_move(ply_index)
+        .and_then(|prev_move| ctx.countermoves.get(prev_move, !mover));
+    let mut incremental_move_gen =
+        IncrementalMoveGen::new(board, ctx.tt, killer_moves, countermove);
 
     if incremental_move_gen.is_over() {
         if in_check {
@@ -880,6 +885,7 @@ fn negamax_it(
 
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
+        ctx.search_stack.set_move(ply_index, mv);
 
         let mut value_opt: Option<i32> = None;
 
@@ -957,6 +963,11 @@ fn negamax_it(
         if value >= beta {
             if is_quiet {
                 ctx.history.reward(mover, mv, depth_remaining);
+                // Update countermove: if opponent's last move exists, record this as the best response
+                if let Some(prev_move) = ctx.search_stack.get_prev_move(ply_index) {
+                    let prev_color = !mover;
+                    ctx.countermoves.record(prev_move, prev_color, mv);
+                }
             }
             if !is_capture && !gives_check {
                 ctx.killers.record(ply_index, mv);
@@ -1093,6 +1104,7 @@ fn root_search_with_window(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     history_table: &mut HistoryTable,
+    countermove_table: &mut CountermoveTable,
     search_stack: &mut SearchStack,
     alpha_start: i32,
     beta_start: i32,
@@ -1121,13 +1133,14 @@ fn root_search_with_window(
         repetition: repetition_table,
         killers: &mut killer_table,
         history: history_table,
+        countermoves: countermove_table,
         nnue: nnue_state,
         search_stack,
     };
     let mut out = io::stdout();
 
     let killer_moves = ctx.killers.killers_for(0);
-    let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves);
+    let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves, None);
     let root_mover = board.side_to_move();
 
     while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
@@ -1253,6 +1266,7 @@ fn aspiration_root_search(
     nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
+    countermove_table: &mut CountermoveTable,
     search_stack: &mut SearchStack,
 ) -> RootSearchResult {
     if prev_score.is_none() {
@@ -1265,6 +1279,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            countermove_table,
             search_stack,
             NEG_INFINITY,
             POS_INFINITY,
@@ -1287,6 +1302,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            countermove_table,
             search_stack,
             alpha,
             beta,
@@ -1327,14 +1343,15 @@ struct ThreadContext<'a> {
     repetition: &'a mut RepetitionTable,
     killers: &'a mut KillerTable,
     history: &'a mut HistoryTable,
+    countermoves: &'a mut CountermoveTable,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
 }
 
-// TODO: Refactor to keep info about last move
 #[derive(Copy, Clone)]
 struct SearchStackEntry {
     eval: i32,
+    last_move: Option<ChessMove>,
 }
 
 struct SearchStack {
@@ -1344,7 +1361,10 @@ struct SearchStack {
 impl SearchStack {
     fn new() -> Self {
         Self {
-            entries: [SearchStackEntry { eval: 0 }; 64],
+            entries: [SearchStackEntry {
+                eval: 0,
+                last_move: None,
+            }; 64],
         }
     }
 
@@ -1354,6 +1374,18 @@ impl SearchStack {
 
     fn set(&mut self, ply: usize, eval: i32) {
         self.entries[ply].eval = eval;
+    }
+
+    fn set_move(&mut self, ply: usize, mv: ChessMove) {
+        self.entries[ply].last_move = Some(mv);
+    }
+
+    fn get_prev_move(&self, ply: usize) -> Option<ChessMove> {
+        if ply > 0 {
+            self.entries[ply - 1].last_move
+        } else {
+            None
+        }
     }
 
     fn is_improving(&self, ply: usize, new_eval: i32) -> bool {
@@ -1380,6 +1412,7 @@ where
     let mut prev_score: Option<i32> = None;
     let mut stats_prev = *stats;
     let mut history_table = HistoryTable::new();
+    let mut countermove_table = CountermoveTable::new();
     let mut search_stack = SearchStack::new();
 
     for depth in 1..=max_depth {
@@ -1400,6 +1433,7 @@ where
             nnue_state,
             prev_score,
             &mut history_table,
+            &mut countermove_table,
             &mut search_stack,
         );
 
