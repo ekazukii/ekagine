@@ -497,3 +497,41 @@ fn history_bonus(depth: i16) -> i32 {
 fn history_malus(depth: i16) -> i32 {
     history_bonus(depth).max(1) / 2
 }
+
+/// Countermove Table - tracks the best quiet move response to opponent moves
+/// Indexed by [color][from_square][to_square] of the previous move
+pub struct CountermoveTable {
+    entries: [[[Option<ChessMove>; 64]; 64]; 2],
+}
+
+impl CountermoveTable {
+    pub fn new() -> Self {
+        Self {
+            entries: [[[None; 64]; 64]; 2],
+        }
+    }
+
+    /// Get the countermove for a given previous move
+    #[inline]
+    pub fn get(&self, prev_move: ChessMove, prev_color: Color) -> Option<ChessMove> {
+        let color_idx = prev_color.to_index();
+        let from = prev_move.get_source().to_index() as usize;
+        let to = prev_move.get_dest().to_index() as usize;
+        self.entries[color_idx][from][to]
+    }
+
+    /// Record a countermove that caused a beta cutoff
+    #[inline]
+    pub fn record(&mut self, prev_move: ChessMove, prev_color: Color, countermove: ChessMove) {
+        let color_idx = prev_color.to_index();
+        let from = prev_move.get_source().to_index() as usize;
+        let to = prev_move.get_dest().to_index() as usize;
+        self.entries[color_idx][from][to] = Some(countermove);
+    }
+}
+
+impl Default for CountermoveTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}

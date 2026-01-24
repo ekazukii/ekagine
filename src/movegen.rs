@@ -25,6 +25,7 @@ pub struct IncrementalMoveGen<'a> {
     board: &'a Board,
     tt_move: Option<ChessMove>,
     killer_moves: [Option<ChessMove>; 2],
+    countermove: Option<ChessMove>,
     move_gen_iter: MoveGen,
     phase: MoveGenPhase,
     side_to_move: Color,
@@ -49,6 +50,7 @@ impl<'a> IncrementalMoveGen<'a> {
         board: &'a Board,
         tt: &TranspositionTable,
         killer_moves: [Option<ChessMove>; 2],
+        countermove: Option<ChessMove>,
     ) -> Self {
         let probe_iter = MoveGen::new_legal(board);
         let has_legal_moves = probe_iter.len() > 0;
@@ -63,6 +65,7 @@ impl<'a> IncrementalMoveGen<'a> {
             board,
             tt_move,
             killer_moves,
+            countermove,
             phase: MoveGenPhase::TTMove,
             has_legal_moves,
             capture_gen_pending: false,
@@ -133,6 +136,7 @@ impl<'a> IncrementalMoveGen<'a> {
         let mut good_scored: SmallVec<[(ChessMove, i32); 32]> = SmallVec::new();
         let mut bad_scored: SmallVec<[(ChessMove, i32); 64]> = SmallVec::new();
         let mut killer_seen = [false; 2];
+        let mut countermove_seen = false;
 
         self.move_gen_iter.set_iterator_mask(!EMPTY);
         for mv in self.move_gen_iter.by_ref() {
@@ -140,6 +144,13 @@ impl<'a> IncrementalMoveGen<'a> {
                 continue;
             }
             if self.board.piece_on(mv.get_dest()).is_some() {
+                continue;
+            }
+
+            // Check if this is the countermove
+            if !countermove_seen && self.countermove == Some(mv) {
+                countermove_seen = true;
+                killer_hits.push(mv);
                 continue;
             }
 
