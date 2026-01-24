@@ -489,7 +489,7 @@ impl Default for HistoryTable {
 
 #[inline]
 fn history_bonus(depth: i16) -> i32 {
-    let d = depth.max(1) as i32;
+    let d = depth.max(1).min(16) as i32;
     d * d
 }
 
