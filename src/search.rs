@@ -665,6 +665,11 @@ fn should_check_singular_extension(
         return false;
     }
 
+    // Don't check at depths where we won't apply the extension anyway
+    if depth > SINGULAR_EXTENSION_DEPTH_LIMIT {
+        return false;
+    }
+
     // Only at PV nodes
     if !is_pv_node {
         return false;
