@@ -17,20 +17,23 @@ If you already have a lichess account, you can challenge it online at:
   and info-string logging hooks for debugging.
 - Negamax alpha-beta search featuring:
   - Transposition table with aging and bound-aware probing.
-  - Killer moves, history, and correction-history heuristics for quiet move
-    ordering.
-  - Late move reductions, late move pruning, static exchange pruning, and
-    futility variants (regular/reverse) to trim the tree.
-  - Null-move pruning with adaptive depth reduction and check/passed-pawn
-    extensions.
-- Correction history system that captures evaluation deltas to suppress
-  repeatedly over-valued quiet moves.
+  - Killer moves, history, and countermove heuristics for quiet move ordering.
+  - PVS (null-window) search with re-search on fail-high.
+  - Late move reductions, late move pruning, static exchange pruning, razoring,
+    and futility variants (regular/reverse) to trim the tree.
+  - Quiescence search with TT usage and SEE-based filtering.
+  - Null-move pruning with adaptive depth reduction.
+  - Extensions: singular, check, and passed-pawn.
 - NNUE incremental evaluation pipeline (driven by `net.bin`) with stack-based
   state push/pop so the network is coherently updated through the search.
 - Incremental move generator with phased ordering (TT move, MVV-LVA captures,
-  killer quiets, high-scoring quiets, remaining captures/quiets).
+  killer/countermove quiets, history-scored quiets, remaining captures/quiets).
+- Threefold repetition detection inside the search.
+- Lazy SMP-style helper threads when `Threads > 1` (shared TT, independent ID).
 - Time-plan manager tuned for practical time controls (movetime, wtime/btime,
   increments, infinite, ponder) that tracks previous think time.
+- CLI tooling: `--benchmark` (eval comparison + stats), `--best` (FEN solve),
+  `--version` (build info).
 - Testing harness with unit coverage for NNUE deltas and move ordering helpers.
 
 ## Requirements

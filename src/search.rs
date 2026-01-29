@@ -2,7 +2,7 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
-use crate::tables::{CountermoveTable, HistoryTable, KillerTable};
+use crate::tables::{CountermoveTable, ContinuationHistory, HistoryTable, KillerTable};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
@@ -921,12 +921,18 @@ fn negamax_it(
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
     let killer_moves = ctx.killers.killers_for(ply_index);
-    let countermove = ctx
-        .search_stack
-        .get_prev_move(ply_index)
-        .and_then(|prev_move| ctx.countermoves.get(prev_move, !mover));
+    let prev_move_opt = ctx.search_stack.get_prev_move(ply_index);
+    let prev_color = !mover;
+    let countermove = prev_move_opt.and_then(|prev_move| ctx.countermoves.get(prev_move, prev_color));
     let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, ctx.tt, killer_moves, countermove);
+        IncrementalMoveGen::new(
+            board,
+            ctx.tt,
+            killer_moves,
+            countermove,
+            prev_move_opt,
+            ctx.continuation as *const ContinuationHistory,
+        );
 
     if incremental_move_gen.is_over() {
         if in_check {
@@ -1133,9 +1139,23 @@ fn negamax_it(
         if value >= beta {
             if is_quiet {
                 ctx.history.reward(mover, mv, depth_remaining);
+                if let Some(prev_move) = prev_move_opt {
+                    if let (Some(prev_piece), Some(curr_piece)) = (
+                        board.piece_on(prev_move.get_dest()),
+                        board.piece_on(mv.get_source()),
+                    ) {
+                        ctx.continuation.reward(
+                            prev_color,
+                            prev_piece,
+                            prev_move.get_dest(),
+                            curr_piece,
+                            mv.get_dest(),
+                            depth_remaining,
+                        );
+                    }
+                }
                 // Update countermove: if opponent's last move exists, record this as the best response
                 if let Some(prev_move) = ctx.search_stack.get_prev_move(ply_index) {
-                    let prev_color = !mover;
                     ctx.countermoves.record(prev_move, prev_color, mv);
                 }
             }
@@ -1150,9 +1170,39 @@ fn negamax_it(
         if was_new_best {
             if is_quiet {
                 ctx.history.reward_soft(mover, mv, depth_remaining);
+                if let Some(prev_move) = prev_move_opt {
+                    if let (Some(prev_piece), Some(curr_piece)) = (
+                        board.piece_on(prev_move.get_dest()),
+                        board.piece_on(mv.get_source()),
+                    ) {
+                        ctx.continuation.reward_soft(
+                            prev_color,
+                            prev_piece,
+                            prev_move.get_dest(),
+                            curr_piece,
+                            mv.get_dest(),
+                            depth_remaining,
+                        );
+                    }
+                }
             }
         } else if is_quiet {
             ctx.history.penalize(mover, mv, depth_remaining);
+            if let Some(prev_move) = prev_move_opt {
+                if let (Some(prev_piece), Some(curr_piece)) = (
+                    board.piece_on(prev_move.get_dest()),
+                    board.piece_on(mv.get_source()),
+                ) {
+                    ctx.continuation.penalize(
+                        prev_color,
+                        prev_piece,
+                        prev_move.get_dest(),
+                        curr_piece,
+                        mv.get_dest(),
+                        depth_remaining,
+                    );
+                }
+            }
         }
 
         if value > alpha {
@@ -1274,6 +1324,7 @@ fn root_search_with_window(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     history_table: &mut HistoryTable,
+    continuation_table: &mut ContinuationHistory,
     countermove_table: &mut CountermoveTable,
     search_stack: &mut SearchStack,
     alpha_start: i32,
@@ -1303,6 +1354,7 @@ fn root_search_with_window(
         repetition: repetition_table,
         killers: &mut killer_table,
         history: history_table,
+        continuation: continuation_table,
         countermoves: countermove_table,
         nnue: nnue_state,
         search_stack,
@@ -1310,7 +1362,15 @@ fn root_search_with_window(
     let mut out = io::stdout();
 
     let killer_moves = ctx.killers.killers_for(0);
-    let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves, None);
+    let mut incremental_move_gen =
+        IncrementalMoveGen::new(
+            board,
+            ctx.tt,
+            killer_moves,
+            None,
+            None,
+            ctx.continuation as *const ContinuationHistory,
+        );
     let root_mover = board.side_to_move();
 
     while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
@@ -1323,6 +1383,7 @@ fn root_search_with_window(
         let is_capture =
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let is_quiet = !is_capture;
+        ctx.search_stack.set_move(0, mv);
         let new_board = board_do_move(board, mv, ctx.repetition);
         let is_pv_node = best_move.is_none();
         let mut child_depth = max_depth.saturating_sub(1);
@@ -1437,6 +1498,7 @@ fn aspiration_root_search(
     nnue_state: &mut NNUEState,
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
+    continuation_table: &mut ContinuationHistory,
     countermove_table: &mut CountermoveTable,
     search_stack: &mut SearchStack,
 ) -> RootSearchResult {
@@ -1450,6 +1512,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            continuation_table,
             countermove_table,
             search_stack,
             NEG_INFINITY,
@@ -1473,6 +1536,7 @@ fn aspiration_root_search(
             stats,
             nnue_state,
             history_table,
+            continuation_table,
             countermove_table,
             search_stack,
             alpha,
@@ -1514,6 +1578,7 @@ struct ThreadContext<'a> {
     repetition: &'a mut RepetitionTable,
     killers: &'a mut KillerTable,
     history: &'a mut HistoryTable,
+    continuation: &'a mut ContinuationHistory,
     countermoves: &'a mut CountermoveTable,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
@@ -1583,6 +1648,7 @@ where
     let mut prev_score: Option<i32> = None;
     let mut stats_prev = *stats;
     let mut history_table = HistoryTable::new();
+    let mut continuation_table = ContinuationHistory::new();
     let mut countermove_table = CountermoveTable::new();
     let mut search_stack = SearchStack::new();
 
@@ -1604,6 +1670,7 @@ where
             nnue_state,
             prev_score,
             &mut history_table,
+            &mut continuation_table,
             &mut countermove_table,
             &mut search_stack,
         );

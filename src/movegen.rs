@@ -1,4 +1,4 @@
-use crate::tables::HistoryTable;
+use crate::tables::{ContinuationHistory, HistoryTable};
 use crate::TranspositionTable;
 use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove,
@@ -26,6 +26,8 @@ pub struct IncrementalMoveGen<'a> {
     tt_move: Option<ChessMove>,
     killer_moves: [Option<ChessMove>; 2],
     countermove: Option<ChessMove>,
+    prev_move: Option<ChessMove>,
+    continuation: *const ContinuationHistory,
     move_gen_iter: MoveGen,
     phase: MoveGenPhase,
     side_to_move: Color,
@@ -51,6 +53,8 @@ impl<'a> IncrementalMoveGen<'a> {
         tt: &TranspositionTable,
         killer_moves: [Option<ChessMove>; 2],
         countermove: Option<ChessMove>,
+        prev_move: Option<ChessMove>,
+        continuation: *const ContinuationHistory,
     ) -> Self {
         let probe_iter = MoveGen::new_legal(board);
         let has_legal_moves = probe_iter.len() > 0;
@@ -66,6 +70,8 @@ impl<'a> IncrementalMoveGen<'a> {
             tt_move,
             killer_moves,
             countermove,
+            prev_move,
+            continuation,
             phase: MoveGenPhase::TTMove,
             has_legal_moves,
             capture_gen_pending: false,
@@ -171,6 +177,22 @@ impl<'a> IncrementalMoveGen<'a> {
             }
 
             let mut score = history.score(self.side_to_move, mv);
+            if let Some(prev_mv) = self.prev_move {
+                if let (Some(prev_piece), Some(curr_piece)) =
+                    (self.board.piece_on(prev_mv.get_dest()), self.board.piece_on(mv.get_source()))
+                {
+                    let prev_color = !self.side_to_move;
+                    // Safe because continuation points to a valid table owned by the caller.
+                    let ch = unsafe { &*self.continuation };
+                    score += ch.score(
+                        prev_color,
+                        prev_piece,
+                        prev_mv.get_dest(),
+                        curr_piece,
+                        mv.get_dest(),
+                    );
+                }
+            }
             if mv.get_promotion().is_some() {
                 score += PROMOTION_HISTORY_BONUS;
                 good_scored.push((mv, score));

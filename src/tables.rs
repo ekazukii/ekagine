@@ -435,6 +435,13 @@ pub struct HistoryTable {
     entries: [[[i32; 64]; 64]; 2],
 }
 
+/// Continuation History: scores quiet moves conditioned on the previous move.
+/// Indexed by [prev_color][prev_piece][prev_to][curr_piece][curr_to]
+#[derive(Debug, Clone)]
+pub struct ContinuationHistory {
+    entries: [[[[[i32; 64]; 6]; 64]; 6]; 2],
+}
+
 impl HistoryTable {
     pub fn new() -> Self {
         Self {
@@ -482,6 +489,99 @@ impl HistoryTable {
 }
 
 impl Default for HistoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContinuationHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: [[[[[0; 64]; 6]; 64]; 6]; 2],
+        }
+    }
+
+    #[inline]
+    pub fn score(
+        &self,
+        prev_color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        curr_piece: Piece,
+        curr_to: Square,
+    ) -> i32 {
+        let c = prev_color.to_index();
+        let pp = prev_piece.to_index() as usize;
+        let pt = prev_to.to_index();
+        let cp = curr_piece.to_index() as usize;
+        let ct = curr_to.to_index();
+        self.entries[c][pp][pt][cp][ct]
+    }
+
+    #[inline]
+    pub fn reward(
+        &mut self,
+        prev_color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        curr_piece: Piece,
+        curr_to: Square,
+        depth: i16,
+    ) {
+        let bonus = history_bonus(depth);
+        let entry = self.mut_entry(prev_color, prev_piece, prev_to, curr_piece, curr_to);
+        *entry = (*entry + bonus).clamp(-HISTORY_CAP, HISTORY_CAP);
+    }
+
+    #[inline]
+    pub fn reward_soft(
+        &mut self,
+        prev_color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        curr_piece: Piece,
+        curr_to: Square,
+        depth: i16,
+    ) {
+        let bonus = history_bonus(depth) / 2;
+        let entry = self.mut_entry(prev_color, prev_piece, prev_to, curr_piece, curr_to);
+        *entry = (*entry + bonus).clamp(-HISTORY_CAP, HISTORY_CAP);
+    }
+
+    #[inline]
+    pub fn penalize(
+        &mut self,
+        prev_color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        curr_piece: Piece,
+        curr_to: Square,
+        depth: i16,
+    ) {
+        let malus = history_malus(depth);
+        let entry = self.mut_entry(prev_color, prev_piece, prev_to, curr_piece, curr_to);
+        *entry = (*entry - malus).clamp(-HISTORY_CAP, HISTORY_CAP);
+    }
+
+    #[inline]
+    fn mut_entry(
+        &mut self,
+        prev_color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        curr_piece: Piece,
+        curr_to: Square,
+    ) -> &mut i32 {
+        let c = prev_color.to_index();
+        let pp = prev_piece.to_index() as usize;
+        let pt = prev_to.to_index();
+        let cp = curr_piece.to_index() as usize;
+        let ct = curr_to.to_index();
+        &mut self.entries[c][pp][pt][cp][ct]
+    }
+}
+
+impl Default for ContinuationHistory {
     fn default() -> Self {
         Self::new()
     }
