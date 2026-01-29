@@ -3,6 +3,7 @@ use crate::movegen::{
 };
 use crate::nnue::NNUEState;
 use crate::tables::{CountermoveTable, HistoryTable, KillerTable};
+use crate::time::{TimeManagerHandle, TimePlan, TimeScaleFactors};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
@@ -20,105 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
-
-#[derive(Debug, Clone)]
-pub struct TimePlan {
-    pub soft_limit: Option<Duration>,
-    pub hard_limit: Option<Duration>,
-    pub infinite: bool,
-}
-
-impl TimePlan {
-    pub fn fixed(duration: Duration) -> Self {
-        let guard_soft = Duration::from_millis(10);
-        let guard_hard = Duration::from_millis(2);
-        let soft = if duration > guard_soft {
-            duration.saturating_sub(guard_soft)
-        } else {
-            duration
-        };
-        let hard = if duration > guard_hard {
-            duration.saturating_sub(guard_hard)
-        } else {
-            duration
-        };
-
-        Self {
-            soft_limit: Some(soft),
-            hard_limit: Some(hard.max(soft)),
-            infinite: false,
-        }
-    }
-
-    pub fn infinite() -> Self {
-        Self {
-            soft_limit: None,
-            hard_limit: None,
-            infinite: true,
-        }
-    }
-
-    fn has_deadlines(&self) -> bool {
-        self.soft_limit.is_some() || self.hard_limit.is_some()
-    }
-}
-
-struct TimeManagerHandle {
-    soft_deadline: Option<Instant>,
-    cancel: Arc<AtomicBool>,
-}
-
-impl TimeManagerHandle {
-    fn new(stop: &StopFlag, plan: &TimePlan, start: Instant) -> Option<Self> {
-        if !plan.has_deadlines() {
-            return None;
-        }
-
-        let soft_deadline = plan.soft_limit.map(|d| start + d);
-        let hard_deadline = plan.hard_limit.map(|d| start + d);
-        let cancel = Arc::new(AtomicBool::new(false));
-
-        if let Some(deadline) = hard_deadline {
-            let cancel_clone = Arc::clone(&cancel);
-            let stop_clone = stop.clone();
-            thread::spawn(move || loop {
-                if cancel_clone.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let now = Instant::now();
-                if now >= deadline {
-                    stop_clone.store(true, Ordering::Relaxed);
-                    break;
-                }
-
-                let remaining = deadline.saturating_duration_since(now);
-                if remaining.is_zero() {
-                    thread::yield_now();
-                } else {
-                    let sleep_for = remaining.min(Duration::from_millis(5));
-                    thread::sleep(sleep_for);
-                }
-            });
-        }
-
-        Some(Self {
-            soft_deadline,
-            cancel,
-        })
-    }
-
-    fn soft_limit_reached(&self, now: Instant) -> bool {
-        if let Some(deadline) = self.soft_deadline {
-            return now >= deadline;
-        }
-        false
-    }
-
-    fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
-}
 
 enum SearchScore {
     CANCELLED,
@@ -1231,6 +1133,9 @@ struct RootSearchResult {
     fail_low: bool,
     fail_high: bool,
     aborted: bool,
+    best_move_nodes: u64,
+    total_nodes: u64,
+    first_move_fail_high: bool,
 }
 
 fn collect_principal_variation(
@@ -1295,6 +1200,12 @@ fn root_search_with_window(
     let mut best_move = None;
     let mut aborted = false;
 
+    // Node tracking for time management
+    let mut best_move_nodes = 0u64;
+    let mut total_nodes = 0u64;
+    let mut first_move_fail_high = false;
+    let mut move_count = 0usize;
+
     let mut killer_table = KillerTable::new(max_depth + 4);
     let mut ctx = ThreadContext {
         tt: transpo_table,
@@ -1318,6 +1229,9 @@ fn root_search_with_window(
             aborted = true;
             break;
         }
+
+        move_count += 1;
+        let nodes_before = ctx.stats.nodes;
 
         let current_best = best_move.map(|bm| (bm, best_value));
         let is_capture =
@@ -1345,6 +1259,9 @@ fn root_search_with_window(
 
         ctx.nnue.pop();
 
+        let nodes_spent = ctx.stats.nodes - nodes_before;
+        total_nodes += nodes_spent;
+
         match result {
             SearchScore::CANCELLED => {
                 ctx.repetition.pop();
@@ -1359,7 +1276,11 @@ fn root_search_with_window(
                     log_root_best_update(&mut out, max_depth, &mv, value, current_best);
                     best_value = value;
                     best_move = Some(mv);
+
+                    // Transfer node accounting: previous best moves become non-best
+                    best_move_nodes = nodes_spent;
                 }
+
                 if value > alpha {
                     alpha = value;
                 }
@@ -1375,6 +1296,10 @@ fn root_search_with_window(
                 }
 
                 if alpha >= beta {
+                    // First move caused fail-high
+                    if move_count == 1 {
+                        first_move_fail_high = true;
+                    }
                     ctx.repetition.pop();
                     break;
                 }
@@ -1424,6 +1349,9 @@ fn root_search_with_window(
         fail_low,
         fail_high,
         aborted,
+        best_move_nodes,
+        total_nodes,
+        first_move_fail_high,
     }
 }
 
@@ -1586,6 +1514,10 @@ where
     let mut countermove_table = CountermoveTable::new();
     let mut search_stack = SearchStack::new();
 
+    // Track best move stability for time management
+    let mut best_move_changes = 0usize;
+    let mut prev_best_move: Option<ChessMove> = None;
+
     for depth in 1..=max_depth {
         if should_stop(stop) {
             break;
@@ -1608,7 +1540,28 @@ where
             &mut search_stack,
         );
 
+        // Extract values we need before moving result
+        let result_aborted = result.aborted;
+        let result_score = result.score;
+        let result_best_move_nodes = result.best_move_nodes;
+        let result_total_nodes = result.total_nodes;
+        let result_first_move_fail_high = result.first_move_fail_high;
+
+        // Calculate score trend BEFORE updating prev_score
+        let score_trend_for_time = TimeScaleFactors::calculate_score_trend_factor(
+            prev_score,
+            result_score,
+        );
+
         if let Some(bm) = result.best_move {
+            // Track best move changes for time management
+            if let Some(prev) = prev_best_move {
+                if prev != bm {
+                    best_move_changes += 1;
+                }
+            }
+            prev_best_move = Some(bm);
+
             best_move = Some(bm);
             best_score = result.score;
             prev_score = Some(result.score);
@@ -1637,8 +1590,27 @@ where
             break;
         }
 
+        // Calculate time scaling factors for intelligent time management
         if let Some(manager) = time_manager {
-            if manager.soft_limit_reached(Instant::now()) {
+            let mut factors = TimeScaleFactors::new();
+
+            // Only apply scaling after depth 4 to avoid instability in early search
+            if depth >= 4 && !result_aborted {
+                factors.set_stability(TimeScaleFactors::calculate_stability_factor(
+                    best_move_changes,
+                    depth,
+                ));
+                factors.set_node_fraction(TimeScaleFactors::calculate_node_fraction_factor(
+                    result_best_move_nodes,
+                    result_total_nodes,
+                ));
+                factors.set_score_trend(score_trend_for_time);
+                factors.set_fail_high_early(result_first_move_fail_high);
+            }
+
+            let time_scale = factors.compute_scale();
+
+            if manager.soft_limit_reached_scaled(Instant::now(), time_scale) {
                 stop.store(true, Ordering::Relaxed);
                 break;
             }

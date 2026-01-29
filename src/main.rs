@@ -8,8 +8,10 @@ mod movegen;
 mod nnue;
 mod search;
 mod tables;
+mod time;
 
-use crate::search::{best_move, uci_score_string, SearchStats, TimePlan};
+use crate::search::{best_move, uci_score_string, SearchStats};
+use crate::time::{plan_time_for_move, TimePlan};
 use chess::Color::{Black, White};
 use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
@@ -23,8 +25,6 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-type StopFlag = Arc<AtomicBool>;
 
 const MAX_THREADS: usize = 64;
 
@@ -53,6 +53,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub use tables::{TTEntry, TTFlag, TranspositionTable};
+pub use time::StopFlag;
 
 pub fn resets_halfmove_clock(board: &Board, mv: ChessMove) -> bool {
     if matches!(board.piece_on(mv.get_source()), Some(Piece::Pawn)) {
@@ -214,92 +215,6 @@ fn parse_go_tokens(tokens: &[&str]) -> ParsedGo {
         i += 1;
     }
     parsed
-}
-
-fn plan_time_for_move(
-    tokens: &[&str],
-    side: Color,
-    board: &Board,
-    state: &EngineState,
-) -> Option<TimePlan> {
-    let parsed = parse_go_tokens(tokens);
-
-    if parsed.infinite || parsed.ponder {
-        return Some(TimePlan::infinite());
-    }
-
-    if let Some(ms) = parsed.movetime {
-        let capped = ms.max(1);
-        return Some(TimePlan::fixed(Duration::from_millis(capped)));
-    }
-
-    let (time_left_opt, increment_opt) = match side {
-        Color::White => (parsed.wtime, parsed.winc),
-        Color::Black => (parsed.btime, parsed.binc),
-    };
-
-    let time_left = time_left_opt.unwrap_or(0);
-    let increment = increment_opt.unwrap_or(0);
-
-    if time_left == 0 && increment == 0 {
-        return Some(TimePlan::fixed(Duration::from_millis(5)));
-    }
-
-    let moves_remaining = parsed
-        .movestogo
-        .filter(|m| *m > 0)
-        .unwrap_or_else(|| estimate_moves_to_go(board));
-
-    const MIN_RESERVE_MS: u64 = 40;
-    const RESERVE_DIVISOR: u64 = 20;
-    const MIN_THINK_MS: u64 = 5;
-    const SOFT_GUARD_MS: u64 = 8;
-    const HARD_GUARD_MS: u64 = 2;
-
-    let mut reserve = time_left / RESERVE_DIVISOR;
-    if reserve < MIN_RESERVE_MS {
-        reserve = MIN_RESERVE_MS;
-    }
-    if reserve > time_left / 2 {
-        reserve = time_left / 2;
-    }
-
-    let mut usable = time_left.saturating_sub(reserve);
-    if usable < MIN_THINK_MS {
-        usable = time_left.max(increment);
-    }
-    if usable < MIN_THINK_MS {
-        usable = MIN_THINK_MS;
-    }
-
-    let moves = moves_remaining.max(1);
-    let per_move = usable / moves;
-    let inc_share = (increment * 7) / 10;
-
-    let mut soft_ms = per_move.saturating_add(inc_share).max(MIN_THINK_MS);
-    if soft_ms + SOFT_GUARD_MS > usable {
-        soft_ms = usable.saturating_sub(SOFT_GUARD_MS).max(MIN_THINK_MS);
-    }
-
-    if let Some(prev) = state.last_think_time {
-        let prev_ms = prev.as_millis() as u64;
-        // Smooth towards recent usage without exceeding usable budget.
-        soft_ms = ((soft_ms + prev_ms) / 2).clamp(MIN_THINK_MS, usable);
-    }
-
-    let mut hard_ms = soft_ms
-        .saturating_add(per_move / 2)
-        .saturating_add(increment / 2)
-        .saturating_add(5);
-    if hard_ms > usable {
-        hard_ms = usable.saturating_sub(HARD_GUARD_MS).max(soft_ms);
-    }
-
-    Some(TimePlan {
-        soft_limit: Some(Duration::from_millis(soft_ms)),
-        hard_limit: Some(Duration::from_millis(hard_ms.max(soft_ms))),
-        infinite: false,
-    })
 }
 
 fn uci_loop() {
