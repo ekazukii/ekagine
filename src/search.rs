@@ -143,6 +143,8 @@ pub struct SearchStats {
     pub lmr_researches: u64,
     pub incremental_move_gen_inits: u64,
     pub incremental_move_gen_capture_lists: u64,
+    pub singular_extensions: u64,
+    pub singular_checks: u64,
     pub effective_branching_factor: f64,
     pub depth: u64,
 }
@@ -174,6 +176,8 @@ impl SearchStats {
             incremental_move_gen_capture_lists: self
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
+            singular_extensions: self.singular_extensions.saturating_sub(other.singular_extensions),
+            singular_checks: self.singular_checks.saturating_sub(other.singular_checks),
             effective_branching_factor: 0.0,
             depth: self.depth,
         }
@@ -207,7 +211,7 @@ impl SearchStats {
 
     pub(crate) fn format_as_info(&self) -> String {
         format!(
-            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} late_move_prune={} lmr_retry={} img_init={} img_capgen={} ebf={:.2} depth={}",
+            "nodes={} qnodes={} tt_hits={} tt_exact={} tt_lower={} tt_upper={} beta_cut={} qbeta_cut={} null_prune={} futility_prune={} rfutility_prune={} late_move_prune={} lmr_retry={} img_init={} img_capgen={} sing_ext={} sing_check={} ebf={:.2} depth={}",
             self.nodes,
             self.qnodes,
             self.tt_hits,
@@ -223,6 +227,8 @@ impl SearchStats {
             self.lmr_researches,
             self.incremental_move_gen_inits,
             self.incremental_move_gen_capture_lists,
+            self.singular_extensions,
+            self.singular_checks,
             self.effective_branching_factor,
             self.depth,
         )
@@ -489,6 +495,9 @@ const RAZORING_MARGIN: i32 = 300;
 
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
+const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
+const SINGULAR_EXTENSION_DEPTH_LIMIT: i16 = 12;
+const SINGULAR_BETA_MARGIN_MULTIPLIER: i32 = 2;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
 const LATE_MOVE_PRUNING_BASE: usize = 4;
@@ -638,6 +647,103 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
 }
 
 // ---------------------------------------------------------------------------
+// Singular Extension helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn should_check_singular_extension(
+    depth: i16,
+    is_pv_node: bool,
+    in_check: bool,
+    tt_move: Option<ChessMove>,
+    tt_depth: i16,
+    tt_flag: TTFlag,
+    exclude_move: Option<ChessMove>,
+) -> bool {
+    // Must have sufficient depth
+    if depth < SINGULAR_EXTENSION_MIN_DEPTH {
+        return false;
+    }
+
+    // Don't check at depths where we won't apply the extension anyway
+    if depth > SINGULAR_EXTENSION_DEPTH_LIMIT {
+        return false;
+    }
+
+    // Only at PV nodes
+    if !is_pv_node {
+        return false;
+    }
+
+    // Don't do singular extensions while in check (too expensive)
+    if in_check {
+        return false;
+    }
+
+    // Must have a TT move to test
+    if tt_move.is_none() {
+        return false;
+    }
+
+    // TT entry must be deep enough (at least depth-3)
+    if tt_depth < depth - 3 {
+        return false;
+    }
+
+    // TT must indicate this move is good (Lower or Exact bound)
+    // Upper bound means the move failed low, not a good candidate
+    if tt_flag == TTFlag::Upper {
+        return false;
+    }
+
+    // Don't do singular extensions in the verification search itself!
+    if exclude_move.is_some() {
+        return false;
+    }
+
+    true
+}
+
+fn is_singular(
+    ctx: &mut ThreadContext,
+    board: &Board,
+    candidate_move: ChessMove,
+    depth: i16,
+    beta: i32,
+    ply_from_root: i32,
+) -> bool {
+    // Reduced beta: if other moves can't reach this, candidate is singular
+    let s_beta_margin = SINGULAR_BETA_MARGIN_MULTIPLIER * depth as i32;
+    let s_beta = beta - s_beta_margin;
+
+    // Reduced depth for verification search (typically depth/2 - 1)
+    let s_depth = (depth / 2) - 1;
+    if s_depth <= 0 {
+        return false;
+    }
+
+    // Search all moves EXCEPT the candidate
+    let result = negamax_it(
+        ctx,
+        board,
+        s_depth,
+        s_beta - 1,      // alpha
+        s_beta,          // beta (null window)
+        ply_from_root,
+        false,           // Not a PV node
+        Some(candidate_move), // Exclude this move
+    );
+
+    match result {
+        SearchScore::CANCELLED => false,
+        SearchScore::EVAL(score) => {
+            // If no other move reached s_beta, the candidate is singular
+            score < s_beta
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core Negamax with α/β pruning + PV maintenance — renamed `negamax_it`.
 // ---------------------------------------------------------------------------
 /// This is the core of the move search, it perform a negamax styled search with alpha/beta pruning
@@ -650,6 +756,7 @@ fn negamax_it(
     beta: i32,
     ply_from_root: i32,
     is_pv_node: bool,
+    exclude_move: Option<ChessMove>,
 ) -> SearchScore {
     if should_stop(ctx.stop) {
         let mut out = io::stdout();
@@ -746,6 +853,7 @@ fn negamax_it(
                 -beta + 1,
                 ply_from_root + 1,
                 false,
+                None,
             );
             board_pop(&nboard, ctx.repetition);
             ctx.nnue.pop();
@@ -787,6 +895,29 @@ fn negamax_it(
         }
     }
 
+    // Singular extension check
+    let tt_move = tt_hit.and_then(|e| e.best_move);
+    let mut singular_extension: i16 = 0;
+    if let Some(entry) = tt_hit {
+        if should_check_singular_extension(
+            depth_remaining,
+            is_pv_node,
+            in_check,
+            tt_move,
+            entry.depth,
+            entry.flag,
+            exclude_move,
+        ) {
+            ctx.stats.singular_checks += 1;
+            if let Some(candidate_move) = tt_move {
+                if is_singular(ctx, board, candidate_move, depth_remaining, beta, ply_from_root) {
+                    singular_extension = 1;
+                    ctx.stats.singular_extensions += 1;
+                }
+            }
+        }
+    }
+
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
     let killer_moves = ctx.killers.killers_for(ply_index);
@@ -815,6 +946,11 @@ fn negamax_it(
     while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
+        }
+
+        // Skip excluded move in verification search for singular extensions
+        if exclude_move.is_some() && Some(mv) == exclude_move {
+            continue;
         }
 
         let is_capture =
@@ -854,13 +990,21 @@ fn negamax_it(
         let child_is_pv_node = is_pv_node && is_first_move;
 
         let mut extension: i16 = 0;
+
+        // Check if this move gets singular extension
+        if Some(mv) == tt_move
+            && singular_extension > 0
+            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT {
+            extension = cmp::max(extension, singular_extension);
+        }
+
         if gives_check && depth_remaining <= CHECK_EXTENSION_DEPTH_LIMIT && depth_remaining > 0 {
-            extension = 1;
+            extension = cmp::max(extension, 1);
         } else if depth_remaining <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
             && depth_remaining > 0
             && is_passed_pawn_push(board, &new_board, mv)
         {
-            extension = 1;
+            extension = cmp::max(extension, 1);
         }
 
         if !is_pv_node
@@ -922,6 +1066,7 @@ fn negamax_it(
                 -alpha,
                 ply_from_root + 1,
                 false,
+                None,
             ) {
                 SearchScore::CANCELLED => {}
                 SearchScore::EVAL(v) => {
@@ -939,6 +1084,7 @@ fn negamax_it(
                             -alpha,
                             ply_from_root + 1,
                             is_pv_node,
+                            None,
                         ) {
                             SearchScore::CANCELLED => {}
                             SearchScore::EVAL(v2) => {
@@ -960,6 +1106,7 @@ fn negamax_it(
                 -alpha,
                 ply_from_root + 1,
                 child_is_pv_node,
+                None,
             ) {
                 SearchScore::CANCELLED => {}
                 SearchScore::EVAL(v) => {
@@ -1193,6 +1340,7 @@ fn root_search_with_window(
             -alpha,
             1,
             is_pv_node,
+            None,
         );
 
         ctx.nnue.pop();

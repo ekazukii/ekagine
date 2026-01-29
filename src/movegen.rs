@@ -470,6 +470,10 @@ pub fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
             };
 
         gain[depth] = captured_value - gain[depth - 1];
+        // Not a bug: if recapturing gives negative gain, the player won't recapture.
+        // In chess you can always stop the exchange sequence if continuing is bad.
+        // Example: Pawn takes Knight (+300), opponent can recapture but that gives them -200,
+        // so they simply don't recapture. The negamax loop below handles the final eval.
         if gain[depth] < 0 {
             break;
         }
