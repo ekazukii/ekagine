@@ -1,4 +1,4 @@
-use crate::tables::HistoryTable;
+use crate::tables::{CaptureHistoryTable, HistoryTable};
 use crate::TranspositionTable;
 use chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove,
@@ -86,7 +86,7 @@ impl<'a> IncrementalMoveGen<'a> {
         }
     }
 
-    fn ensure_captures(&mut self) {
+    fn ensure_captures(&mut self, cap_hist: &CaptureHistoryTable) {
         if self.captures_generated {
             return;
         }
@@ -108,9 +108,20 @@ impl<'a> IncrementalMoveGen<'a> {
                 continue;
             }
 
-            let mut score = see_for_sort(self.board, mv);
-            if score >= 0 {
-                score += 1;
+            let see_val = see_for_sort(self.board, mv);
+            let ch_bonus = if let (Some(piece), Some(captured)) = (
+                self.board.piece_on(mv.get_source()),
+                self.board.piece_on(mv.get_dest()),
+            ) {
+                cap_hist
+                    .score(self.side_to_move, piece, mv.get_dest(), captured)
+            } else {
+                0
+            };
+            // SEE dominates; capture history is a tiebreaker within the same SEE band
+            let mut score = see_val * 1024 + ch_bonus;
+            if see_val >= 0 {
+                score += 1024; // ensure good captures stay above 0
                 good_scored.push((mv, score));
             } else {
                 bad_scored.push((mv, score));
@@ -202,7 +213,7 @@ impl<'a> IncrementalMoveGen<'a> {
         !self.has_legal_moves
     }
 
-    pub fn next(&mut self, history: &HistoryTable) -> Option<ChessMove> {
+    pub fn next(&mut self, history: &HistoryTable, cap_hist: &CaptureHistoryTable) -> Option<ChessMove> {
         loop {
             match self.phase {
                 MoveGenPhase::TTMove => {
@@ -212,7 +223,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     }
                 }
                 MoveGenPhase::GoodCaptures => {
-                    self.ensure_captures();
+                    self.ensure_captures(cap_hist);
                     if self.good_capture_idx < self.good_captures.len() {
                         let mv = self.good_captures[self.good_capture_idx];
                         self.good_capture_idx += 1;
@@ -235,7 +246,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::BadCaptures;
                 }
                 MoveGenPhase::BadCaptures => {
-                    self.ensure_captures();
+                    self.ensure_captures(cap_hist);
                     if self.bad_capture_idx < self.bad_captures.len() {
                         let mv = self.bad_captures[self.bad_capture_idx];
                         self.bad_capture_idx += 1;
