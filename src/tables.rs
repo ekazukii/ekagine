@@ -535,3 +535,64 @@ impl Default for CountermoveTable {
         Self::new()
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capture History
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Capture History Table
+///
+/// Tracks which captures work well, indexed by
+/// [color][moving_piece][to_square][captured_piece].
+/// 2 × 6 × 64 × 6 = 4,608 entries (~18 KB).
+pub struct CaptureHistoryTable {
+    entries: [[[[i32; 6]; 64]; 6]; 2],
+}
+
+impl CaptureHistoryTable {
+    pub fn new() -> Self {
+        Self {
+            entries: [[[[0i32; 6]; 64]; 6]; 2],
+        }
+    }
+
+    #[inline]
+    pub fn score(&self, color: Color, piece: Piece, to: Square, captured: Piece) -> i32 {
+        self.entries[color.to_index()][piece.to_index()][to.to_index()][captured.to_index()]
+    }
+
+    #[inline]
+    fn update(&mut self, color: Color, piece: Piece, to: Square, captured: Piece, delta: i32) {
+        let entry = &mut self.entries[color.to_index()][piece.to_index()][to.to_index()]
+            [captured.to_index()];
+        // Gravity-based update to prevent saturation
+        *entry += delta - *entry * delta.abs() / HISTORY_CAP;
+    }
+
+    pub fn reward(&mut self, color: Color, piece: Piece, to: Square, captured: Piece, depth: i16) {
+        let bonus = history_bonus(depth);
+        if bonus > 0 {
+            self.update(color, piece, to, captured, bonus);
+        }
+    }
+
+    pub fn penalize(
+        &mut self,
+        color: Color,
+        piece: Piece,
+        to: Square,
+        captured: Piece,
+        depth: i16,
+    ) {
+        let malus = history_malus(depth);
+        if malus > 0 {
+            self.update(color, piece, to, captured, -malus);
+        }
+    }
+}
+
+impl Default for CaptureHistoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
