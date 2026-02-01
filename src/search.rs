@@ -429,10 +429,6 @@ const LMR_MAX_MOVES: usize = 64;
 const LMR_BASE: f64 = 0.75;
 const LMR_DIVISOR: f64 = 2.25;
 
-lazy_static! {
-    static ref LMR_TABLE: [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] = compute_lmr_table();
-}
-
 fn compute_lmr_table() -> [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] {
     let mut table = [[0i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH];
     for depth in 1..LMR_MAX_DEPTH {
@@ -444,6 +440,8 @@ fn compute_lmr_table() -> [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] {
     }
     table
 }
+
+static LMR_TABLE: [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] = compute_lmr_table();
 
 #[inline]
 fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool) -> i16 {
