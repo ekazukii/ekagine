@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "chess_engine"
-version = "2.10.1"
+version = "2.10.2"
 dependencies = [
  "chess",
  "lazy_static",
