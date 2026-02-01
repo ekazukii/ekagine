@@ -468,23 +468,11 @@ fn is_passed_pawn(board: &Board, square: Square, color: Color) -> bool {
         Color::Black => Color::White,
     };
     let enemy_pawns = *board.pieces(Piece::Pawn) & board.color_combined(enemy_color);
-    let file_idx = square.get_file().to_index() as i32;
-    let rank_idx = square.get_rank().to_index() as i32;
-
-    let mut iter = enemy_pawns;
-    for enemy_sq in &mut iter {
-        let df = enemy_sq.get_file().to_index() as i32 - file_idx;
-        if df.abs() <= 1 {
-            let enemy_rank = enemy_sq.get_rank().to_index() as i32;
-            match color {
-                Color::White if enemy_rank > rank_idx => return false,
-                Color::Black if enemy_rank < rank_idx => return false,
-                _ => {}
-            }
-        }
-    }
-
-    true
+    let mask = match color {
+        Color::White => crate::eval::PASSED_MASK_WHITE[square.to_index()],
+        Color::Black => crate::eval::PASSED_MASK_BLACK[square.to_index()],
+    };
+    (mask & enemy_pawns).0 == 0
 }
 
 #[inline]

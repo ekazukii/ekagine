@@ -301,8 +301,8 @@ fn build_passed_masks(color: Color) -> [BitBoard; 64] {
 }
 
 lazy_static::lazy_static! {
-    static ref PASSED_MASK_WHITE: [BitBoard; 64] = build_passed_masks(Color::White);
-    static ref PASSED_MASK_BLACK: [BitBoard; 64] = build_passed_masks(Color::Black);
+    pub static ref PASSED_MASK_WHITE: [BitBoard; 64] = build_passed_masks(Color::White);
+    pub static ref PASSED_MASK_BLACK: [BitBoard; 64] = build_passed_masks(Color::Black);
 }
 
 fn passed_pawn_eval(pawns: BitBoard, enemy_pawns: BitBoard, color: Color) -> i32 {
