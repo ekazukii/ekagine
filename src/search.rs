@@ -244,7 +244,7 @@ fn quiesce_negamax_it(
     ctx.stats.qnodes += 1;
 
     let zob = board.get_hash();
-    let in_check = board.checkers().popcnt() > 0;
+    let in_check = board.checkers().0 != 0;
 
     // Quiescence TT lookup
     let hit = ctx.tt.probe(zob);
@@ -357,7 +357,7 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
         | *board.pieces(Piece::Rook)
         | *board.pieces(Piece::Queen))
         & bb;
-    non_pawns.popcnt() > 0
+    non_pawns.0 != 0
 }
 
 /// Create a new board representing a null move using Board::null_move(),
@@ -720,7 +720,7 @@ fn negamax_it(
     ctx.search_stack.set(ply_from_root as usize, eval);
     let is_improving = ctx.search_stack.is_improving(ply_from_root as usize, eval);
 
-    let in_check = board.checkers().popcnt() > 0;
+    let in_check = board.checkers().0 != 0;
 
     // Razoring: at depth 1, if eval is far below alpha, verify position is bad via qsearch
     if depth_remaining == RAZORING_DEPTH
@@ -888,7 +888,7 @@ fn negamax_it(
 
         let new_board = board_do_move(board, mv, ctx.repetition);
 
-        let gives_check = new_board.checkers().popcnt() > 0;
+        let gives_check = new_board.checkers().0 != 0;
         let child_is_pv_node = is_pv_node && is_first_move;
 
         let mut extension: i16 = 0;
