@@ -1540,7 +1540,6 @@ where
         }
 
         transpo_table.bump_generation();
-        nnue_state.refresh(board);
 
         let result = aspiration_root_search(
             board,
