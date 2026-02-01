@@ -2,7 +2,7 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
-use crate::tables::{CountermoveTable, HistoryTable, KillerTable};
+use crate::tables::{CaptureHistoryTable, CountermoveTable, HistoryTable, KillerTable};
 use crate::time::{TimeManagerHandle, TimePlan, TimeScaleFactors};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
@@ -845,7 +845,7 @@ fn negamax_it(
     };
 
     let mut move_idx: usize = 0;
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
@@ -1040,6 +1040,15 @@ fn negamax_it(
                     let prev_color = !mover;
                     ctx.countermoves.record(prev_move, prev_color, mv);
                 }
+            } else if is_capture {
+                // Reward capture history on capture beta cutoff
+                let cap_piece = board.piece_on(mv.get_source());
+                let cap_victim = board.piece_on(mv.get_dest()).or_else(|| {
+                    if is_en_passant_capture(board, mv) { Some(Piece::Pawn) } else { None }
+                });
+                if let (Some(piece), Some(victim)) = (cap_piece, cap_victim) {
+                    ctx.cap_hist.reward(mover, piece, mv.get_dest(), victim, depth_remaining);
+                }
             }
             if !is_capture && !gives_check {
                 ctx.killers.record(ply_index, mv);
@@ -1180,6 +1189,7 @@ fn root_search_with_window(
     nnue_state: &mut NNUEState,
     history_table: &mut HistoryTable,
     countermove_table: &mut CountermoveTable,
+    cap_hist_table: &mut CaptureHistoryTable,
     search_stack: &mut SearchStack,
     alpha_start: i32,
     beta_start: i32,
@@ -1215,6 +1225,7 @@ fn root_search_with_window(
         killers: &mut killer_table,
         history: history_table,
         countermoves: countermove_table,
+        cap_hist: cap_hist_table,
         nnue: nnue_state,
         search_stack,
     };
@@ -1224,7 +1235,7 @@ fn root_search_with_window(
     let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves, None);
     let root_mover = board.side_to_move();
 
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history) {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
         if should_stop(ctx.stop) {
             aborted = true;
             break;
@@ -1366,6 +1377,7 @@ fn aspiration_root_search(
     prev_score: Option<i32>,
     history_table: &mut HistoryTable,
     countermove_table: &mut CountermoveTable,
+    cap_hist_table: &mut CaptureHistoryTable,
     search_stack: &mut SearchStack,
 ) -> RootSearchResult {
     if prev_score.is_none() {
@@ -1379,6 +1391,7 @@ fn aspiration_root_search(
             nnue_state,
             history_table,
             countermove_table,
+            cap_hist_table,
             search_stack,
             NEG_INFINITY,
             POS_INFINITY,
@@ -1402,6 +1415,7 @@ fn aspiration_root_search(
             nnue_state,
             history_table,
             countermove_table,
+            cap_hist_table,
             search_stack,
             alpha,
             beta,
@@ -1443,6 +1457,7 @@ struct ThreadContext<'a> {
     killers: &'a mut KillerTable,
     history: &'a mut HistoryTable,
     countermoves: &'a mut CountermoveTable,
+    cap_hist: &'a mut CaptureHistoryTable,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
 }
@@ -1512,6 +1527,7 @@ where
     let mut stats_prev = *stats;
     let mut history_table = HistoryTable::new();
     let mut countermove_table = CountermoveTable::new();
+    let mut cap_hist_table = CaptureHistoryTable::new();
     let mut search_stack = SearchStack::new();
 
     // Track best move stability for time management
@@ -1537,6 +1553,7 @@ where
             prev_score,
             &mut history_table,
             &mut countermove_table,
+            &mut cap_hist_table,
             &mut search_stack,
         );
 
