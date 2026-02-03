@@ -397,9 +397,10 @@ const RAZORING_MARGIN: i32 = 300;
 
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
-const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
-const SINGULAR_EXTENSION_DEPTH_LIMIT: i16 = 12;
+const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 6;
+const SINGULAR_EXTENSION_MIN_DEPTH_NON_PV: i16 = 8;
 const SINGULAR_BETA_MARGIN_MULTIPLIER: i32 = 2;
+const SINGULAR_DOUBLE_EXTENSION_MARGIN: i32 = 100;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
 const LATE_MOVE_PRUNING_BASE: usize = 4;
@@ -562,18 +563,13 @@ fn should_check_singular_extension(
     tt_flag: TTFlag,
     exclude_move: Option<ChessMove>,
 ) -> bool {
-    // Must have sufficient depth
-    if depth < SINGULAR_EXTENSION_MIN_DEPTH {
-        return false;
-    }
-
-    // Don't check at depths where we won't apply the extension anyway
-    if depth > SINGULAR_EXTENSION_DEPTH_LIMIT {
-        return false;
-    }
-
-    // Only at PV nodes
-    if !is_pv_node {
+    // Must have sufficient depth (stricter for non-PV)
+    let min_depth = if is_pv_node {
+        SINGULAR_EXTENSION_MIN_DEPTH
+    } else {
+        SINGULAR_EXTENSION_MIN_DEPTH_NON_PV
+    };
+    if depth < min_depth {
         return false;
     }
 
@@ -606,14 +602,28 @@ fn should_check_singular_extension(
     true
 }
 
-fn is_singular(
+/// Result of singular extension check
+enum SingularResult {
+    /// Search was cancelled
+    Cancelled,
+    /// Not singular - other moves are competitive
+    NotSingular,
+    /// Singular with single extension
+    Singular,
+    /// Very singular - extend by 2 (margin exceeded double extension threshold)
+    DoubleSingular,
+    /// Multi-cut: verification search failed high, can do beta cutoff
+    MultiCut,
+}
+
+fn check_singular(
     ctx: &mut ThreadContext,
     board: &Board,
     candidate_move: ChessMove,
     depth: i16,
     beta: i32,
     ply_from_root: i32,
-) -> bool {
+) -> SingularResult {
     // Reduced beta: if other moves can't reach this, candidate is singular
     let s_beta_margin = SINGULAR_BETA_MARGIN_MULTIPLIER * depth as i32;
     let s_beta = beta - s_beta_margin;
@@ -621,7 +631,7 @@ fn is_singular(
     // Reduced depth for verification search (typically depth/2 - 1)
     let s_depth = (depth / 2) - 1;
     if s_depth <= 0 {
-        return false;
+        return SingularResult::NotSingular;
     }
 
     // Search all moves EXCEPT the candidate
@@ -637,10 +647,22 @@ fn is_singular(
     );
 
     match result {
-        SearchScore::CANCELLED => false,
+        SearchScore::CANCELLED => SingularResult::Cancelled,
         SearchScore::EVAL(score) => {
-            // If no other move reached s_beta, the candidate is singular
-            score < s_beta
+            if score >= beta {
+                // Multi-cut: other moves are so good we can cut off
+                SingularResult::MultiCut
+            } else if score < s_beta {
+                // Candidate is singular - check if very singular for double extension
+                let margin = s_beta - score;
+                if margin >= SINGULAR_DOUBLE_EXTENSION_MARGIN {
+                    SingularResult::DoubleSingular
+                } else {
+                    SingularResult::Singular
+                }
+            } else {
+                SingularResult::NotSingular
+            }
         }
     }
 }
@@ -812,9 +834,21 @@ fn negamax_it(
         ) {
             ctx.stats.singular_checks += 1;
             if let Some(candidate_move) = tt_move {
-                if is_singular(ctx, board, candidate_move, depth_remaining, beta, ply_from_root) {
-                    singular_extension = 1;
-                    ctx.stats.singular_extensions += 1;
+                match check_singular(ctx, board, candidate_move, depth_remaining, beta, ply_from_root) {
+                    SingularResult::Cancelled => return SearchScore::CANCELLED,
+                    SingularResult::MultiCut => {
+                        // Other moves failed high - beta cutoff
+                        return SearchScore::EVAL(beta);
+                    }
+                    SingularResult::DoubleSingular => {
+                        singular_extension = 2;
+                        ctx.stats.singular_extensions += 1;
+                    }
+                    SingularResult::Singular => {
+                        singular_extension = 1;
+                        ctx.stats.singular_extensions += 1;
+                    }
+                    SingularResult::NotSingular => {}
                 }
             }
         }
@@ -893,10 +927,8 @@ fn negamax_it(
 
         let mut extension: i16 = 0;
 
-        // Check if this move gets singular extension
-        if Some(mv) == tt_move
-            && singular_extension > 0
-            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT {
+        // Apply singular extension (single or double) to the TT move
+        if Some(mv) == tt_move && singular_extension > 0 {
             extension = cmp::max(extension, singular_extension);
         }
 
