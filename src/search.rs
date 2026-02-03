@@ -298,7 +298,8 @@ fn quiesce_negamax_it(
     }
 
     let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
-    for (mv, _val) in get_captures(board) {
+    let mut captures = QSearchCaptures::from_board(board);
+    while let Some(mv) = captures.pick_next() {
         if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
             continue;
         }
@@ -511,41 +512,62 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
     is_passed_pawn(child, dest, color_to_move)
 }
 
-fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
-    // 1. Build the capture mask: opponent pieces + possible en passant square
-    let mut mask = *board.color_combined(!board.side_to_move());
-    if let Some(ep_square) = board.en_passant() {
-        mask |= BitBoard::from_square(ep_square);
-    }
+/// Scored capture list for qsearch with pick-best selection sort.
+/// Collects captures once, then yields them one at a time in best-first order
+/// without a full upfront sort.
+struct QSearchCaptures {
+    moves: SmallVec<[(ChessMove, u8); 32]>,
+    current: usize,
+}
 
-    // 2. Generate only capture-type moves (filtered by mask)
-    let mut gen = MoveGen::new_legal(board);
-    gen.set_iterator_mask(mask);
+impl QSearchCaptures {
+    fn from_board(board: &Board) -> Self {
+        let mut mask = *board.color_combined(!board.side_to_move());
+        if let Some(ep_square) = board.en_passant() {
+            mask |= BitBoard::from_square(ep_square);
+        }
 
-    // 3. Score each move
-    let mut scored_moves: SmallVec<[(ChessMove, u8); 64]> = SmallVec::new();
+        let mut gen = MoveGen::new_legal(board);
+        gen.set_iterator_mask(mask);
 
-    for mv in gen {
-        let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
-            // Normal capture
-            if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-                let victim_idx = victim_piece.to_index() as usize;
-                let attacker_idx = attacker_piece.to_index() as usize;
-                MVV_LVA_TABLE[victim_idx][attacker_idx]
+        let mut moves: SmallVec<[(ChessMove, u8); 32]> = SmallVec::new();
+        for mv in gen {
+            let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
+                if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
+                    MVV_LVA_TABLE[victim_piece.to_index() as usize][attacker_piece.to_index() as usize]
+                } else {
+                    0
+                }
+            } else if is_en_passant_capture(board, mv) {
+                25
             } else {
                 0
-            }
-        } else if is_en_passant_capture(board, mv) {
-            25 // arbitrary EP value; tune as needed
-        } else {
-            0
-        };
+            };
+            moves.push((mv, score));
+        }
 
-        scored_moves.push((mv, score));
+        Self { moves, current: 0 }
     }
 
-    scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    scored_moves
+    /// Pick the best remaining capture via partial selection sort.
+    /// Only swaps the best unseen move to the front — O(1) per call amortized
+    /// when beta cutoffs happen early.
+    #[inline]
+    fn pick_next(&mut self) -> Option<ChessMove> {
+        if self.current >= self.moves.len() {
+            return None;
+        }
+        let mut best_idx = self.current;
+        for i in (self.current + 1)..self.moves.len() {
+            if self.moves[i].1 > self.moves[best_idx].1 {
+                best_idx = i;
+            }
+        }
+        self.moves.swap(self.current, best_idx);
+        let mv = self.moves[self.current].0;
+        self.current += 1;
+        Some(mv)
+    }
 }
 
 // ---------------------------------------------------------------------------
