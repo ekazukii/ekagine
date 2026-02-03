@@ -660,7 +660,7 @@ fn negamax_it(
     is_pv_node: bool,
     exclude_move: Option<ChessMove>,
 ) -> SearchScore {
-    if should_stop(ctx.stop) {
+    if ctx.stats.nodes & 2047 == 0 && should_stop(ctx.stop) {
         let mut out = io::stdout();
         let info_line = format!("info string break stop");
         send_message(&mut out, &info_line);
