@@ -77,9 +77,13 @@ pub struct RepetitionTable {
 
 impl RepetitionTable {
     pub fn new(hash: u64) -> Self {
+        let mut history = Vec::with_capacity(512);
+        let mut ply_since_last_hmclock = Vec::with_capacity(512);
+        history.push(hash);
+        ply_since_last_hmclock.push(0);
         Self {
-            history: vec![hash],
-            ply_since_last_hmclock: vec![0],
+            history,
+            ply_since_last_hmclock,
         }
     }
 
