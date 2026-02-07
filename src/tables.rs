@@ -456,7 +456,7 @@ impl HistoryTable {
         let from = mv.get_source().to_index() as usize;
         let to = mv.get_dest().to_index() as usize;
         let entry = &mut self.entries[color_idx][from][to];
-        *entry = (*entry + delta).clamp(-HISTORY_CAP, HISTORY_CAP);
+        *entry += delta - *entry * delta.abs() / HISTORY_CAP;
     }
 
     pub fn reward(&mut self, color: Color, mv: ChessMove, depth: i16) {

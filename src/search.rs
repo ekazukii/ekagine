@@ -844,6 +844,9 @@ fn negamax_it(
         POS_INFINITY
     };
 
+    let mut tried_quiets: SmallVec<[ChessMove; 32]> = SmallVec::new();
+    let mut tried_captures: SmallVec<[(Piece, Square, Piece, ChessMove); 16]> = SmallVec::new();
+
     let mut move_idx: usize = 0;
     while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
         if incremental_move_gen.take_capture_generation_event() {
@@ -952,6 +955,19 @@ fn negamax_it(
             reduced_depth = 0;
         }
 
+        // Track tried moves for batch malus on beta cutoff
+        if is_quiet {
+            tried_quiets.push(mv);
+        } else if is_capture {
+            let cap_piece = board.piece_on(mv.get_source());
+            let cap_victim = board.piece_on(mv.get_dest()).or_else(|| {
+                if is_en_passant_capture(board, mv) { Some(Piece::Pawn) } else { None }
+            });
+            if let (Some(piece), Some(victim)) = (cap_piece, cap_victim) {
+                tried_captures.push((piece, mv.get_dest(), victim, mv));
+            }
+        }
+
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
         ctx.search_stack.set_move(ply_index, mv);
@@ -1035,6 +1051,12 @@ fn negamax_it(
         if value >= beta {
             if is_quiet {
                 ctx.history.reward(mover, mv, depth_remaining);
+                // Batch penalize all previously tried quiet moves
+                for &tried_mv in &tried_quiets {
+                    if tried_mv != mv {
+                        ctx.history.penalize(mover, tried_mv, depth_remaining);
+                    }
+                }
                 // Update countermove: if opponent's last move exists, record this as the best response
                 if let Some(prev_move) = ctx.search_stack.get_prev_move(ply_index) {
                     let prev_color = !mover;
@@ -1049,6 +1071,12 @@ fn negamax_it(
                 if let (Some(piece), Some(victim)) = (cap_piece, cap_victim) {
                     ctx.cap_hist.reward(mover, piece, mv.get_dest(), victim, depth_remaining);
                 }
+                // Batch penalize all previously tried captures
+                for &(piece, dest, victim, tried_mv) in &tried_captures {
+                    if tried_mv != mv {
+                        ctx.cap_hist.penalize(mover, piece, dest, victim, depth_remaining);
+                    }
+                }
             }
             if !is_capture && !gives_check {
                 ctx.killers.record(ply_index, mv);
@@ -1062,8 +1090,6 @@ fn negamax_it(
             if is_quiet {
                 ctx.history.reward_soft(mover, mv, depth_remaining);
             }
-        } else if is_quiet {
-            ctx.history.penalize(mover, mv, depth_remaining);
         }
 
         if value > alpha {
