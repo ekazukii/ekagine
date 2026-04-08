@@ -256,14 +256,14 @@ fn quiesce_negamax_it(
                 return tt_score;
             }
             TTFlag::Lower => {
-                if tt_hit.score >= beta {
+                if tt_score >= beta {
                     ctx.stats.tt_cutoff_lower += 1;
                     ctx.stats.beta_cutoffs_quiescence += 1;
                     return tt_score;
                 }
             }
             TTFlag::Upper => {
-                if tt_hit.score <= alpha {
+                if tt_score <= alpha {
                     ctx.stats.tt_cutoff_upper += 1;
                     return tt_score;
                 }
