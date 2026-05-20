@@ -238,7 +238,9 @@ fn quiesce_negamax_it(
     beta: i32,
     ply_from_root: i32,
 ) -> i32 {
-    debug_assert!(!ctx.repetition.is_in_threefold_scenario(board));
+    if ctx.repetition.is_in_threefold_scenario(board) {
+        return 0;
+    }
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
@@ -256,14 +258,14 @@ fn quiesce_negamax_it(
                 return tt_score;
             }
             TTFlag::Lower => {
-                if tt_hit.score >= beta {
+                if tt_score >= beta {
                     ctx.stats.tt_cutoff_lower += 1;
                     ctx.stats.beta_cutoffs_quiescence += 1;
                     return tt_score;
                 }
             }
             TTFlag::Upper => {
-                if tt_hit.score <= alpha {
+                if tt_score <= alpha {
                     ctx.stats.tt_cutoff_upper += 1;
                     return tt_score;
                 }
@@ -271,9 +273,55 @@ fn quiesce_negamax_it(
         }
     }
 
-    let static_eval = if in_check {
-        None
-    } else if let Some(ref tt_hit) = hit {
+    if in_check {
+        let mut evasions = MoveGen::new_legal(board);
+        if evasions.len() == 0 {
+            return mated_in_plies(ply_from_root);
+        }
+
+        let alpha_orig = alpha;
+        let mut best_move_opt: Option<ChessMove> = None;
+
+        while let Some(mv) = evasions.next() {
+            let new_board = board_do_move(board, mv, ctx.repetition);
+            ctx.nnue.push();
+            ctx.nnue.apply_move(board, mv);
+            let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
+            board_pop(&new_board, ctx.repetition);
+            ctx.nnue.pop();
+
+            if score > alpha {
+                alpha = score;
+                best_move_opt = Some(mv);
+            }
+
+            if score >= beta {
+                ctx.stats.beta_cutoffs_quiescence += 1;
+                break;
+            }
+        }
+
+        let bound = if alpha >= beta {
+            TTFlag::Lower
+        } else if alpha > alpha_orig {
+            TTFlag::Exact
+        } else {
+            TTFlag::Upper
+        };
+
+        ctx.tt.store(
+            zob,
+            0,
+            tt_score_on_store(alpha, ply_from_root),
+            bound,
+            best_move_opt,
+            None,
+        );
+
+        return alpha;
+    }
+
+    let static_eval = if let Some(ref tt_hit) = hit {
         Some(
             tt_hit
                 .eval
@@ -1805,6 +1853,7 @@ pub fn best_move(
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     #[test]
     fn see_favorable_capture() {
@@ -1819,5 +1868,28 @@ mod tests {
         let mv = ChessMove::new(Square::D1, Square::D5, None);
         let see = static_exchange_eval(&board, mv);
         assert!(see < 0, "expected SEE < 0, got {}", see);
+    }
+
+    #[test]
+    fn regression_no_phantom_mate_on_queen_sac_line() {
+        let board = Board::from_str("r3kb1r/ppq2ppp/4p1N1/1b1p4/8/2B5/PPPN1PPP/R2Q1RK1 b kq - 0 12")
+            .expect("valid FEN");
+        let tt = Arc::new(TranspositionTable::new());
+        let outcome = best_move(
+            &board,
+            2,
+            Arc::clone(&tt),
+            RepetitionTable::new(board.get_hash()),
+            None,
+            None,
+            1,
+        );
+
+        assert!(
+            !is_mate_score(outcome.score),
+            "expected finite score, got {}",
+            outcome.score
+        );
+        assert!(outcome.best_move.is_some(), "expected a legal best move");
     }
 }
