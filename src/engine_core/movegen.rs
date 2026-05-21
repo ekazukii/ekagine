@@ -622,6 +622,11 @@ pub struct PinInfo {
     pub checkers: u64,
     pub num_checkers: u32,
     pub check_evasion_mask: u64,
+    /// Square of the opponent's king, for `gives_check` direct/discovered check detection.
+    pub opp_king_sq: u8,
+    /// Our pieces lying between opp king and one of our sliders — moving any
+    /// of these off the ray uncovers a slider attack on opp king (discovered check).
+    pub opp_blockers: u64,
 }
 
 impl PinInfo {
@@ -632,6 +637,12 @@ impl PinInfo {
         let their_pieces = board.color_combined(them).0;
         let occ = board.combined().0;
         let king_bb = board.pieces(Piece::King).0 & our_pieces;
+        let opp_king_bb = board.pieces(Piece::King).0 & their_pieces;
+        let opp_king_sq = if opp_king_bb != 0 {
+            opp_king_bb.trailing_zeros() as u8
+        } else {
+            0
+        };
         if king_bb == 0 {
             return PinInfo {
                 king_sq: 0,
@@ -639,6 +650,8 @@ impl PinInfo {
                 checkers: 0,
                 num_checkers: 0,
                 check_evasion_mask: !0u64,
+                opp_king_sq,
+                opp_blockers: 0,
             };
         }
         let king_sq = king_bb.trailing_zeros() as u8;
@@ -690,13 +703,166 @@ impl PinInfo {
             !0u64
         };
 
+        // Discovered-check blockers: OUR pieces between opp king and OUR sliders.
+        // Moving such a piece off its ray exposes opp king to the slider.
+        let mut opp_blockers = 0u64;
+        if opp_king_bb != 0 {
+            let our_orth = (board.pieces(Piece::Rook).0 | board.pieces(Piece::Queen).0) & our_pieces;
+            let opp_orth_xray = rook_attacks_u64(opp_king_sq as usize, 0);
+            let mut potential = opp_orth_xray & our_orth;
+            while potential != 0 {
+                let slider = potential.trailing_zeros() as usize;
+                potential &= potential - 1;
+                let between = between_u64(opp_king_sq as usize, slider);
+                let blockers = between & occ;
+                if blockers.count_ones() == 1 && (blockers & our_pieces) != 0 {
+                    opp_blockers |= blockers;
+                }
+            }
+            let our_diag = (board.pieces(Piece::Bishop).0 | board.pieces(Piece::Queen).0) & our_pieces;
+            let opp_diag_xray = bishop_attacks_u64(opp_king_sq as usize, 0);
+            let mut potential = opp_diag_xray & our_diag;
+            while potential != 0 {
+                let slider = potential.trailing_zeros() as usize;
+                potential &= potential - 1;
+                let between = between_u64(opp_king_sq as usize, slider);
+                let blockers = between & occ;
+                if blockers.count_ones() == 1 && (blockers & our_pieces) != 0 {
+                    opp_blockers |= blockers;
+                }
+            }
+        }
+
         PinInfo {
             king_sq,
             pinned,
             checkers,
             num_checkers,
             check_evasion_mask,
+            opp_king_sq,
+            opp_blockers,
         }
+    }
+
+    /// Returns true iff making `mv` would put the opponent's king in check.
+    /// Does not require materializing the post-move board.
+    ///
+    /// Handles direct check (moving piece — or its promoted form — attacks
+    /// opp king from `to`), discovered check (moving piece was a blocker on
+    /// an opp-king ray and steps off it), and the special cases:
+    /// - castling (rook lands at f/d-file, may attack king from there)
+    /// - en passant (captured pawn removed, may uncover a slider on opp king)
+    #[inline]
+    pub fn gives_check(&self, board: &Board, mv: ChessMove) -> bool {
+        let opp_king_bb = board.pieces(Piece::King).0
+            & board.color_combined(!board.side_to_move()).0;
+        if opp_king_bb == 0 {
+            return false;
+        }
+        let opp_king_sq = self.opp_king_sq as usize;
+        let from = mv.get_source().to_index();
+        let to = mv.get_dest().to_index();
+        let from_bit = 1u64 << from;
+        let to_bit = 1u64 << to;
+
+        let piece = match board.piece_on(Square(from as u8)) {
+            Some(p) => p,
+            None => return false,
+        };
+        let post_piece = mv.get_promotion().unwrap_or(piece);
+        let us = board.side_to_move();
+
+        // Build post-move occupancy: clear `from`, set `to`, handle EP capture
+        // and castling rook move.
+        let mut new_occ = board.combined().0;
+        new_occ &= !from_bit;
+        new_occ |= to_bit;
+
+        let is_ep = piece == Piece::Pawn
+            && Some(mv.get_dest()) == board.en_passant()
+            && (board.combined().0 & to_bit) == 0;
+        if is_ep {
+            let captured_idx = match us {
+                Color::White => to - 8,
+                Color::Black => to + 8,
+            };
+            new_occ &= !(1u64 << captured_idx);
+        }
+
+        let castling_rook_to: Option<usize> = if piece == Piece::King
+            && (from as i32 - to as i32).abs() == 2
+        {
+            match (us, to) {
+                (Color::White, 6) => {
+                    new_occ &= !(1u64 << 7);
+                    new_occ |= 1u64 << 5;
+                    Some(5)
+                }
+                (Color::White, 2) => {
+                    new_occ &= !(1u64 << 0);
+                    new_occ |= 1u64 << 3;
+                    Some(3)
+                }
+                (Color::Black, 62) => {
+                    new_occ &= !(1u64 << 63);
+                    new_occ |= 1u64 << 61;
+                    Some(61)
+                }
+                (Color::Black, 58) => {
+                    new_occ &= !(1u64 << 56);
+                    new_occ |= 1u64 << 59;
+                    Some(59)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // 1. Direct check: post-move piece attacks opp king from `to`.
+        let direct = match post_piece {
+            Piece::Pawn => pawn_attacks_u64(us, to),
+            Piece::Knight => knight_attacks_u64(to),
+            Piece::Bishop => bishop_attacks_u64(to, new_occ),
+            Piece::Rook => rook_attacks_u64(to, new_occ),
+            Piece::Queen => bishop_attacks_u64(to, new_occ) | rook_attacks_u64(to, new_occ),
+            Piece::King => 0, // kings can never attack the opposing king
+        };
+        if (direct & opp_king_bb) != 0 {
+            return true;
+        }
+
+        // 2. Castling rook discovered check from f/d-file.
+        if let Some(rook_sq) = castling_rook_to {
+            if (rook_attacks_u64(rook_sq, new_occ) & opp_king_bb) != 0 {
+                return true;
+            }
+        }
+
+        // 3. Discovered check: piece at `from` was blocking one of our sliders
+        //    on opp king. If we step off the king→slider line, the slider
+        //    now attacks the king.
+        if (self.opp_blockers & from_bit) != 0 {
+            if (line_u64(opp_king_sq, from) & to_bit) == 0 {
+                return true;
+            }
+        }
+
+        // 4. EP discovered check: the captured pawn's removal may expose a
+        //    slider attack on opp king. Re-scan from opp king with new_occ.
+        if is_ep {
+            let our_pieces = board.color_combined(us).0;
+            let our_orth = (board.pieces(Piece::Rook).0 | board.pieces(Piece::Queen).0) & our_pieces;
+            let our_diag = (board.pieces(Piece::Bishop).0 | board.pieces(Piece::Queen).0) & our_pieces;
+            if (rook_attacks_u64(opp_king_sq, new_occ) & our_orth) != 0 {
+                return true;
+            }
+            if (bishop_attacks_u64(opp_king_sq, new_occ) & our_diag) != 0 {
+                return true;
+            }
+        }
+
+        false
     }
 
     #[inline]

@@ -79,6 +79,46 @@ fn perft_full(board: &Board, depth: u32) -> u64 {
     count
 }
 
+/// Recursively walks the move tree asserting `pin_info.gives_check(board, mv)`
+/// matches `new_board.checkers() != 0` on every legal move. Used to validate
+/// the move-info-based check detection without relying on the search's
+/// debug_assert. Cheap variant — runs at fixed shallow depth.
+fn validate_gives_check(board: &Board, depth: u32) {
+    if depth == 0 {
+        return;
+    }
+    let pin_info = PinInfo::for_board(board);
+    let mut moves: SmallVec<[ChessMove; 64]> = SmallVec::new();
+    gen_pseudo_legal(board, &mut moves);
+    for mv in &moves {
+        if !pin_info.move_is_legal(board, *mv) {
+            continue;
+        }
+        let predicted = pin_info.gives_check(board, *mv);
+        let new_board = board.make_move_new(*mv);
+        let actual = new_board.checkers().0 != 0;
+        assert_eq!(
+            predicted, actual,
+            "gives_check mismatch: mv={} from FEN at depth {}",
+            mv, depth
+        );
+        validate_gives_check(&new_board, depth - 1);
+    }
+}
+
+#[test]
+fn gives_check_matches_actual_on_perft_tree() {
+    ensure_init();
+    // Reuse the existing perft suite positions — they cover normal moves,
+    // captures, EP, promotions, castling, pins, checks, and double checks.
+    for (fen, _, _) in POSITIONS {
+        let board = Board::from_str(fen).expect("valid FEN");
+        // Depth 3 is plenty: that's ~tens of thousands of moves per position,
+        // exercising every special case.
+        validate_gives_check(&board, 3);
+    }
+}
+
 /// Startpos perft(6) with `count_legal_moves` shortcut at depth 1
 /// (this is the same algorithm `perft_suite` uses).
 #[test]

@@ -209,6 +209,11 @@ impl<'a> IncrementalMoveGen<'a> {
             .extend(bad_scored.into_iter().map(|(mv, _)| mv));
     }
 
+    #[inline(always)]
+    pub fn pin_info(&self) -> &PinInfo {
+        &self.pin_info
+    }
+
     pub fn take_capture_generation_event(&mut self) -> bool {
         if self.capture_gen_pending {
             self.capture_gen_pending = false;

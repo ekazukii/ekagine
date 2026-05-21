@@ -561,17 +561,24 @@ fn is_passed_pawn(board: &Board, square: Square, color: Color) -> bool {
 }
 
 #[inline]
-fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
+fn is_passed_pawn_push(parent: &Board, _child: &Board, mv: ChessMove) -> bool {
+    is_passed_pawn_push_pre_make(parent, mv)
+}
+
+/// Like `is_passed_pawn_push` but evaluated against the pre-move position only.
+/// Lets the search compute extensions before doing the move.
+#[inline]
+fn is_passed_pawn_push_pre_make(parent: &Board, mv: ChessMove) -> bool {
     if parent.piece_on(mv.get_source()) != Some(Piece::Pawn) {
+        return false;
+    }
+    if mv.get_promotion().is_some() {
+        // Post-move dest is the promoted piece, not a pawn.
         return false;
     }
 
     let color_to_move = parent.side_to_move();
     let dest = mv.get_dest();
-
-    if child.piece_on(dest) != Some(Piece::Pawn) {
-        return false;
-    }
 
     let target_rank = match color_to_move {
         Color::White => 6,
@@ -581,7 +588,7 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
         return false;
     }
 
-    is_passed_pawn(child, dest, color_to_move)
+    is_passed_pawn(parent, dest, color_to_move)
 }
 
 fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
@@ -953,17 +960,17 @@ fn negamax_it(
             continue;
         }
 
-        let new_board = board_do_move(board, mv, ctx.repetition);
-
-        let gives_check = new_board.checkers().0 != 0;
+        // Compute gives_check on the parent board (no make_move yet).
+        // This lets LMP / extension decisions run before paying the make cost.
+        let gives_check = incremental_move_gen.pin_info().gives_check(board, mv);
         let child_is_pv_node = is_pv_node && is_first_move;
 
         let mut extension: i16 = 0;
 
-        // Check if this move gets singular extension
         if Some(mv) == tt_move
             && singular_extension > 0
-            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT {
+            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT
+        {
             extension = cmp::max(extension, singular_extension);
         }
 
@@ -971,7 +978,7 @@ fn negamax_it(
             extension = cmp::max(extension, 1);
         } else if depth_remaining <= PASSED_PAWN_EXTENSION_DEPTH_LIMIT
             && depth_remaining > 0
-            && is_passed_pawn_push(board, &new_board, mv)
+            && is_passed_pawn_push_pre_make(board, mv)
         {
             extension = cmp::max(extension, 1);
         }
@@ -988,11 +995,20 @@ fn negamax_it(
             let lmp_limit = late_move_pruning_threshold(depth_remaining);
             if move_idx >= lmp_limit {
                 ctx.stats.late_move_prunes += 1;
-                ctx.repetition.pop();
                 move_idx += 1;
                 continue;
             }
         }
+
+        // All prune-before-make filters passed. Now actually do the move.
+        let new_board = board_do_move(board, mv, ctx.repetition);
+        debug_assert_eq!(
+            gives_check,
+            new_board.checkers().0 != 0,
+            "gives_check mismatch for move {} on board {:?}",
+            mv,
+            board.get_hash()
+        );
 
         let apply_lmr =
             depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
