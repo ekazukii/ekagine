@@ -1,8 +1,6 @@
-// Cargo.toml dependencies (for reference):
-// [dependencies]
-// chess = "3.2.0"
-// once_cell = "1.18.0"    # for lazy_static
+// Engine-internal modules (no external `chess` crate dependency).
 
+mod engine_core;
 mod eval;
 mod movegen;
 mod nnue;
@@ -10,10 +8,12 @@ mod search;
 mod tables;
 mod time;
 
+use crate::engine_core::Color::{Black, White};
+use crate::engine_core::{
+    BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
+};
 use crate::search::{best_move, uci_score_string, SearchStats};
 use crate::time::{plan_time_for_move, TimePlan};
-use chess::Color::{Black, White};
-use chess::{BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square};
 use lazy_static::lazy_static;
 use serde::Deserialize;
 use std::collections::HashMap;

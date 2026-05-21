@@ -1,4 +1,4 @@
-use chess::{ChessMove, Color, File, Piece, Rank, Square};
+use crate::engine_core::{ChessMove, Color, File, Piece, Rank, Square};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

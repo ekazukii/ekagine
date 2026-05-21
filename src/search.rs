@@ -8,7 +8,7 @@ use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
 };
-use chess::{
+use crate::engine_core::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
     BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
 };
@@ -275,19 +275,24 @@ fn quiesce_negamax_it(
 
     if in_check {
         let mut evasions = MoveGen::new_legal(board);
-        if evasions.len() == 0 {
-            return mated_in_plies(ply_from_root);
-        }
-
         let alpha_orig = alpha;
         let mut best_move_opt: Option<ChessMove> = None;
+        let mut any_legal = false;
 
         while let Some(mv) = evasions.next() {
-            let new_board = board_do_move(board, mv, ctx.repetition);
+            let new_board = board.make_move_new(mv);
+            if !new_board.is_position_legal() {
+                continue;
+            }
+            any_legal = true;
+            ctx.repetition.push(
+                new_board.get_hash(),
+                crate::resets_halfmove_clock(board, mv),
+            );
             ctx.nnue.push();
             ctx.nnue.apply_move(board, mv);
             let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
-            board_pop(&new_board, ctx.repetition);
+            ctx.repetition.pop();
             ctx.nnue.pop();
 
             if score > alpha {
@@ -299,6 +304,10 @@ fn quiesce_negamax_it(
                 ctx.stats.beta_cutoffs_quiescence += 1;
                 break;
             }
+        }
+
+        if !any_legal {
+            return mated_in_plies(ply_from_root);
         }
 
         let bound = if alpha >= beta {
@@ -356,11 +365,18 @@ fn quiesce_negamax_it(
         if dest_piece.is_none() && !is_en_passant {
             continue;
         }
-        let new_board = board_do_move(board, mv, ctx.repetition);
+        let new_board = board.make_move_new(mv);
+        if !new_board.is_position_legal() {
+            continue;
+        }
+        ctx.repetition.push(
+            new_board.get_hash(),
+            crate::resets_halfmove_clock(board, mv),
+        );
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
         let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
-        board_pop(&new_board, ctx.repetition);
+        ctx.repetition.pop();
         ctx.nnue.pop();
 
         if score > alpha {
@@ -896,7 +912,9 @@ fn negamax_it(
     let mut tried_captures: SmallVec<[(Piece, Square, Piece, ChessMove); 16]> = SmallVec::new();
 
     let mut move_idx: usize = 0;
+    let mut saw_legal_yield = false;
     while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
+        saw_legal_yield = true;
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
@@ -1146,6 +1164,14 @@ fn negamax_it(
 
         ctx.repetition.pop();
         move_idx += 1;
+    }
+
+    if !saw_legal_yield {
+        // No legal moves yielded → mate or stalemate.
+        if in_check {
+            return SearchScore::EVAL(mated_in_plies(ply_from_root));
+        }
+        return SearchScore::EVAL(0);
     }
 
     if best_move_opt.is_none() {

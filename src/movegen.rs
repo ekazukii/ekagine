@@ -1,9 +1,9 @@
+use crate::engine_core::{
+    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove,
+    Color, MoveGen, Piece, PinInfo, Square, EMPTY,
+};
 use crate::tables::{CaptureHistoryTable, HistoryTable};
 use crate::TranspositionTable;
-use chess::{
-    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove,
-    Color, MoveGen, Piece, Square, EMPTY,
-};
 use smallvec::SmallVec;
 use std::cmp;
 
@@ -27,9 +27,9 @@ pub struct IncrementalMoveGen<'a> {
     killer_moves: [Option<ChessMove>; 2],
     countermove: Option<ChessMove>,
     move_gen_iter: MoveGen,
+    pin_info: PinInfo,
     phase: MoveGenPhase,
     side_to_move: Color,
-    has_legal_moves: bool,
     capture_gen_pending: bool,
     captures_generated: bool,
     quiet_generated: bool,
@@ -53,7 +53,7 @@ impl<'a> IncrementalMoveGen<'a> {
         countermove: Option<ChessMove>,
     ) -> Self {
         let probe_iter = MoveGen::new_legal(board);
-        let has_legal_moves = probe_iter.len() > 0;
+        let pin_info = PinInfo::for_board(board);
 
         let zob = board.get_hash();
         let tt_move = tt
@@ -67,11 +67,11 @@ impl<'a> IncrementalMoveGen<'a> {
             killer_moves,
             countermove,
             phase: MoveGenPhase::TTMove,
-            has_legal_moves,
             capture_gen_pending: false,
             captures_generated: false,
             quiet_generated: false,
             move_gen_iter: probe_iter,
+            pin_info,
             side_to_move: board.side_to_move(),
             good_captures: MoveList::new(),
             bad_captures: MoveList::new(),
@@ -105,6 +105,9 @@ impl<'a> IncrementalMoveGen<'a> {
 
         for mv in self.move_gen_iter.by_ref() {
             if Some(mv) == self.tt_move {
+                continue;
+            }
+            if !self.pin_info.move_is_legal(self.board, mv) {
                 continue;
             }
 
@@ -155,6 +158,9 @@ impl<'a> IncrementalMoveGen<'a> {
                 continue;
             }
             if self.board.piece_on(mv.get_dest()).is_some() {
+                continue;
+            }
+            if !self.pin_info.move_is_legal(self.board, mv) {
                 continue;
             }
 
@@ -208,9 +214,12 @@ impl<'a> IncrementalMoveGen<'a> {
         }
     }
 
-    // Game's over if player cannot play a single move
+    // Returns true only when we definitively know there are no legal moves;
+    // with pseudo-legal generation we don't know upfront, so always return
+    // false here and let the search detect mate/stalemate at end-of-loop by
+    // tracking whether any legal move was searched.
     pub fn is_over(&self) -> bool {
-        !self.has_legal_moves
+        false
     }
 
     pub fn next(&mut self, history: &HistoryTable, cap_hist: &CaptureHistoryTable) -> Option<ChessMove> {
@@ -515,9 +524,8 @@ pub fn static_exchange_eval(board: &Board, mv: ChessMove) -> i32 {
 
 #[inline]
 pub fn is_en_passant_capture(board: &Board, mv: ChessMove) -> bool {
-    // En passant is a pawn move to the ep square capturing a pawn that isn't on dest.
-    // chess::Board exposes the en-passant target square via `en_passant()` in recent versions.
-    // We conservatively detect: moving piece is a pawn, destination equals ep square.
+    // `Board::en_passant()` returns the EP *target* square. An EP capture is
+    // a pawn move whose destination matches that square.
     if let Some(Piece::Pawn) = board.piece_on(mv.get_source()) {
         if let Some(ep_sq) = board.en_passant() {
             return mv.get_dest() == ep_sq;

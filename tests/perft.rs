@@ -1,4 +1,14 @@
-use chess::{Board, MoveGen};
+// Integration test for the engine's own movegen, independent of the main
+// binary. We include the `engine_core` module directly via `#[path]` so the
+// test doesn't depend on the crate having a lib target.
+
+#[path = "../src/engine_core/mod.rs"]
+mod engine_core;
+
+use crate::engine_core::{
+    count_legal_moves, ensure_init, gen_pseudo_legal, Board, ChessMove, PinInfo,
+};
+use smallvec::SmallVec;
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -6,13 +16,18 @@ fn perft(board: &Board, depth: u32) -> u64 {
     if depth == 0 {
         return 1;
     }
-    let moves = MoveGen::new_legal(board);
     if depth == 1 {
-        return moves.len() as u64;
+        return count_legal_moves(board);
     }
+    let pin_info = PinInfo::for_board(board);
+    let mut moves: SmallVec<[ChessMove; 64]> = SmallVec::new();
+    gen_pseudo_legal(board, &mut moves);
     let mut count = 0u64;
-    for mv in moves {
-        let new_board = board.make_move_new(mv);
+    for mv in &moves {
+        if !pin_info.move_is_legal(board, *mv) {
+            continue;
+        }
+        let new_board = board.make_move_new(*mv);
         count += perft(&new_board, depth - 1);
     }
     count
@@ -48,6 +63,11 @@ const POSITIONS: &[(&str, u32, u64)] = &[
 
 #[test]
 fn perft_suite() {
+    // Force lazy table init (magic bitboards, etc.) BEFORE starting the timer
+    // so the one-time init cost does not contaminate the NPS measurement.
+    ensure_init();
+    let _ = Board::default();
+
     let mut total_nodes: u64 = 0;
     let start = Instant::now();
     let mut mismatches: Vec<String> = Vec::new();
