@@ -1,4 +1,4 @@
-use chess::{Board, ChessMove, Color, Piece, Square};
+use crate::engine_core::{Board, ChessMove, Color, Piece, Square};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 /// NNUE Implementation
@@ -230,7 +230,7 @@ impl NNUEState {
         let dest_piece = board.piece_on(to);
         let is_en_passant = piece == Piece::Pawn
             && dest_piece.is_none()
-            && board.en_passant() == Some(to.ubackward(color));
+            && board.en_passant() == Some(to);
 
         if promotion.is_none() && !is_en_passant && dest_piece.is_none() {
             self.move_update(piece, color, from, to);
@@ -399,7 +399,7 @@ fn squared_crelu(value: i16) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chess::ChessMove;
+    use crate::engine_core::ChessMove;
     use std::str::FromStr;
 
     fn assert_accumulators_equal(a: &NNUEState, a_idx: usize, b: &NNUEState, b_idx: usize) {
@@ -536,7 +536,7 @@ mod tests {
             board = board.make_move_new(mv);
         }
 
-        assert_eq!(board.en_passant(), Some(Square::F5));
+        assert_eq!(board.en_passant(), Some(Square::F6));
 
         let ep = ChessMove::new(Square::E5, Square::F6, None);
         let mut state = NNUEState::from_board(&board);

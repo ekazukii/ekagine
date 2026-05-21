@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use chess::{Board, Color};
+use crate::engine_core::{Board, Color};
 use crate::{estimate_moves_to_go, parse_go_tokens, EngineState};
 
 /// Time plan for a search, specifying soft and hard limits

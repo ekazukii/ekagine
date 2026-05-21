@@ -1,19 +1,19 @@
 #![allow(dead_code, unused_imports)]
 
 /* New helper: compute endgame progress as an integer between 0 and 100 */
-use crate::{NEG_INFINITY, POS_INFINITY};
-use chess::Color::{Black, White};
-use chess::{
+use crate::engine_core::Color::{Black, White};
+use crate::engine_core::{
     get_adjacent_files, get_bishop_moves, get_file, get_king_moves, get_knight_moves,
     get_rook_moves, BitBoard, Board, BoardStatus, Color, File, Piece, Rank, Square,
 };
+use crate::{NEG_INFINITY, POS_INFINITY};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 /// Evaluate a set of bitboard squares using a piece‐square table + base value.
-fn pieces_type_eval(bitboard: &chess::BitBoard, table: &[i32; 64], base_val: i32) -> i32 {
+fn pieces_type_eval(bitboard: &BitBoard, table: &[i32; 64], base_val: i32) -> i32 {
     let mut total = base_val * bitboard.popcnt() as i32;
     for square in *bitboard {
         total += table[square.to_index()];
@@ -199,8 +199,8 @@ fn king_safety_eval(board: &Board, king_sq: Square, our_color: Color) -> i32 {
             continue;
         }
         let sq = Square::make_square(
-            chess::Rank::from_index(r as usize),
-            chess::File::from_index(f as usize),
+            Rank::from_index(r as usize),
+            File::from_index(f as usize),
         );
         match board.piece_on(sq) {
             Some(Piece::Pawn) if board.color_on(sq) == Some(our_color) => {
@@ -221,9 +221,9 @@ fn king_safety_eval(board: &Board, king_sq: Square, our_color: Color) -> i32 {
 
     // Bonus if king is on its original back rank (i.e. likely castled or still safe)
     let back_rank = if our_color == Color::White {
-        chess::Rank::First
+        Rank::First
     } else {
-        chess::Rank::Eighth
+        Rank::Eighth
     };
     if king_sq.get_rank() == back_rank {
         score += 20;

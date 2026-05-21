@@ -8,9 +8,9 @@ use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
 };
-use chess::{
-    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
-    BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
+use crate::engine_core::{
+    for_each_capture_pseudo_legal, get_bishop_moves, get_king_moves, get_knight_moves,
+    get_rook_moves, BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, PinInfo, Square,
 };
 use lazy_static::lazy_static;
 use smallvec::SmallVec;
@@ -274,20 +274,26 @@ fn quiesce_negamax_it(
     }
 
     if in_check {
+        let pin_info = PinInfo::for_board(board);
         let mut evasions = MoveGen::new_legal(board);
-        if evasions.len() == 0 {
-            return mated_in_plies(ply_from_root);
-        }
-
         let alpha_orig = alpha;
         let mut best_move_opt: Option<ChessMove> = None;
+        let mut any_legal = false;
 
         while let Some(mv) = evasions.next() {
-            let new_board = board_do_move(board, mv, ctx.repetition);
+            if !pin_info.move_is_legal(board, mv) {
+                continue;
+            }
+            let new_board = board.make_move_new(mv);
+            any_legal = true;
+            ctx.repetition.push(
+                new_board.get_hash(),
+                crate::resets_halfmove_clock(board, mv),
+            );
             ctx.nnue.push();
             ctx.nnue.apply_move(board, mv);
             let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
-            board_pop(&new_board, ctx.repetition);
+            ctx.repetition.pop();
             ctx.nnue.pop();
 
             if score > alpha {
@@ -299,6 +305,10 @@ fn quiesce_negamax_it(
                 ctx.stats.beta_cutoffs_quiescence += 1;
                 break;
             }
+        }
+
+        if !any_legal {
+            return mated_in_plies(ply_from_root);
         }
 
         let bound = if alpha >= beta {
@@ -346,6 +356,11 @@ fn quiesce_negamax_it(
     }
 
     let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
+    let pin_info = PinInfo::for_board(board);
+    // Fast path: in non-check positions with no pinned pieces, only king
+    // captures and EP captures need the per-move legality test.
+    let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
+    let ep_sq = board.en_passant();
     for (mv, _val) in get_captures(board) {
         if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
             continue;
@@ -356,11 +371,21 @@ fn quiesce_negamax_it(
         if dest_piece.is_none() && !is_en_passant {
             continue;
         }
-        let new_board = board_do_move(board, mv, ctx.repetition);
+        let needs_legal_check = !fast_path
+            || (mv.get_source().to_index() as u8) == pin_info.king_sq
+            || Some(mv.get_dest()) == ep_sq;
+        if needs_legal_check && !pin_info.move_is_legal(board, mv) {
+            continue;
+        }
+        let new_board = board.make_move_new(mv);
+        ctx.repetition.push(
+            new_board.get_hash(),
+            crate::resets_halfmove_clock(board, mv),
+        );
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
         let score = -quiesce_negamax_it(ctx, &new_board, -beta, -alpha, ply_from_root + 1);
-        board_pop(&new_board, ctx.repetition);
+        ctx.repetition.pop();
         ctx.nnue.pop();
 
         if score > alpha {
@@ -560,22 +585,12 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
 }
 
 fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
-    // 1. Build the capture mask: opponent pieces + possible en passant square
-    let mut mask = *board.color_combined(!board.side_to_move());
-    if let Some(ep_square) = board.en_passant() {
-        mask |= BitBoard::from_square(ep_square);
-    }
-
-    // 2. Generate only capture-type moves (filtered by mask)
-    let mut gen = MoveGen::new_legal(board);
-    gen.set_iterator_mask(mask);
-
-    // 3. Score each move
+    // Generate only capture-type moves (incl. en-passant + capture-promotions)
+    // via the staged generator, then MVV-LVA-sort.
     let mut scored_moves: SmallVec<[(ChessMove, u8); 64]> = SmallVec::new();
 
-    for mv in gen {
+    for_each_capture_pseudo_legal(board, |mv| {
         let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
-            // Normal capture
             if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
                 let victim_idx = victim_piece.to_index() as usize;
                 let attacker_idx = attacker_piece.to_index() as usize;
@@ -588,9 +603,8 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
         } else {
             0
         };
-
         scored_moves.push((mv, score));
-    }
+    });
 
     scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     scored_moves
@@ -896,7 +910,9 @@ fn negamax_it(
     let mut tried_captures: SmallVec<[(Piece, Square, Piece, ChessMove); 16]> = SmallVec::new();
 
     let mut move_idx: usize = 0;
+    let mut saw_legal_yield = false;
     while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
+        saw_legal_yield = true;
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
         }
@@ -1146,6 +1162,14 @@ fn negamax_it(
 
         ctx.repetition.pop();
         move_idx += 1;
+    }
+
+    if !saw_legal_yield {
+        // No legal moves yielded → mate or stalemate.
+        if in_check {
+            return SearchScore::EVAL(mated_in_plies(ply_from_root));
+        }
+        return SearchScore::EVAL(0);
     }
 
     if best_move_opt.is_none() {
