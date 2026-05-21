@@ -629,6 +629,8 @@ pub fn compute_best_from_fen(
 }
 
 fn main() {
+    engine_core::ensure_init();
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(

@@ -59,7 +59,7 @@ impl<'a> IncrementalMoveGen<'a> {
         let tt_move = tt
             .probe(zob)
             .and_then(|e| e.best_move)
-            .filter(|mv| board.legal(*mv));
+            .filter(|mv| board.is_pseudo_legal(*mv) && pin_info.move_is_legal(board, *mv));
 
         Self {
             board,

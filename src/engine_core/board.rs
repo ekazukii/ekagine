@@ -182,24 +182,177 @@ impl Board {
     }
 
     /// Verifies a (possibly user-supplied) move is fully legal in this position.
+    /// Fast path: cheap pseudo-legality check, then king-safety via `PinInfo`.
+    /// No `make_move_new` involved on the rejection path.
     pub fn legal(&self, mv: ChessMove) -> bool {
+        if !self.is_pseudo_legal(mv) {
+            return false;
+        }
+        let pin_info = super::movegen::PinInfo::for_board(self);
+        pin_info.move_is_legal(self, mv)
+    }
+
+    /// Cheap pseudo-legality check for a single move (O(1) attack lookups,
+    /// no full move-list regeneration). Verifies piece presence/color, target
+    /// reachability and special-move shape (castling rights & path, EP target,
+    /// promotion field consistency). King-safety (pin/check) is handled
+    /// separately by `PinInfo::move_is_legal` — callers must combine both.
+    pub fn is_pseudo_legal(&self, mv: ChessMove) -> bool {
         let from = mv.get_source();
-        let color = match decode_piece(self.mailbox[from.to_index()]) {
-            Some((_, c)) => c,
+        let to = mv.get_dest();
+        let from_idx = from.to_index();
+        let to_idx = to.to_index();
+        if from_idx == to_idx {
+            return false;
+        }
+
+        let (piece, color) = match decode_piece(self.mailbox[from_idx]) {
+            Some(pc) => pc,
             None => return false,
         };
         if color != self.side {
             return false;
         }
 
-        // Verify pseudo-legal, then check king safety after applying.
-        let mut moves = smallvec::SmallVec::<[ChessMove; 64]>::new();
-        super::movegen::gen_pseudo_legal(self, &mut moves);
-        if !moves.iter().any(|m| *m == mv) {
+        let us = self.side;
+        let them = !us;
+        let our_pieces = self.colors_bb[us.to_index()].0;
+        let their_pieces = self.colors_bb[them.to_index()].0;
+        let occ = self.combined_bb.0;
+        let to_bit = 1u64 << to_idx;
+
+        if (to_bit & our_pieces) != 0 {
             return false;
         }
-        let new_board = self.make_move_new(mv);
-        new_board.is_position_legal()
+
+        let promotion = mv.get_promotion();
+
+        match piece {
+            Piece::Pawn => {
+                let from_rank = (from_idx / 8) as i32;
+                let to_rank = (to_idx / 8) as i32;
+                let last_rank = if us == Color::White { 7 } else { 0 };
+                if promotion.is_some() != (to_rank == last_rank) {
+                    return false;
+                }
+
+                let single_step: i32 = if us == Color::White { 8 } else { -8 };
+                let single_target = from_idx as i32 + single_step;
+                let double_target = from_idx as i32 + 2 * single_step;
+                let start_rank = if us == Color::White { 1 } else { 6 };
+
+                if to_idx as i32 == single_target && (to_bit & occ) == 0 {
+                    return true;
+                }
+                if to_idx as i32 == double_target
+                    && from_rank == start_rank
+                    && (to_bit & occ) == 0
+                    && ((1u64 << single_target) & occ) == 0
+                {
+                    return true;
+                }
+                let attacks = pawn_attacks_u64(us, from_idx);
+                if (attacks & to_bit) != 0 {
+                    if (to_bit & their_pieces) != 0 {
+                        return true;
+                    }
+                    if Some(to) == self.en_passant && (to_bit & occ) == 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+            Piece::Knight => {
+                if promotion.is_some() {
+                    return false;
+                }
+                (knight_attacks_u64(from_idx) & to_bit) != 0
+            }
+            Piece::Bishop => {
+                if promotion.is_some() {
+                    return false;
+                }
+                (bishop_attacks_u64(from_idx, occ) & to_bit) != 0
+            }
+            Piece::Rook => {
+                if promotion.is_some() {
+                    return false;
+                }
+                (rook_attacks_u64(from_idx, occ) & to_bit) != 0
+            }
+            Piece::Queen => {
+                if promotion.is_some() {
+                    return false;
+                }
+                ((bishop_attacks_u64(from_idx, occ) | rook_attacks_u64(from_idx, occ))
+                    & to_bit)
+                    != 0
+            }
+            Piece::King => {
+                if promotion.is_some() {
+                    return false;
+                }
+                if (king_attacks_u64(from_idx) & to_bit) != 0 {
+                    return true;
+                }
+                // Castling: same rank, king moves exactly 2 files.
+                if (from_idx / 8) == (to_idx / 8)
+                    && (from_idx as i32 - to_idx as i32).abs() == 2
+                {
+                    return self.castling_pseudo_legal(
+                        us,
+                        from_idx as u8,
+                        to_idx as u8,
+                        occ,
+                        them,
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    #[inline]
+    fn castling_pseudo_legal(
+        &self,
+        us: Color,
+        king_sq: u8,
+        dest_sq: u8,
+        occ: u64,
+        them: Color,
+    ) -> bool {
+        if self.checkers_bb.0 != 0 {
+            return false;
+        }
+        let castling = self.castling;
+        let occ_no_king = occ ^ (1u64 << king_sq);
+        match (us, king_sq, dest_sq) {
+            (Color::White, 4, 6) => {
+                (castling & WK) != 0
+                    && (occ & ((1u64 << 5) | (1u64 << 6))) == 0
+                    && !is_sq_attacked_internal(self, 5, them, occ_no_king)
+                    && !is_sq_attacked_internal(self, 6, them, occ_no_king)
+            }
+            (Color::White, 4, 2) => {
+                (castling & WQ) != 0
+                    && (occ & ((1u64 << 1) | (1u64 << 2) | (1u64 << 3))) == 0
+                    && !is_sq_attacked_internal(self, 3, them, occ_no_king)
+                    && !is_sq_attacked_internal(self, 2, them, occ_no_king)
+            }
+            (Color::Black, 60, 62) => {
+                (castling & BK) != 0
+                    && (occ & ((1u64 << 61) | (1u64 << 62))) == 0
+                    && !is_sq_attacked_internal(self, 61, them, occ_no_king)
+                    && !is_sq_attacked_internal(self, 62, them, occ_no_king)
+            }
+            (Color::Black, 60, 58) => {
+                (castling & BQ) != 0
+                    && (occ & ((1u64 << 57) | (1u64 << 58) | (1u64 << 59))) == 0
+                    && !is_sq_attacked_internal(self, 59, them, occ_no_king)
+                    && !is_sq_attacked_internal(self, 58, them, occ_no_king)
+            }
+            _ => false,
+        }
     }
 
     pub fn null_move(&self) -> Option<Board> {
@@ -288,6 +441,10 @@ impl Board {
         }
 
         // Double pawn push → ep square is the *target* (square passed over).
+        // Only retain the EP marker (and hash its file) when an enemy pawn
+        // can actually capture en-passant on the next move; otherwise two
+        // positions that differ only by an inert EP marker would hash to
+        // different keys and miss TT / 3-fold transpositions.
         if piece == Piece::Pawn {
             let from_rank = from_idx / 8;
             let to_rank = to_idx / 8;
@@ -296,7 +453,11 @@ impl Board {
                     Color::White => from_idx + 8,
                     Color::Black => from_idx - 8,
                 };
-                new_ep = Some(Square(ep_idx as u8));
+                let their_pawns = self.pieces_bb[Piece::Pawn.to_index() as usize].0
+                    & self.colors_bb[them.to_index()].0;
+                if (pawn_attacks_u64(us, ep_idx) & their_pawns) != 0 {
+                    new_ep = Some(Square(ep_idx as u8));
+                }
             }
         }
 
@@ -543,8 +704,10 @@ impl FromStr for Board {
         }
         board.castling = rights;
 
-        // 4. en passant: store the target square directly (FEN convention).
-        board.en_passant = if parts[3] == "-" {
+        // 4. en passant: store the target square directly (FEN convention),
+        //    but discard the marker when the side-to-move has no pawn that
+        //    can actually capture en-passant — keeps Zobrist consistent.
+        let raw_ep = if parts[3] == "-" {
             None
         } else {
             let bytes = parts[3].as_bytes();
@@ -561,6 +724,16 @@ impl FromStr for Board {
                 File::from_index(f as usize),
             ))
         };
+        board.en_passant = raw_ep.and_then(|ep_sq| {
+            let mover_just_pushed = !board.side;
+            let our_pawns = board.pieces_bb[Piece::Pawn.to_index() as usize].0
+                & board.colors_bb[board.side.to_index()].0;
+            if (pawn_attacks_u64(mover_just_pushed, ep_sq.to_index()) & our_pawns) != 0 {
+                Some(ep_sq)
+            } else {
+                None
+            }
+        });
 
         // 5/6. clocks
         board.halfmove_clock = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);

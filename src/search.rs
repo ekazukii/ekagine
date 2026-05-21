@@ -10,7 +10,7 @@ use crate::{
 };
 use crate::engine_core::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
-    BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
+    BoardStatus, ChessMove, Color, MoveGen, Piece, PinInfo, Square,
 };
 use lazy_static::lazy_static;
 use smallvec::SmallVec;
@@ -274,16 +274,17 @@ fn quiesce_negamax_it(
     }
 
     if in_check {
+        let pin_info = PinInfo::for_board(board);
         let mut evasions = MoveGen::new_legal(board);
         let alpha_orig = alpha;
         let mut best_move_opt: Option<ChessMove> = None;
         let mut any_legal = false;
 
         while let Some(mv) = evasions.next() {
-            let new_board = board.make_move_new(mv);
-            if !new_board.is_position_legal() {
+            if !pin_info.move_is_legal(board, mv) {
                 continue;
             }
+            let new_board = board.make_move_new(mv);
             any_legal = true;
             ctx.repetition.push(
                 new_board.get_hash(),
@@ -355,6 +356,7 @@ fn quiesce_negamax_it(
     }
 
     let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
+    let pin_info = PinInfo::for_board(board);
     for (mv, _val) in get_captures(board) {
         if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
             continue;
@@ -365,10 +367,10 @@ fn quiesce_negamax_it(
         if dest_piece.is_none() && !is_en_passant {
             continue;
         }
-        let new_board = board.make_move_new(mv);
-        if !new_board.is_position_legal() {
+        if !pin_info.move_is_legal(board, mv) {
             continue;
         }
+        let new_board = board.make_move_new(mv);
         ctx.repetition.push(
             new_board.get_hash(),
             crate::resets_halfmove_clock(board, mv),
