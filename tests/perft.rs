@@ -61,6 +61,67 @@ const POSITIONS: &[(&str, u32, u64)] = &[
     ),
 ];
 
+fn perft_full(board: &Board, depth: u32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+    let pin_info = PinInfo::for_board(board);
+    let mut moves: SmallVec<[ChessMove; 64]> = SmallVec::new();
+    gen_pseudo_legal(board, &mut moves);
+    let mut count = 0u64;
+    for mv in &moves {
+        if !pin_info.move_is_legal(board, *mv) {
+            continue;
+        }
+        let new_board = board.make_move_new(*mv);
+        count += perft_full(&new_board, depth - 1);
+    }
+    count
+}
+
+/// Startpos perft(6) with `count_legal_moves` shortcut at depth 1
+/// (this is the same algorithm `perft_suite` uses).
+#[test]
+#[ignore = "long-running perft depth 6 benchmark"]
+fn perft_depth6_startpos_shortcut() {
+    ensure_init();
+    let _ = Board::default();
+
+    let board = Board::from_str("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+        .expect("valid FEN");
+    let start = Instant::now();
+    let nodes = perft(&board, 6);
+    let elapsed = start.elapsed().as_secs_f64();
+    let nps_m = nodes as f64 / elapsed / 1e6;
+    println!(
+        "perft(6) shortcut: {} nodes in {:.3}s ({:.1} Mnps)",
+        nodes, elapsed, nps_m
+    );
+    assert_eq!(nodes, 119_060_324);
+}
+
+/// Same position but with full move enumeration at every depth, so the
+/// per-move `make_move_new` + `pin_info.move_is_legal` cost is exercised
+/// at the leaves. Closer to what the actual search pays per move.
+#[test]
+#[ignore = "long-running perft depth 6 benchmark"]
+fn perft_depth6_startpos_full() {
+    ensure_init();
+    let _ = Board::default();
+
+    let board = Board::from_str("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+        .expect("valid FEN");
+    let start = Instant::now();
+    let nodes = perft_full(&board, 6);
+    let elapsed = start.elapsed().as_secs_f64();
+    let nps_m = nodes as f64 / elapsed / 1e6;
+    println!(
+        "perft(6) full enum: {} nodes in {:.3}s ({:.1} Mnps)",
+        nodes, elapsed, nps_m
+    );
+    assert_eq!(nodes, 119_060_324);
+}
+
 #[test]
 fn perft_suite() {
     // Force lazy table init (magic bitboards, etc.) BEFORE starting the timer

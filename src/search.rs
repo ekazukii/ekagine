@@ -9,8 +9,8 @@ use crate::{
     NEG_INFINITY, POS_INFINITY,
 };
 use crate::engine_core::{
-    get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board,
-    BoardStatus, ChessMove, Color, MoveGen, Piece, PinInfo, Square,
+    for_each_capture_pseudo_legal, get_bishop_moves, get_king_moves, get_knight_moves,
+    get_rook_moves, BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, PinInfo, Square,
 };
 use lazy_static::lazy_static;
 use smallvec::SmallVec;
@@ -357,6 +357,10 @@ fn quiesce_negamax_it(
 
     let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
     let pin_info = PinInfo::for_board(board);
+    // Fast path: in non-check positions with no pinned pieces, only king
+    // captures and EP captures need the per-move legality test.
+    let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
+    let ep_sq = board.en_passant();
     for (mv, _val) in get_captures(board) {
         if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
             continue;
@@ -367,7 +371,10 @@ fn quiesce_negamax_it(
         if dest_piece.is_none() && !is_en_passant {
             continue;
         }
-        if !pin_info.move_is_legal(board, mv) {
+        let needs_legal_check = !fast_path
+            || (mv.get_source().to_index() as u8) == pin_info.king_sq
+            || Some(mv.get_dest()) == ep_sq;
+        if needs_legal_check && !pin_info.move_is_legal(board, mv) {
             continue;
         }
         let new_board = board.make_move_new(mv);
@@ -578,22 +585,12 @@ fn is_passed_pawn_push(parent: &Board, child: &Board, mv: ChessMove) -> bool {
 }
 
 fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
-    // 1. Build the capture mask: opponent pieces + possible en passant square
-    let mut mask = *board.color_combined(!board.side_to_move());
-    if let Some(ep_square) = board.en_passant() {
-        mask |= BitBoard::from_square(ep_square);
-    }
-
-    // 2. Generate only capture-type moves (filtered by mask)
-    let mut gen = MoveGen::new_legal(board);
-    gen.set_iterator_mask(mask);
-
-    // 3. Score each move
+    // Generate only capture-type moves (incl. en-passant + capture-promotions)
+    // via the staged generator, then MVV-LVA-sort.
     let mut scored_moves: SmallVec<[(ChessMove, u8); 64]> = SmallVec::new();
 
-    for mv in gen {
+    for_each_capture_pseudo_legal(board, |mv| {
         let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
-            // Normal capture
             if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
                 let victim_idx = victim_piece.to_index() as usize;
                 let attacker_idx = attacker_piece.to_index() as usize;
@@ -606,9 +603,8 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
         } else {
             0
         };
-
         scored_moves.push((mv, score));
-    }
+    });
 
     scored_moves.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     scored_moves

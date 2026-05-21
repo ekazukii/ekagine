@@ -367,7 +367,10 @@ impl Board {
         nb.side = !nb.side;
         nb.hash ^= key_side();
         nb.halfmove_clock = nb.halfmove_clock.saturating_add(1);
-        nb.checkers_bb = compute_checkers(&nb);
+        // In a legal position the side not-to-move is never in check.
+        // We've just verified we're not in check, so after flipping the side
+        // the new side-to-move is also not in check by construction.
+        nb.checkers_bb = BitBoard(0);
         Some(nb)
     }
 

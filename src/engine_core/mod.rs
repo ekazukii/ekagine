@@ -19,6 +19,7 @@ pub use attacks::{
 };
 pub use board::Board;
 pub use movegen::{
-    any_legal_move, count_legal_moves, for_each_pseudo_legal, gen_pseudo_legal, MoveGen, PinInfo,
+    any_legal_move, count_legal_moves, for_each_capture_pseudo_legal, for_each_pseudo_legal,
+    for_each_quiet_pseudo_legal, gen_pseudo_legal, MoveGen, PinInfo,
 };
 pub use types::{BitBoard, BoardStatus, ChessMove, Color, File, Piece, Rank, Square, EMPTY};

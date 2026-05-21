@@ -304,6 +304,313 @@ fn promote_cb<F: FnMut(ChessMove)>(from: Square, to: Square, f: &mut F) {
     f(ChessMove::new(from, to, Some(Piece::Knight)));
 }
 
+/// Yield all pseudo-legal capture moves (including en-passant and capture-
+/// promotions). Excludes quiet pushes/quiet promotions and castling.
+#[inline]
+pub fn for_each_capture_pseudo_legal<F: FnMut(ChessMove)>(board: &Board, mut f: F) {
+    let us = board.side_to_move();
+    let them = !us;
+    let our_pieces = board.color_combined(us).0;
+    let their_pieces = board.color_combined(them).0;
+    let occ = board.combined().0;
+
+    let pawns = board.pieces(Piece::Pawn).0 & our_pieces;
+    if pawns != 0 {
+        match us {
+            Color::White => pawn_white_captures_cb(pawns, their_pieces, board.en_passant(), &mut f),
+            Color::Black => pawn_black_captures_cb(pawns, their_pieces, board.en_passant(), &mut f),
+        }
+    }
+
+    let mut knights = board.pieces(Piece::Knight).0 & our_pieces;
+    while knights != 0 {
+        let from = knights.trailing_zeros() as u8;
+        knights &= knights - 1;
+        let mut targets = knight_attacks_u64(from as usize) & their_pieces;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let mut bishops = board.pieces(Piece::Bishop).0 & our_pieces;
+    while bishops != 0 {
+        let from = bishops.trailing_zeros() as u8;
+        bishops &= bishops - 1;
+        let mut targets = bishop_attacks_u64(from as usize, occ) & their_pieces;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let mut rooks = board.pieces(Piece::Rook).0 & our_pieces;
+    while rooks != 0 {
+        let from = rooks.trailing_zeros() as u8;
+        rooks &= rooks - 1;
+        let mut targets = rook_attacks_u64(from as usize, occ) & their_pieces;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let mut queens = board.pieces(Piece::Queen).0 & our_pieces;
+    while queens != 0 {
+        let from = queens.trailing_zeros() as u8;
+        queens &= queens - 1;
+        let mut targets = (bishop_attacks_u64(from as usize, occ)
+            | rook_attacks_u64(from as usize, occ))
+            & their_pieces;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let king_bb = board.pieces(Piece::King).0 & our_pieces;
+    if king_bb != 0 {
+        let king_sq = king_bb.trailing_zeros() as u8;
+        let mut targets = king_attacks_u64(king_sq as usize) & their_pieces;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(king_sq), Square(to), None));
+        }
+    }
+}
+
+/// Yield all pseudo-legal quiet moves: pawn pushes (incl. push-promotions),
+/// non-capture piece moves and castling. Excludes captures and EP.
+#[inline]
+pub fn for_each_quiet_pseudo_legal<F: FnMut(ChessMove)>(board: &Board, mut f: F) {
+    let us = board.side_to_move();
+    let them = !us;
+    let our_pieces = board.color_combined(us).0;
+    let occ = board.combined().0;
+    let empty = !occ;
+
+    let pawns = board.pieces(Piece::Pawn).0 & our_pieces;
+    if pawns != 0 {
+        match us {
+            Color::White => pawn_white_quiets_cb(pawns, empty, &mut f),
+            Color::Black => pawn_black_quiets_cb(pawns, empty, &mut f),
+        }
+    }
+
+    let mut knights = board.pieces(Piece::Knight).0 & our_pieces;
+    while knights != 0 {
+        let from = knights.trailing_zeros() as u8;
+        knights &= knights - 1;
+        let mut targets = knight_attacks_u64(from as usize) & empty;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let mut bishops = board.pieces(Piece::Bishop).0 & our_pieces;
+    while bishops != 0 {
+        let from = bishops.trailing_zeros() as u8;
+        bishops &= bishops - 1;
+        let mut targets = bishop_attacks_u64(from as usize, occ) & empty;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let mut rooks = board.pieces(Piece::Rook).0 & our_pieces;
+    while rooks != 0 {
+        let from = rooks.trailing_zeros() as u8;
+        rooks &= rooks - 1;
+        let mut targets = rook_attacks_u64(from as usize, occ) & empty;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let mut queens = board.pieces(Piece::Queen).0 & our_pieces;
+    while queens != 0 {
+        let from = queens.trailing_zeros() as u8;
+        queens &= queens - 1;
+        let mut targets = (bishop_attacks_u64(from as usize, occ)
+            | rook_attacks_u64(from as usize, occ))
+            & empty;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(from), Square(to), None));
+        }
+    }
+
+    let king_bb = board.pieces(Piece::King).0 & our_pieces;
+    if king_bb != 0 {
+        let king_sq = king_bb.trailing_zeros() as u8;
+        let mut targets = king_attacks_u64(king_sq as usize) & empty;
+        while targets != 0 {
+            let to = targets.trailing_zeros() as u8;
+            targets &= targets - 1;
+            f(ChessMove::new(Square(king_sq), Square(to), None));
+        }
+
+        let in_check = board.checkers().0 != 0;
+        if !in_check {
+            castling_cb(board, us, king_sq, occ, them, &mut f);
+        }
+    }
+}
+
+#[inline]
+fn pawn_white_captures_cb<F: FnMut(ChessMove)>(
+    pawns: u64,
+    their_pieces: u64,
+    ep: Option<Square>,
+    f: &mut F,
+) {
+    let ne_targets = ((pawns & 0x7F7F_7F7F_7F7F_7F7F) << 9) & their_pieces;
+    let mut bb = ne_targets & !RANK_8;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to - 9), Square(to), None));
+    }
+    let mut bb = ne_targets & RANK_8;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        promote_cb(Square(to - 9), Square(to), f);
+    }
+    let nw_targets = ((pawns & 0xFEFE_FEFE_FEFE_FEFE) << 7) & their_pieces;
+    let mut bb = nw_targets & !RANK_8;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to - 7), Square(to), None));
+    }
+    let mut bb = nw_targets & RANK_8;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        promote_cb(Square(to - 7), Square(to), f);
+    }
+    if let Some(ep_sq) = ep {
+        let target = ep_sq.0;
+        let target_bb = 1u64 << target;
+        let ne_ep = ((pawns & 0x7F7F_7F7F_7F7F_7F7F) << 9) & target_bb;
+        if ne_ep != 0 {
+            f(ChessMove::new(Square(target - 9), ep_sq, None));
+        }
+        let nw_ep = ((pawns & 0xFEFE_FEFE_FEFE_FEFE) << 7) & target_bb;
+        if nw_ep != 0 {
+            f(ChessMove::new(Square(target - 7), ep_sq, None));
+        }
+    }
+}
+
+#[inline]
+fn pawn_black_captures_cb<F: FnMut(ChessMove)>(
+    pawns: u64,
+    their_pieces: u64,
+    ep: Option<Square>,
+    f: &mut F,
+) {
+    let sw_targets = ((pawns & 0xFEFE_FEFE_FEFE_FEFE) >> 9) & their_pieces;
+    let mut bb = sw_targets & !RANK_1;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to + 9), Square(to), None));
+    }
+    let mut bb = sw_targets & RANK_1;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        promote_cb(Square(to + 9), Square(to), f);
+    }
+    let se_targets = ((pawns & 0x7F7F_7F7F_7F7F_7F7F) >> 7) & their_pieces;
+    let mut bb = se_targets & !RANK_1;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to + 7), Square(to), None));
+    }
+    let mut bb = se_targets & RANK_1;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        promote_cb(Square(to + 7), Square(to), f);
+    }
+    if let Some(ep_sq) = ep {
+        let target = ep_sq.0;
+        let target_bb = 1u64 << target;
+        let sw_ep = ((pawns & 0xFEFE_FEFE_FEFE_FEFE) >> 9) & target_bb;
+        if sw_ep != 0 {
+            f(ChessMove::new(Square(target + 9), ep_sq, None));
+        }
+        let se_ep = ((pawns & 0x7F7F_7F7F_7F7F_7F7F) >> 7) & target_bb;
+        if se_ep != 0 {
+            f(ChessMove::new(Square(target + 7), ep_sq, None));
+        }
+    }
+}
+
+#[inline]
+fn pawn_white_quiets_cb<F: FnMut(ChessMove)>(pawns: u64, empty: u64, f: &mut F) {
+    let single = (pawns << 8) & empty;
+    let mut bb = single & !RANK_8;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to - 8), Square(to), None));
+    }
+    let mut promo_push = single & RANK_8;
+    while promo_push != 0 {
+        let to = promo_push.trailing_zeros() as u8;
+        promo_push &= promo_push - 1;
+        promote_cb(Square(to - 8), Square(to), f);
+    }
+    let double = ((single & 0x0000_0000_00FF_0000) << 8) & empty;
+    let mut bb = double;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to - 16), Square(to), None));
+    }
+}
+
+#[inline]
+fn pawn_black_quiets_cb<F: FnMut(ChessMove)>(pawns: u64, empty: u64, f: &mut F) {
+    let single = (pawns >> 8) & empty;
+    let mut bb = single & !RANK_1;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to + 8), Square(to), None));
+    }
+    let mut promo_push = single & RANK_1;
+    while promo_push != 0 {
+        let to = promo_push.trailing_zeros() as u8;
+        promo_push &= promo_push - 1;
+        promote_cb(Square(to + 8), Square(to), f);
+    }
+    let double = ((single & 0x0000_FF00_0000_0000) >> 8) & empty;
+    let mut bb = double;
+    while bb != 0 {
+        let to = bb.trailing_zeros() as u8;
+        bb &= bb - 1;
+        f(ChessMove::new(Square(to + 16), Square(to), None));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pin info — used to filter pseudo-legal moves without `make_move_new`.
 // ─────────────────────────────────────────────────────────────────────────────
