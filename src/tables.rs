@@ -596,3 +596,105 @@ impl Default for CaptureHistoryTable {
         Self::new()
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Continuation History (1-ply / counter-move history)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Continuation History Table
+///
+/// Scores a quiet move as a *response* to the move played one ply earlier.
+/// Indexed by [stm][prev_piece][prev_to][cur_piece][cur_to].
+/// 2 × 6 × 64 × 6 × 64 = 294,912 entries (~1.18 MB), heap-allocated.
+const CONT_HIST_LEN: usize = 2 * 6 * 64 * 6 * 64;
+
+pub struct ContinuationHistory {
+    entries: Vec<i32>,
+}
+
+impl ContinuationHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: vec![0i32; CONT_HIST_LEN],
+        }
+    }
+
+    #[inline]
+    fn index(
+        color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        cur_piece: Piece,
+        cur_to: Square,
+    ) -> usize {
+        let c = color.to_index();
+        let pp = prev_piece.to_index() as usize;
+        let pt = prev_to.to_index() as usize;
+        let cp = cur_piece.to_index() as usize;
+        let ct = cur_to.to_index() as usize;
+        ((((c * 6 + pp) * 64 + pt) * 6 + cp) * 64) + ct
+    }
+
+    #[inline]
+    pub fn score(
+        &self,
+        color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        cur_piece: Piece,
+        cur_to: Square,
+    ) -> i32 {
+        self.entries[Self::index(color, prev_piece, prev_to, cur_piece, cur_to)]
+    }
+
+    #[inline]
+    fn update(
+        &mut self,
+        color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        cur_piece: Piece,
+        cur_to: Square,
+        delta: i32,
+    ) {
+        let entry = &mut self.entries[Self::index(color, prev_piece, prev_to, cur_piece, cur_to)];
+        // Gravity-based update to prevent saturation (same scheme as HistoryTable).
+        *entry += delta - *entry * delta.abs() / HISTORY_CAP;
+    }
+
+    pub fn reward(
+        &mut self,
+        color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        cur_piece: Piece,
+        cur_to: Square,
+        depth: i16,
+    ) {
+        let bonus = history_bonus(depth);
+        if bonus > 0 {
+            self.update(color, prev_piece, prev_to, cur_piece, cur_to, bonus);
+        }
+    }
+
+    pub fn penalize(
+        &mut self,
+        color: Color,
+        prev_piece: Piece,
+        prev_to: Square,
+        cur_piece: Piece,
+        cur_to: Square,
+        depth: i16,
+    ) {
+        let malus = history_malus(depth);
+        if malus > 0 {
+            self.update(color, prev_piece, prev_to, cur_piece, cur_to, -malus);
+        }
+    }
+}
+
+impl Default for ContinuationHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}

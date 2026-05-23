@@ -2,7 +2,9 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
-use crate::tables::{CaptureHistoryTable, CountermoveTable, HistoryTable, KillerTable};
+use crate::tables::{
+    CaptureHistoryTable, ContinuationHistory, CountermoveTable, HistoryTable, KillerTable,
+};
 use crate::time::{TimeManagerHandle, TimePlan, TimeScaleFactors};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
@@ -245,6 +247,11 @@ fn quiesce_negamax_it(
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
 
+    // Safety net: bound qsearch recursion to the accumulator/stack capacity.
+    if ply_from_root as usize >= MAX_PLY {
+        return ctx.nnue.evaluate(board.side_to_move());
+    }
+
     let zob = board.get_hash();
     let in_check = board.checkers().0 != 0;
 
@@ -460,6 +467,12 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
 const ASPIRATION_START_WINDOW: i32 = 25;
 const QUIESCE_FUTILITY_MARGIN: i32 = 200;
 
+// Hard cap on search ply. Bounds the SearchStack and NNUE accumulator stack so
+// deep extension/qsearch lines can never index out of bounds (Rust bounds-checks
+// in release would panic and crash the engine, forfeiting the game). Must stay
+// below NNUE `MAX_DEPTH` (256). Large enough to never affect real search.
+const MAX_PLY: usize = 246;
+
 const FUTILITY_PRUNE_MAX_DEPTH: i16 = 6;
 const FUTILITY_MARGIN_BASE: i32 = 100;
 const FUTILITY_MARGIN_PER_DEPTH: i32 = 75;
@@ -471,7 +484,6 @@ const RAZORING_MARGIN: i32 = 300;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
 const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
-const SINGULAR_EXTENSION_DEPTH_LIMIT: i16 = 12;
 const SINGULAR_BETA_MARGIN_MULTIPLIER: i32 = 2;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
@@ -501,6 +513,9 @@ const LMR_MAX_DEPTH: usize = 64;
 const LMR_MAX_MOVES: usize = 64;
 const LMR_BASE: f64 = 0.75;
 const LMR_DIVISOR: f64 = 2.25;
+// History (butterfly) is gravity-bounded to ±HISTORY_CAP (1<<20). Dividing by
+// 1<<17 maps it to roughly [-8, 8], clamped to ±2 plies of LMR adjustment.
+const HISTORY_LMR_DIVISOR: i32 = 1 << 17;
 
 lazy_static! {
     static ref LMR_TABLE: [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] = compute_lmr_table();
@@ -617,25 +632,15 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
 #[inline]
 fn should_check_singular_extension(
     depth: i16,
-    is_pv_node: bool,
     in_check: bool,
     tt_move: Option<ChessMove>,
     tt_depth: i16,
     tt_flag: TTFlag,
     exclude_move: Option<ChessMove>,
 ) -> bool {
-    // Must have sufficient depth
+    // Must have sufficient depth (no upper cap: singular helps most at high
+    // depth, and it is enabled at both PV and non-PV nodes — the standard config).
     if depth < SINGULAR_EXTENSION_MIN_DEPTH {
-        return false;
-    }
-
-    // Don't check at depths where we won't apply the extension anyway
-    if depth > SINGULAR_EXTENSION_DEPTH_LIMIT {
-        return false;
-    }
-
-    // Only at PV nodes
-    if !is_pv_node {
         return false;
     }
 
@@ -736,6 +741,12 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
+    // Safety net: never recurse past the stack capacity. Acts only on
+    // pathological infinite-extension lines; far beyond any real depth.
+    if ply_from_root as usize >= MAX_PLY {
+        return SearchScore::EVAL(ctx.nnue.evaluate(board.side_to_move()));
+    }
+
     if depth <= 0 {
         return SearchScore::EVAL(quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root));
     }
@@ -804,9 +815,15 @@ fn negamax_it(
     if !is_pv_node
         && !in_check
         && depth_remaining >= 2
+        && eval >= beta
         && has_non_pawn_material(board, board.side_to_move())
     {
-        let r: i16 = if depth_remaining >= 6 { 3 } else { 2 } + if is_improving { 1 } else { 0 };
+        let mut r: i16 = if depth_remaining >= 6 { 3 } else { 2 } + if is_improving { 1 } else { 0 };
+        // Reduce more when the static eval is well above beta (the null move is
+        // very likely to still fail high, so we can verify it more cheaply).
+        if !is_mate_score(beta) {
+            r += ((eval - beta) / 200).clamp(0, 3) as i16;
+        }
         if let Some(nboard) = board_do_null_move(board, ctx.repetition) {
             ctx.nnue.push();
             let result = negamax_it(
@@ -865,7 +882,6 @@ fn negamax_it(
     if let Some(entry) = tt_hit {
         if should_check_singular_extension(
             depth_remaining,
-            is_pv_node,
             in_check,
             tt_move,
             entry.depth,
@@ -885,12 +901,14 @@ fn negamax_it(
     ctx.stats.incremental_move_gen_inits += 1;
     let ply_index = ply_from_root.max(0) as usize;
     let killer_moves = ctx.killers.killers_for(ply_index);
-    let countermove = ctx
-        .search_stack
-        .get_prev_move(ply_index)
+    let prev_move_piece = ctx.search_stack.get_prev_move_piece(ply_index);
+    let countermove = prev_move_piece
+        .map(|(prev_move, _)| prev_move)
         .and_then(|prev_move| ctx.countermoves.get(prev_move, !mover));
+    // (piece, to) of the previous move, for continuation history.
+    let prev_cont = prev_move_piece.map(|(prev_move, piece)| (piece, prev_move.get_dest()));
     let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, ctx.tt, killer_moves, countermove);
+        IncrementalMoveGen::new(board, ctx.tt, killer_moves, countermove, prev_cont);
 
     if incremental_move_gen.is_over() {
         if in_check {
@@ -911,7 +929,7 @@ fn negamax_it(
 
     let mut move_idx: usize = 0;
     let mut saw_legal_yield = false;
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont_hist) {
         saw_legal_yield = true;
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
@@ -961,9 +979,7 @@ fn negamax_it(
         let mut extension: i16 = 0;
 
         // Check if this move gets singular extension
-        if Some(mv) == tt_move
-            && singular_extension > 0
-            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT {
+        if Some(mv) == tt_move && singular_extension > 0 {
             extension = cmp::max(extension, singular_extension);
         }
 
@@ -997,7 +1013,21 @@ fn negamax_it(
         let apply_lmr =
             depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
         let reduction: i16 = if apply_lmr {
-            lmr_reduction(depth_remaining, move_idx, is_pv_node)
+            let mut r = lmr_reduction(depth_remaining, move_idx, is_pv_node);
+            // History-based adjustment: reduce less for quiets with good history,
+            // more for quiets with bad history. (apply_lmr already implies quiet.)
+            let hist = ctx.history.score(mover, mv);
+            r -= (hist / HISTORY_LMR_DIVISOR).clamp(-2, 2) as i16;
+            // Continuation history contributes a secondary, smaller adjustment.
+            if let Some((prev_piece, prev_to)) = prev_cont {
+                if let Some(cur_piece) = board.piece_on(mv.get_source()) {
+                    let cont =
+                        ctx.cont_hist
+                            .score(mover, prev_piece, prev_to, cur_piece, mv.get_dest());
+                    r -= (cont / HISTORY_LMR_DIVISOR).clamp(-1, 1) as i16;
+                }
+            }
+            r.max(1)
         } else {
             0
         };
@@ -1034,7 +1064,8 @@ fn negamax_it(
 
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
-        ctx.search_stack.set_move(ply_index, mv);
+        ctx.search_stack
+            .set_move(ply_index, mv, board.piece_on(mv.get_source()));
 
         let mut value_opt: Option<i32> = None;
 
@@ -1115,6 +1146,25 @@ fn negamax_it(
         if value >= beta {
             if is_quiet {
                 ctx.history.reward(mover, mv, depth_remaining);
+                // Continuation history: reward this quiet as a reply to the
+                // previous move; penalize the quiets that were tried first.
+                if let Some((prev_piece, prev_to)) = prev_cont {
+                    if let Some(cur_piece) = board.piece_on(mv.get_source()) {
+                        ctx.cont_hist.reward(
+                            mover, prev_piece, prev_to, cur_piece, mv.get_dest(), depth_remaining,
+                        );
+                    }
+                    for &tried_mv in &tried_quiets {
+                        if tried_mv != mv {
+                            if let Some(tried_piece) = board.piece_on(tried_mv.get_source()) {
+                                ctx.cont_hist.penalize(
+                                    mover, prev_piece, prev_to, tried_piece, tried_mv.get_dest(),
+                                    depth_remaining,
+                                );
+                            }
+                        }
+                    }
+                }
                 // Batch penalize all previously tried quiet moves
                 for &tried_mv in &tried_quiets {
                     if tried_mv != mv {
@@ -1288,6 +1338,7 @@ fn root_search_with_window(
     history_table: &mut HistoryTable,
     countermove_table: &mut CountermoveTable,
     cap_hist_table: &mut CaptureHistoryTable,
+    cont_hist_table: &mut ContinuationHistory,
     search_stack: &mut SearchStack,
     alpha_start: i32,
     beta_start: i32,
@@ -1324,16 +1375,18 @@ fn root_search_with_window(
         history: history_table,
         countermoves: countermove_table,
         cap_hist: cap_hist_table,
+        cont_hist: cont_hist_table,
         nnue: nnue_state,
         search_stack,
     };
     let mut out = io::stdout();
 
     let killer_moves = ctx.killers.killers_for(0);
-    let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves, None);
+    let mut incremental_move_gen =
+        IncrementalMoveGen::new(board, ctx.tt, killer_moves, None, None);
     let root_mover = board.side_to_move();
 
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
+    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont_hist) {
         if should_stop(ctx.stop) {
             aborted = true;
             break;
@@ -1476,6 +1529,7 @@ fn aspiration_root_search(
     history_table: &mut HistoryTable,
     countermove_table: &mut CountermoveTable,
     cap_hist_table: &mut CaptureHistoryTable,
+    cont_hist_table: &mut ContinuationHistory,
     search_stack: &mut SearchStack,
 ) -> RootSearchResult {
     if prev_score.is_none() {
@@ -1490,6 +1544,7 @@ fn aspiration_root_search(
             history_table,
             countermove_table,
             cap_hist_table,
+            cont_hist_table,
             search_stack,
             NEG_INFINITY,
             POS_INFINITY,
@@ -1514,6 +1569,7 @@ fn aspiration_root_search(
             history_table,
             countermove_table,
             cap_hist_table,
+            cont_hist_table,
             search_stack,
             alpha,
             beta,
@@ -1556,6 +1612,7 @@ struct ThreadContext<'a> {
     history: &'a mut HistoryTable,
     countermoves: &'a mut CountermoveTable,
     cap_hist: &'a mut CaptureHistoryTable,
+    cont_hist: &'a mut ContinuationHistory,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
 }
@@ -1564,10 +1621,11 @@ struct ThreadContext<'a> {
 struct SearchStackEntry {
     eval: i32,
     last_move: Option<ChessMove>,
+    last_piece: Option<Piece>,
 }
 
 struct SearchStack {
-    entries: [SearchStackEntry; 64],
+    entries: [SearchStackEntry; MAX_PLY + 2],
 }
 
 impl SearchStack {
@@ -1576,7 +1634,8 @@ impl SearchStack {
             entries: [SearchStackEntry {
                 eval: 0,
                 last_move: None,
-            }; 64],
+                last_piece: None,
+            }; MAX_PLY + 2],
         }
     }
 
@@ -1588,13 +1647,27 @@ impl SearchStack {
         self.entries[ply].eval = eval;
     }
 
-    fn set_move(&mut self, ply: usize, mv: ChessMove) {
+    fn set_move(&mut self, ply: usize, mv: ChessMove, piece: Option<Piece>) {
         self.entries[ply].last_move = Some(mv);
+        self.entries[ply].last_piece = piece;
     }
 
     fn get_prev_move(&self, ply: usize) -> Option<ChessMove> {
         if ply > 0 {
             self.entries[ply - 1].last_move
+        } else {
+            None
+        }
+    }
+
+    /// Previous move together with the piece that made it (for continuation history).
+    fn get_prev_move_piece(&self, ply: usize) -> Option<(ChessMove, Piece)> {
+        if ply > 0 {
+            let e = &self.entries[ply - 1];
+            match (e.last_move, e.last_piece) {
+                (Some(mv), Some(pc)) => Some((mv, pc)),
+                _ => None,
+            }
         } else {
             None
         }
@@ -1626,6 +1699,7 @@ where
     let mut history_table = HistoryTable::new();
     let mut countermove_table = CountermoveTable::new();
     let mut cap_hist_table = CaptureHistoryTable::new();
+    let mut cont_hist_table = ContinuationHistory::new();
     let mut search_stack = SearchStack::new();
 
     // Track best move stability for time management
@@ -1651,6 +1725,7 @@ where
             &mut history_table,
             &mut countermove_table,
             &mut cap_hist_table,
+            &mut cont_hist_table,
             &mut search_stack,
         );
 
