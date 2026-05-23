@@ -8,7 +8,9 @@ use std::ops::{Deref, DerefMut};
 /// Most likely this can be copy-pasted for any other engine that use the chess crate
 use std::{alloc, array};
 
-const MAX_DEPTH: usize = 128;
+// Must be >= search.rs MAX_PLY so the accumulator stack can never overflow
+// along a root-to-leaf path (one push per make_move in both main + qsearch).
+const MAX_DEPTH: usize = 256;
 
 // Network Arch
 const FEATURES: usize = 768;
