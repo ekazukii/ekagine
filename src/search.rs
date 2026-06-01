@@ -2,7 +2,9 @@ use crate::movegen::{
     is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
-use crate::tables::{CaptureHistoryTable, CountermoveTable, HistoryTable, KillerTable};
+use crate::tables::{
+    CaptureHistoryTable, ContHist, CorrHist, CountermoveTable, HistoryTable, KillerTable,
+};
 use crate::time::{TimeManagerHandle, TimePlan, TimeScaleFactors};
 use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
@@ -158,6 +160,11 @@ impl SearchOutcome {
 // ----------------------------------------------------------------------------
 // Mate distance scoring helpers
 // ----------------------------------------------------------------------------
+// Hard ply ceiling. Real searches never approach this; it exists purely to
+// stop pathological extension/check lines from overflowing the fixed-size
+// NNUE accumulator stack (and the search stack). Comfortably below both caps.
+pub const MAX_SEARCH_PLY: i32 = 120;
+
 // A large value to represent mate; must be >> any centipawn eval
 pub const MATE_VALUE: i32 = 1_000_000;
 // Threshold to detect mate-encoded scores
@@ -178,15 +185,21 @@ fn mated_in_plies(ply: i32) -> i32 {
     -MATE_VALUE + ply
 }
 
-// Adjust mate scores when storing/loading from TT to remain comparable
+// The TT packs the score into an i16, so the search-scale mate values (~1e6)
+// would be clamped to 32767 and lose their mate-ness on reload. Map mate
+// scores into a compact i16-safe band (TT_MATE) on store and back on load,
+// keeping the distance node-relative so transpositions reload correctly.
+const TT_MATE: i32 = 32_000;
+const TT_MATE_THRESHOLD: i32 = TT_MATE - 2 * MAX_SEARCH_PLY;
+
 #[inline]
 fn tt_score_on_store(score: i32, ply_from_root: i32) -> i32 {
-    if is_mate_score(score) {
-        if score > 0 {
-            score + ply_from_root
-        } else {
-            score - ply_from_root
-        }
+    if score >= MATE_THRESHOLD {
+        // mate for the side to move: store distance-from-this-node in the
+        // compact band so it survives the i16 packing.
+        TT_MATE - (MATE_VALUE - score) + ply_from_root
+    } else if score <= -MATE_THRESHOLD {
+        -TT_MATE + (MATE_VALUE + score) - ply_from_root
     } else {
         score
     }
@@ -194,12 +207,10 @@ fn tt_score_on_store(score: i32, ply_from_root: i32) -> i32 {
 
 #[inline]
 fn tt_score_on_load(score: i32, ply_from_root: i32) -> i32 {
-    if is_mate_score(score) {
-        if score > 0 {
-            score - ply_from_root
-        } else {
-            score + ply_from_root
-        }
+    if score >= TT_MATE_THRESHOLD {
+        MATE_VALUE - (TT_MATE - score) - ply_from_root
+    } else if score <= -TT_MATE_THRESHOLD {
+        -MATE_VALUE + (TT_MATE + score) + ply_from_root
     } else {
         score
     }
@@ -244,6 +255,10 @@ fn quiesce_negamax_it(
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.qnodes += 1;
+
+    if ply_from_root >= MAX_SEARCH_PLY {
+        return ctx.nnue.evaluate(board.side_to_move());
+    }
 
     let zob = board.get_hash();
     let in_check = board.checkers().0 != 0;
@@ -341,7 +356,16 @@ fn quiesce_negamax_it(
         Some(ctx.nnue.evaluate(board.side_to_move()))
     };
 
-    let stand_pat = static_eval.unwrap_or(NEG_INFINITY);
+    // This path is only reached when not in check (the in-check case returns
+    // above). Apply the correction-history adjustment to the stand-pat used for
+    // pruning/cutoffs while keeping the raw eval in the TT (`static_eval`).
+    let raw_stand = static_eval.unwrap_or(NEG_INFINITY);
+    let stand_pat = if is_mate_score(raw_stand) {
+        raw_stand
+    } else {
+        (raw_stand + ctx.corrhist.correction(board.side_to_move(), pawn_structure_key(board)))
+            .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+    };
 
     let alpha_orig = alpha;
     let mut best_value = stand_pat;
@@ -433,6 +457,22 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
     non_pawns.0 != 0
 }
 
+/// Cheap pawn-structure hash (white & black pawn bitboards mixed), used to key
+/// the correction-history table. Not collision-free, but the table tolerates
+/// collisions gracefully.
+#[inline]
+fn pawn_structure_key(board: &Board) -> usize {
+    let wp = (*board.pieces(Piece::Pawn) & *board.color_combined(Color::White)).0;
+    let bp = (*board.pieces(Piece::Pawn) & *board.color_combined(Color::Black)).0;
+    let mut h = wp
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ bp.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 31;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h as usize
+}
+
 /// Create a new board representing a null move using Board::null_move(),
 /// then update the repetition table for that new position.
 fn board_do_null_move(board: &Board, repetition_table: &mut RepetitionTable) -> Option<Board> {
@@ -473,15 +513,24 @@ const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
 const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
 const SINGULAR_EXTENSION_DEPTH_LIMIT: i16 = 12;
 const SINGULAR_BETA_MARGIN_MULTIPLIER: i32 = 2;
+const PROBCUT_MIN_DEPTH: i16 = 5;
+const PROBCUT_MARGIN: i32 = 180;
+const PROBCUT_REDUCTION: i16 = 4;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
 const LATE_MOVE_PRUNING_BASE: usize = 4;
 const LATE_MOVE_PRUNING_SCALE: usize = 2;
 
 #[inline]
-fn futility_margin(depth: i16) -> i32 {
-    let depth = depth as i32;
-    FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth.saturating_sub(1)
+fn futility_margin(depth: i16, is_improving: bool) -> i32 {
+    let d = depth as i32;
+    let base = FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * d.saturating_sub(1);
+    // Tighter margin (more pruning) when the position is not improving.
+    if is_improving {
+        base
+    } else {
+        (base - FUTILITY_MARGIN_PER_DEPTH / 2).max(FUTILITY_MARGIN_BASE / 2)
+    }
 }
 
 #[inline]
@@ -491,9 +540,15 @@ fn reverse_futility_margin(depth: i16) -> i32 {
 }
 
 #[inline]
-fn late_move_pruning_threshold(depth: i16) -> usize {
+fn late_move_pruning_threshold(depth: i16, is_improving: bool) -> usize {
     let depth = depth.max(0) as usize;
-    LATE_MOVE_PRUNING_BASE + depth * LATE_MOVE_PRUNING_SCALE
+    let base = LATE_MOVE_PRUNING_BASE + depth * LATE_MOVE_PRUNING_SCALE;
+    // Prune later when improving, earlier when not.
+    if is_improving {
+        base + depth
+    } else {
+        base
+    }
 }
 
 // Late Move Reduction (LMR) table and constants
@@ -518,17 +573,24 @@ fn compute_lmr_table() -> [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] {
     table
 }
 
+/// Divisor mapping the (butterfly + continuation) history score of a quiet move
+/// into an LMR reduction adjustment, clamped to ±2 plies.
+const HIST_LMR_DIVISOR: i32 = 16384;
+
 #[inline]
-fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool) -> i16 {
+fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool, hist: i32) -> i16 {
     let d = (depth as usize).min(LMR_MAX_DEPTH - 1);
     let m = move_idx.min(LMR_MAX_MOVES - 1);
 
     let mut reduction = LMR_TABLE[d][m];
 
-    // Reduce less in PV nodes
+    // Reduce less in PV nodes.
     if is_pv_node {
         reduction = reduction.saturating_sub(1);
     }
+    // Reduce less for moves with good history, more for bad history.
+    let hist_adj = (hist / HIST_LMR_DIVISOR).clamp(-2, 2) as i16;
+    reduction -= hist_adj;
 
     // Ensure minimum reduction of 1 when LMR applies
     reduction.max(1)
@@ -617,7 +679,6 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
 #[inline]
 fn should_check_singular_extension(
     depth: i16,
-    is_pv_node: bool,
     in_check: bool,
     tt_move: Option<ChessMove>,
     tt_depth: i16,
@@ -634,10 +695,9 @@ fn should_check_singular_extension(
         return false;
     }
 
-    // Only at PV nodes
-    if !is_pv_node {
-        return false;
-    }
+    // Singular checks now run at non-PV nodes too (the bulk of the tree); the
+    // verification search is correct since the exclude_move TT cutoff/store
+    // bugs were fixed.
 
     // Don't do singular extensions while in check (too expensive)
     if in_check {
@@ -736,6 +796,10 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
+    if ply_from_root >= MAX_SEARCH_PLY {
+        return SearchScore::EVAL(ctx.nnue.evaluate(board.side_to_move()));
+    }
+
     if depth <= 0 {
         return SearchScore::EVAL(quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root));
     }
@@ -746,7 +810,10 @@ fn negamax_it(
     let tt_hit = ctx.tt.probe(zob);
     if let Some(entry) = tt_hit {
         ctx.stats.tt_hits += 1;
-        if entry.depth >= depth_remaining {
+        // Don't take a TT cutoff during a singular verification search: the
+        // entry was stored for the full position (including the excluded move),
+        // so cutting on it would defeat the exclusion.
+        if exclude_move.is_none() && entry.depth >= depth_remaining {
             let tt_score = tt_score_on_load(entry.score, ply_from_root);
             match entry.flag {
                 TTFlag::Exact => {
@@ -770,7 +837,7 @@ fn negamax_it(
         }
     }
 
-    let eval = if let Some(hit) = tt_hit {
+    let raw_eval = if let Some(hit) = tt_hit {
         if let Some(tt_eval) = hit.eval {
             tt_eval
         } else {
@@ -779,10 +846,19 @@ fn negamax_it(
     } else {
         ctx.nnue.evaluate(board.side_to_move())
     };
+    let in_check = board.checkers().0 != 0;
+    // Correction history: nudge the raw static eval toward observed search
+    // results for this pawn structure. Stored raw in the TT; corrected here for
+    // pruning/improving decisions. Disabled in check / near mate.
+    let corr_key = pawn_structure_key(board);
+    let eval = if in_check || is_mate_score(raw_eval) {
+        raw_eval
+    } else {
+        (raw_eval + ctx.corrhist.correction(board.side_to_move(), corr_key))
+            .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+    };
     ctx.search_stack.set(ply_from_root as usize, eval);
     let is_improving = ctx.search_stack.is_improving(ply_from_root as usize, eval);
-
-    let in_check = board.checkers().0 != 0;
 
     // Razoring: at depth 1, if eval is far below alpha, verify position is bad via qsearch
     if depth_remaining == RAZORING_DEPTH
@@ -804,11 +880,22 @@ fn negamax_it(
     if !is_pv_node
         && !in_check
         && depth_remaining >= 2
+        && eval >= beta
+        && !is_mate_score(eval)
         && has_non_pawn_material(board, board.side_to_move())
     {
-        let r: i16 = if depth_remaining >= 6 { 3 } else { 2 } + if is_improving { 1 } else { 0 };
+        // Reduction scales with depth and how far eval exceeds beta (safe:
+        // C guarantees eval >= beta here), plus the improving bonus.
+        let r: i16 = 2
+            + depth_remaining / 4
+            + ((eval - beta) / 256).clamp(0, 2) as i16
+            + if is_improving { 1 } else { 0 };
         if let Some(nboard) = board_do_null_move(board, ctx.repetition) {
             ctx.nnue.push();
+            // The child of a null move has no "previous move"; clear this ply's
+            // slot so continuation-history / countermove lookups in the null
+            // subtree don't read a stale sibling move.
+            ctx.search_stack.set_null(ply_from_root as usize);
             let result = negamax_it(
                 ctx,
                 &nboard,
@@ -828,7 +915,77 @@ fn negamax_it(
                     if value >= beta {
                         ctx.stats.null_move_prunes += 1;
                         ctx.stats.beta_cutoffs += 1;
+                        // Don't return an unproven mate score from a null search.
+                        let value = if is_mate_score(value) { beta } else { value };
                         return SearchScore::EVAL(value);
+                    }
+                }
+            }
+        }
+    }
+
+    // ProbCut: at non-PV nodes, if a good capture beats a raised beta even in a
+    // shallow verification search, the position is very likely a fail-high — so
+    // prune. Same make/unmake protocol as the main move loop.
+    if !is_pv_node
+        && !in_check
+        && exclude_move.is_none()
+        && depth_remaining >= PROBCUT_MIN_DEPTH
+        && !is_mate_score(beta)
+        && eval >= beta
+    {
+        let pc_beta = beta.saturating_add(PROBCUT_MARGIN);
+        let pin_info = PinInfo::for_board(board);
+        let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
+        let ep_sq = board.en_passant();
+        let see_threshold = pc_beta - eval;
+        for (mv, _) in get_captures(board) {
+            let dest_piece = board.piece_on(mv.get_dest());
+            let is_ep = dest_piece.is_none() && is_en_passant_capture(board, mv);
+            if dest_piece.is_none() && !is_ep {
+                continue;
+            }
+            let needs_legal = !fast_path
+                || (mv.get_source().to_index() as u8) == pin_info.king_sq
+                || Some(mv.get_dest()) == ep_sq;
+            if needs_legal && !pin_info.move_is_legal(board, mv) {
+                continue;
+            }
+            if see_for_sort(board, mv) < see_threshold {
+                continue;
+            }
+
+            let new_board = board_do_move(board, mv, ctx.repetition);
+            ctx.nnue.push();
+            ctx.nnue.apply_move(board, mv);
+            ctx.search_stack
+                .set_move(ply_from_root as usize, mv, board.piece_on(mv.get_source()));
+            let result = negamax_it(
+                ctx,
+                &new_board,
+                depth_remaining - PROBCUT_REDUCTION,
+                -pc_beta,
+                -pc_beta + 1,
+                ply_from_root + 1,
+                false,
+                None,
+            );
+            ctx.nnue.pop();
+            ctx.repetition.pop();
+            match result {
+                SearchScore::CANCELLED => return SearchScore::CANCELLED,
+                SearchScore::EVAL(v) => {
+                    let score = -v;
+                    if score >= pc_beta {
+                        ctx.tt.store(
+                            zob,
+                            depth_remaining - PROBCUT_REDUCTION + 1,
+                            tt_score_on_store(score, ply_from_root),
+                            TTFlag::Lower,
+                            Some(mv),
+                            Some(raw_eval),
+                        );
+                        return SearchScore::EVAL(score);
                     }
                 }
             }
@@ -865,7 +1022,6 @@ fn negamax_it(
     if let Some(entry) = tt_hit {
         if should_check_singular_extension(
             depth_remaining,
-            is_pv_node,
             in_check,
             tt_move,
             entry.depth,
@@ -889,8 +1045,16 @@ fn negamax_it(
         .search_stack
         .get_prev_move(ply_index)
         .and_then(|prev_move| ctx.countermoves.get(prev_move, !mover));
-    let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, ctx.tt, killer_moves, countermove);
+    let cont_ctx1 = ctx.search_stack.cont_context(ply_index, 1);
+    let cont_ctx2 = ctx.search_stack.cont_context(ply_index, 2);
+    let mut incremental_move_gen = IncrementalMoveGen::new(
+        board,
+        ctx.tt,
+        killer_moves,
+        countermove,
+        cont_ctx1,
+        cont_ctx2,
+    );
 
     if incremental_move_gen.is_over() {
         if in_check {
@@ -901,7 +1065,7 @@ fn negamax_it(
 
     let can_fp = !in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH;
     let fp_val = if can_fp {
-        eval + futility_margin(depth_remaining)
+        eval + futility_margin(depth_remaining, is_improving)
     } else {
         POS_INFINITY
     };
@@ -911,7 +1075,9 @@ fn negamax_it(
 
     let mut move_idx: usize = 0;
     let mut saw_legal_yield = false;
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
+    while let Some(mv) =
+        incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont1, &*ctx.cont2)
+    {
         saw_legal_yield = true;
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
@@ -985,7 +1151,7 @@ fn negamax_it(
             && !is_promotion
             && depth_remaining <= LATE_MOVE_PRUNING_MAX_DEPTH
         {
-            let lmp_limit = late_move_pruning_threshold(depth_remaining);
+            let lmp_limit = late_move_pruning_threshold(depth_remaining, is_improving);
             if move_idx >= lmp_limit {
                 ctx.stats.late_move_prunes += 1;
                 ctx.repetition.pop();
@@ -997,7 +1163,18 @@ fn negamax_it(
         let apply_lmr =
             depth_remaining >= 3 && move_idx >= 3 && !is_first_move && !is_capture && !gives_check;
         let reduction: i16 = if apply_lmr {
-            lmr_reduction(depth_remaining, move_idx, is_pv_node)
+            // History signal for this quiet (butterfly + continuation history).
+            let mut hist = ctx.history.score(mover, mv);
+            if let Some(p) = board.piece_on(mv.get_source()) {
+                let to = mv.get_dest();
+                if let Some((pp, pt)) = cont_ctx1 {
+                    hist += ctx.cont1.score(pp, pt, p, to);
+                }
+                if let Some((pp, pt)) = cont_ctx2 {
+                    hist += ctx.cont2.score(pp, pt, p, to);
+                }
+            }
+            lmr_reduction(depth_remaining, move_idx, is_pv_node, hist)
         } else {
             0
         };
@@ -1034,7 +1211,8 @@ fn negamax_it(
 
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
-        ctx.search_stack.set_move(ply_index, mv);
+        ctx.search_stack
+            .set_move(ply_index, mv, board.piece_on(mv.get_source()));
 
         let mut value_opt: Option<i32> = None;
 
@@ -1115,10 +1293,28 @@ fn negamax_it(
         if value >= beta {
             if is_quiet {
                 ctx.history.reward(mover, mv, depth_remaining);
+                if let Some(p) = board.piece_on(mv.get_source()) {
+                    let to = mv.get_dest();
+                    if let Some((pp, pt)) = cont_ctx1 {
+                        ctx.cont1.reward(pp, pt, p, to, depth_remaining);
+                    }
+                    if let Some((pp, pt)) = cont_ctx2 {
+                        ctx.cont2.reward(pp, pt, p, to, depth_remaining);
+                    }
+                }
                 // Batch penalize all previously tried quiet moves
                 for &tried_mv in &tried_quiets {
                     if tried_mv != mv {
                         ctx.history.penalize(mover, tried_mv, depth_remaining);
+                        if let Some(p) = board.piece_on(tried_mv.get_source()) {
+                            let to = tried_mv.get_dest();
+                            if let Some((pp, pt)) = cont_ctx1 {
+                                ctx.cont1.penalize(pp, pt, p, to, depth_remaining);
+                            }
+                            if let Some((pp, pt)) = cont_ctx2 {
+                                ctx.cont2.penalize(pp, pt, p, to, depth_remaining);
+                            }
+                        }
                     }
                 }
                 // Update countermove: if opponent's last move exists, record this as the best response
@@ -1153,6 +1349,15 @@ fn negamax_it(
         if was_new_best {
             if is_quiet {
                 ctx.history.reward_soft(mover, mv, depth_remaining);
+                if let Some(p) = board.piece_on(mv.get_source()) {
+                    let to = mv.get_dest();
+                    if let Some((pp, pt)) = cont_ctx1 {
+                        ctx.cont1.reward_soft(pp, pt, p, to, depth_remaining);
+                    }
+                    if let Some((pp, pt)) = cont_ctx2 {
+                        ctx.cont2.reward_soft(pp, pt, p, to, depth_remaining);
+                    }
+                }
             }
         }
 
@@ -1173,6 +1378,13 @@ fn negamax_it(
     }
 
     if best_move_opt.is_none() {
+        // In a singular verification search all remaining moves may be pruned/
+        // excluded — that's a legitimate "no move beat s_beta" result, not a
+        // cancellation. Returning the (low) best_value tells is_singular the
+        // candidate is singular.
+        if exclude_move.is_some() {
+            return SearchScore::EVAL(best_value);
+        }
         return SearchScore::CANCELLED;
     }
 
@@ -1183,15 +1395,40 @@ fn negamax_it(
     } else {
         TTFlag::Exact
     };
-    let stored = tt_score_on_store(best_value, ply_from_root);
-    ctx.tt.store(
-        zob,
-        depth_remaining,
-        stored,
-        bound,
-        best_move_opt,
-        Some(eval),
-    );
+
+    // Don't write the TT or correction history from a singular verification
+    // search — its best_value is computed over the position minus one move and
+    // would pollute probes/ordering/eval for the real position.
+    if exclude_move.is_none() {
+        let stored = tt_score_on_store(best_value, ply_from_root);
+        ctx.tt.store(
+            zob,
+            depth_remaining,
+            stored,
+            bound,
+            best_move_opt,
+            Some(raw_eval),
+        );
+
+        // Correction-history update: only when the static eval is meaningful
+        // (not in check, not a mate score) and the search bound is consistent
+        // with the direction of the static-vs-search error.
+        if !in_check && !is_mate_score(best_value) && !is_mate_score(raw_eval) {
+            let update_ok = match bound {
+                TTFlag::Exact => true,
+                TTFlag::Lower => best_value > eval,
+                TTFlag::Upper => best_value < eval,
+            };
+            if update_ok {
+                ctx.corrhist.update(
+                    board.side_to_move(),
+                    corr_key,
+                    best_value - eval,
+                    depth_remaining,
+                );
+            }
+        }
+    }
 
     SearchScore::EVAL(best_value)
 }
@@ -1288,6 +1525,10 @@ fn root_search_with_window(
     history_table: &mut HistoryTable,
     countermove_table: &mut CountermoveTable,
     cap_hist_table: &mut CaptureHistoryTable,
+    cont1_table: &mut ContHist,
+    cont2_table: &mut ContHist,
+    corrhist_table: &mut CorrHist,
+    killer_table: &mut KillerTable,
     search_stack: &mut SearchStack,
     alpha_start: i32,
     beta_start: i32,
@@ -1314,26 +1555,31 @@ fn root_search_with_window(
     let mut first_move_fail_high = false;
     let mut move_count = 0usize;
 
-    let mut killer_table = KillerTable::new(max_depth + 4);
     let mut ctx = ThreadContext {
         tt: transpo_table,
         stop,
         stats,
         repetition: repetition_table,
-        killers: &mut killer_table,
+        killers: killer_table,
         history: history_table,
         countermoves: countermove_table,
         cap_hist: cap_hist_table,
+        cont1: cont1_table,
+        cont2: cont2_table,
+        corrhist: corrhist_table,
         nnue: nnue_state,
         search_stack,
     };
     let mut out = io::stdout();
 
     let killer_moves = ctx.killers.killers_for(0);
-    let mut incremental_move_gen = IncrementalMoveGen::new(board, ctx.tt, killer_moves, None);
+    let mut incremental_move_gen =
+        IncrementalMoveGen::new(board, ctx.tt, killer_moves, None, None, None);
     let root_mover = board.side_to_move();
 
-    while let Some(mv) = incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist) {
+    while let Some(mv) =
+        incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont1, &*ctx.cont2)
+    {
         if should_stop(ctx.stop) {
             aborted = true;
             break;
@@ -1354,6 +1600,8 @@ fn root_search_with_window(
         let child_depth_i16 = child_depth as i16;
         ctx.nnue.push();
         ctx.nnue.apply_move(board, mv);
+        ctx.search_stack
+            .set_move(0, mv, board.piece_on(mv.get_source()));
 
         let result = negamax_it(
             &mut ctx,
@@ -1399,8 +1647,6 @@ fn root_search_with_window(
                         ctx.history.reward(root_mover, mv, child_depth_i16);
                     } else if was_new_best {
                         ctx.history.reward_soft(root_mover, mv, child_depth_i16);
-                    } else {
-                        ctx.history.penalize(root_mover, mv, child_depth_i16);
                     }
                 }
 
@@ -1476,6 +1722,10 @@ fn aspiration_root_search(
     history_table: &mut HistoryTable,
     countermove_table: &mut CountermoveTable,
     cap_hist_table: &mut CaptureHistoryTable,
+    cont1_table: &mut ContHist,
+    cont2_table: &mut ContHist,
+    corrhist_table: &mut CorrHist,
+    killer_table: &mut KillerTable,
     search_stack: &mut SearchStack,
 ) -> RootSearchResult {
     if prev_score.is_none() {
@@ -1490,6 +1740,10 @@ fn aspiration_root_search(
             history_table,
             countermove_table,
             cap_hist_table,
+            cont1_table,
+            cont2_table,
+            corrhist_table,
+            killer_table,
             search_stack,
             NEG_INFINITY,
             POS_INFINITY,
@@ -1514,6 +1768,10 @@ fn aspiration_root_search(
             history_table,
             countermove_table,
             cap_hist_table,
+            cont1_table,
+            cont2_table,
+            corrhist_table,
+            killer_table,
             search_stack,
             alpha,
             beta,
@@ -1556,6 +1814,9 @@ struct ThreadContext<'a> {
     history: &'a mut HistoryTable,
     countermoves: &'a mut CountermoveTable,
     cap_hist: &'a mut CaptureHistoryTable,
+    cont1: &'a mut ContHist,
+    cont2: &'a mut ContHist,
+    corrhist: &'a mut CorrHist,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
 }
@@ -1564,10 +1825,13 @@ struct ThreadContext<'a> {
 struct SearchStackEntry {
     eval: i32,
     last_move: Option<ChessMove>,
+    last_piece: Option<Piece>,
 }
 
+const SEARCH_STACK_SIZE: usize = 256;
+
 struct SearchStack {
-    entries: [SearchStackEntry; 64],
+    entries: [SearchStackEntry; SEARCH_STACK_SIZE],
 }
 
 impl SearchStack {
@@ -1576,7 +1840,8 @@ impl SearchStack {
             entries: [SearchStackEntry {
                 eval: 0,
                 last_move: None,
-            }; 64],
+                last_piece: None,
+            }; SEARCH_STACK_SIZE],
         }
     }
 
@@ -1588,13 +1853,36 @@ impl SearchStack {
         self.entries[ply].eval = eval;
     }
 
-    fn set_move(&mut self, ply: usize, mv: ChessMove) {
+    fn set_move(&mut self, ply: usize, mv: ChessMove, piece: Option<Piece>) {
         self.entries[ply].last_move = Some(mv);
+        self.entries[ply].last_piece = piece;
+    }
+
+    /// Mark a ply as having no move (e.g. the child of a null move), so that
+    /// continuation-history / countermove lookups don't read a stale sibling.
+    fn set_null(&mut self, ply: usize) {
+        self.entries[ply].last_move = None;
+        self.entries[ply].last_piece = None;
     }
 
     fn get_prev_move(&self, ply: usize) -> Option<ChessMove> {
         if ply > 0 {
             self.entries[ply - 1].last_move
+        } else {
+            None
+        }
+    }
+
+    /// (piece, to) context of the move played `back` plies before the node at
+    /// `ply` — i.e. the move recorded in slot `ply - back`. Used to index
+    /// continuation history (back=1 → opponent reply, back=2 → our prior move).
+    fn cont_context(&self, ply: usize, back: usize) -> Option<(Piece, Square)> {
+        if ply >= back {
+            let e = &self.entries[ply - back];
+            match (e.last_piece, e.last_move) {
+                (Some(p), Some(mv)) => Some((p, mv.get_dest())),
+                _ => None,
+            }
         } else {
             None
         }
@@ -1626,6 +1914,11 @@ where
     let mut history_table = HistoryTable::new();
     let mut countermove_table = CountermoveTable::new();
     let mut cap_hist_table = CaptureHistoryTable::new();
+    let mut cont1_table = ContHist::new();
+    let mut cont2_table = ContHist::new();
+    let mut corrhist_table = CorrHist::new();
+    // Persist killers across iterative-deepening depths (was reset per depth).
+    let mut killer_table = KillerTable::new(max_depth + 4);
     let mut search_stack = SearchStack::new();
 
     // Track best move stability for time management
@@ -1636,8 +1929,6 @@ where
         if should_stop(stop) {
             break;
         }
-
-        transpo_table.bump_generation();
 
         let result = aspiration_root_search(
             board,
@@ -1651,6 +1942,10 @@ where
             &mut history_table,
             &mut countermove_table,
             &mut cap_hist_table,
+            &mut cont1_table,
+            &mut cont2_table,
+            &mut corrhist_table,
+            &mut killer_table,
             &mut search_stack,
         );
 
@@ -1808,6 +2103,11 @@ pub fn best_move(
     let mut nnue_state = NNUEState::from_board(board);
     let mut local_repetition = repetition_table.clone();
 
+    // One TT generation bump per search (not per depth) so that deep entries
+    // from earlier iterations are preferred over shallow ones for the whole
+    // search, and only entries from previous `go` commands are aged out.
+    transpo_table.bump_generation();
+
     let helper_handles = spawn_lazy_smp_helpers(
         board,
         max_depth,
@@ -1884,6 +2184,40 @@ mod tests {
         let board = Board::from_str("k7/3p4/8/8/8/8/3R4/7K w - - 0 1").expect("valid FEN");
         let mv = ChessMove::new(Square::D2, Square::D7, None);
         assert!(static_exchange_eval(&board, mv) > 0);
+    }
+
+    #[test]
+    fn tt_mate_score_roundtrip_fits_i16_and_recovers() {
+        for plies in [1, 2, 7, 25, 60, 100] {
+            for ply_from_root in [0, 1, 4, 10, 30] {
+                for sign in [1i32, -1] {
+                    let score = sign * mate_in_plies(plies);
+                    let stored = tt_score_on_store(score, ply_from_root);
+                    // Must fit in the i16 TT slot without clamping.
+                    assert!(
+                        stored >= i16::MIN as i32 && stored <= i16::MAX as i32,
+                        "stored {} out of i16 range (plies={}, ply={})",
+                        stored,
+                        plies,
+                        ply_from_root
+                    );
+                    // Simulate the i16 pack/unpack the TT performs.
+                    let packed = (stored as i16) as i32;
+                    let loaded = tt_score_on_load(packed, ply_from_root);
+                    assert_eq!(
+                        loaded, score,
+                        "mate score not recovered (plies={}, ply={}, sign={})",
+                        plies, ply_from_root, sign
+                    );
+                    // And it must still register as a mate score after the round trip.
+                    assert!(is_mate_score(loaded));
+                }
+            }
+        }
+        // A normal eval round-trips unchanged.
+        for &cp in &[0, 37, -250, 2999, -3000] {
+            assert_eq!(tt_score_on_load((tt_score_on_store(cp, 5) as i16) as i32, 5), cp);
+        }
     }
 
     #[test]

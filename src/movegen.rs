@@ -2,7 +2,7 @@ use crate::engine_core::{
     for_each_capture_pseudo_legal, for_each_quiet_pseudo_legal, get_bishop_moves, get_king_moves,
     get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove, Color, Piece, PinInfo, Square,
 };
-use crate::tables::{CaptureHistoryTable, HistoryTable};
+use crate::tables::{CaptureHistoryTable, ContHist, HistoryTable};
 use crate::TranspositionTable;
 use smallvec::SmallVec;
 use std::cmp;
@@ -26,6 +26,8 @@ pub struct IncrementalMoveGen<'a> {
     tt_move: Option<ChessMove>,
     killer_moves: [Option<ChessMove>; 2],
     countermove: Option<ChessMove>,
+    cont_ctx1: Option<(Piece, Square)>,
+    cont_ctx2: Option<(Piece, Square)>,
     pin_info: PinInfo,
     phase: MoveGenPhase,
     side_to_move: Color,
@@ -50,6 +52,8 @@ impl<'a> IncrementalMoveGen<'a> {
         tt: &TranspositionTable,
         killer_moves: [Option<ChessMove>; 2],
         countermove: Option<ChessMove>,
+        cont_ctx1: Option<(Piece, Square)>,
+        cont_ctx2: Option<(Piece, Square)>,
     ) -> Self {
         let pin_info = PinInfo::for_board(board);
 
@@ -64,6 +68,8 @@ impl<'a> IncrementalMoveGen<'a> {
             tt_move,
             killer_moves,
             countermove,
+            cont_ctx1,
+            cont_ctx2,
             phase: MoveGenPhase::TTMove,
             capture_gen_pending: false,
             captures_generated: false,
@@ -140,7 +146,7 @@ impl<'a> IncrementalMoveGen<'a> {
             .extend(bad_scored.into_iter().map(|(mv, _)| mv));
     }
 
-    fn ensure_quiet(&mut self, history: &HistoryTable) {
+    fn ensure_quiet(&mut self, history: &HistoryTable, cont1: &ContHist, cont2: &ContHist) {
         if self.quiet_generated {
             return;
         }
@@ -158,6 +164,8 @@ impl<'a> IncrementalMoveGen<'a> {
         let side_to_move = self.side_to_move;
         let killer_moves = self.killer_moves;
         let countermove = self.countermove;
+        let cont_ctx1 = self.cont_ctx1;
+        let cont_ctx2 = self.cont_ctx2;
         let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
         for_each_quiet_pseudo_legal(board, |mv| {
             if Some(mv) == tt_move {
@@ -192,6 +200,15 @@ impl<'a> IncrementalMoveGen<'a> {
             }
 
             let mut score = history.score(side_to_move, mv);
+            if let Some(piece) = board.piece_on(mv.get_source()) {
+                let to = mv.get_dest();
+                if let Some((pp, pt)) = cont_ctx1 {
+                    score += cont1.score(pp, pt, piece, to);
+                }
+                if let Some((pp, pt)) = cont_ctx2 {
+                    score += cont2.score(pp, pt, piece, to);
+                }
+            }
             if mv.get_promotion().is_some() {
                 score += PROMOTION_HISTORY_BONUS;
                 good_scored.push((mv, score));
@@ -226,7 +243,13 @@ impl<'a> IncrementalMoveGen<'a> {
         false
     }
 
-    pub fn next(&mut self, history: &HistoryTable, cap_hist: &CaptureHistoryTable) -> Option<ChessMove> {
+    pub fn next(
+        &mut self,
+        history: &HistoryTable,
+        cap_hist: &CaptureHistoryTable,
+        cont1: &ContHist,
+        cont2: &ContHist,
+    ) -> Option<ChessMove> {
         loop {
             match self.phase {
                 MoveGenPhase::TTMove => {
@@ -245,7 +268,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::GoodQuiet;
                 }
                 MoveGenPhase::GoodQuiet => {
-                    self.ensure_quiet(history);
+                    self.ensure_quiet(history, cont1, cont2);
                     if self.killer_quiet_idx < self.killer_quiet.len() {
                         let mv = self.killer_quiet[self.killer_quiet_idx];
                         self.killer_quiet_idx += 1;
@@ -268,7 +291,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::BadQuiet;
                 }
                 MoveGenPhase::BadQuiet => {
-                    self.ensure_quiet(history);
+                    self.ensure_quiet(history, cont1, cont2);
                     if self.bad_quiet_idx < self.bad_quiet.len() {
                         let mv = self.bad_quiet[self.bad_quiet_idx];
                         self.bad_quiet_idx += 1;
