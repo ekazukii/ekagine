@@ -891,7 +891,11 @@ fn negamax_it(
             + ((eval - beta) / 256).clamp(0, 2) as i16
             + if is_improving { 1 } else { 0 };
         if let Some(nboard) = board_do_null_move(board, ctx.repetition) {
-            ctx.nnue.push();
+            // A null move changes no pieces, so the accumulator is identical to
+            // the parent's. Reuse the parent's accumulator slot directly instead
+            // of pushing a full copy: the null child reads `current_acc` (the
+            // unchanged parent accumulator) and its own children push/apply from
+            // there as usual. Saves a 4KB accumulator copy per null move.
             // The child of a null move has no "previous move"; clear this ply's
             // slot so continuation-history / countermove lookups in the null
             // subtree don't read a stale sibling move.
@@ -907,7 +911,6 @@ fn negamax_it(
                 None,
             );
             board_pop(&nboard, ctx.repetition);
-            ctx.nnue.pop();
             match result {
                 SearchScore::CANCELLED => return SearchScore::CANCELLED,
                 SearchScore::EVAL(v) => {

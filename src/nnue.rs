@@ -79,43 +79,123 @@ impl Default for Accumulator {
 }
 
 impl Accumulator {
-    /// Updates weights for a single feature, either turning them on or off
+    /// Updates weights for a single feature, either turning them on or off.
+    /// Both perspectives are updated in a single loop; indices are valid by
+    /// construction (feature rows are `feature_num * HIDDEN`, always in bounds),
+    /// so the bounds checks are elided via `get_unchecked`.
     fn update_weights<const ON: bool>(&mut self, idx: (usize, usize)) {
-        fn update<const ON: bool>(acc: &mut SideAccumulator, idx: usize) {
-            let zip = acc
-                .iter_mut()
-                .zip(&MODEL.feature_weights[idx..idx + HIDDEN]);
-
-            for (acc_val, &weight) in zip {
+        let w: &[i16] = &MODEL.feature_weights.0;
+        let (wi, bi) = idx;
+        let white = &mut self.white.0;
+        let black = &mut self.black.0;
+        for i in 0..HIDDEN {
+            unsafe {
                 if ON {
-                    *acc_val += weight;
+                    *white.get_unchecked_mut(i) += *w.get_unchecked(wi + i);
+                    *black.get_unchecked_mut(i) += *w.get_unchecked(bi + i);
                 } else {
-                    *acc_val -= weight;
+                    *white.get_unchecked_mut(i) -= *w.get_unchecked(wi + i);
+                    *black.get_unchecked_mut(i) -= *w.get_unchecked(bi + i);
                 }
             }
         }
-
-        update::<ON>(&mut self.white, idx.0);
-        update::<ON>(&mut self.black, idx.1);
     }
 
-    /// Update accumulator for a quiet move.
-    /// Adds in features for the destination and removes the features of the source
-    fn add_sub_weights(&mut self, from: (usize, usize), to: (usize, usize)) {
-        fn add_sub(acc: &mut SideAccumulator, from: usize, to: usize) {
-            let zip = acc.iter_mut().zip(
-                MODEL.feature_weights[from..from + HIDDEN]
-                    .iter()
-                    .zip(&MODEL.feature_weights[to..to + HIDDEN]),
-            );
-
-            for (acc_val, (&remove_weight, &add_weight)) in zip {
-                *acc_val += add_weight - remove_weight;
+    /// Fused copy + add/sub: produce `self` from a *different* `prev`
+    /// accumulator in a single pass, `new[i] = prev[i] + w[add+i] - w[sub+i]`,
+    /// both perspectives. This replaces the separate "copy previous slot then
+    /// modify in place" sequence, eliminating one full accumulator read+write
+    /// pass (the 4KB copy) per move. `self` and `prev` are distinct stack slots
+    /// (no aliasing).
+    fn add_sub_from(&mut self, prev: &Accumulator, add: (usize, usize), sub: (usize, usize)) {
+        let w: &[i16] = &MODEL.feature_weights.0;
+        let dw = &mut self.white.0;
+        let db = &mut self.black.0;
+        let pw = &prev.white.0;
+        let pb = &prev.black.0;
+        for i in 0..HIDDEN {
+            unsafe {
+                *dw.get_unchecked_mut(i) =
+                    *pw.get_unchecked(i) + *w.get_unchecked(add.0 + i) - *w.get_unchecked(sub.0 + i);
+                *db.get_unchecked_mut(i) =
+                    *pb.get_unchecked(i) + *w.get_unchecked(add.1 + i) - *w.get_unchecked(sub.1 + i);
             }
         }
+    }
 
-        add_sub(&mut self.white, from.0, to.0);
-        add_sub(&mut self.black, from.1, to.1);
+    /// Fused capture: `new[i] = prev[i] + w[add+i] - w[sub0+i] - w[sub1+i]`,
+    /// both perspectives, single pass. Used for captures and promotion-captures
+    /// (move the piece + remove the captured piece) so the new accumulator is
+    /// touched only once instead of an add/sub pass followed by a separate sub.
+    fn add_sub_sub_from(
+        &mut self,
+        prev: &Accumulator,
+        add: (usize, usize),
+        sub0: (usize, usize),
+        sub1: (usize, usize),
+    ) {
+        let w: &[i16] = &MODEL.feature_weights.0;
+        let dw = &mut self.white.0;
+        let db = &mut self.black.0;
+        let pw = &prev.white.0;
+        let pb = &prev.black.0;
+        for i in 0..HIDDEN {
+            unsafe {
+                *dw.get_unchecked_mut(i) = *pw.get_unchecked(i) + *w.get_unchecked(add.0 + i)
+                    - *w.get_unchecked(sub0.0 + i)
+                    - *w.get_unchecked(sub1.0 + i);
+                *db.get_unchecked_mut(i) = *pb.get_unchecked(i) + *w.get_unchecked(add.1 + i)
+                    - *w.get_unchecked(sub0.1 + i)
+                    - *w.get_unchecked(sub1.1 + i);
+            }
+        }
+    }
+
+    /// Fused castling: `new[i] = prev[i] + w[add0] + w[add1] - w[sub0] - w[sub1]`,
+    /// both perspectives, single pass (king move + rook move).
+    fn add_add_sub_sub_from(
+        &mut self,
+        prev: &Accumulator,
+        add0: (usize, usize),
+        add1: (usize, usize),
+        sub0: (usize, usize),
+        sub1: (usize, usize),
+    ) {
+        let w: &[i16] = &MODEL.feature_weights.0;
+        let dw = &mut self.white.0;
+        let db = &mut self.black.0;
+        let pw = &prev.white.0;
+        let pb = &prev.black.0;
+        for i in 0..HIDDEN {
+            unsafe {
+                *dw.get_unchecked_mut(i) = *pw.get_unchecked(i)
+                    + *w.get_unchecked(add0.0 + i)
+                    + *w.get_unchecked(add1.0 + i)
+                    - *w.get_unchecked(sub0.0 + i)
+                    - *w.get_unchecked(sub1.0 + i);
+                *db.get_unchecked_mut(i) = *pb.get_unchecked(i)
+                    + *w.get_unchecked(add0.1 + i)
+                    + *w.get_unchecked(add1.1 + i)
+                    - *w.get_unchecked(sub0.1 + i)
+                    - *w.get_unchecked(sub1.1 + i);
+            }
+        }
+    }
+
+    /// Update accumulator for a quiet move (in place): add the destination
+    /// feature and remove the source feature, both perspectives in one loop.
+    fn add_sub_weights(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let w: &[i16] = &MODEL.feature_weights.0;
+        let white = &mut self.white.0;
+        let black = &mut self.black.0;
+        for i in 0..HIDDEN {
+            unsafe {
+                *white.get_unchecked_mut(i) +=
+                    *w.get_unchecked(to.0 + i) - *w.get_unchecked(from.0 + i);
+                *black.get_unchecked_mut(i) +=
+                    *w.get_unchecked(to.1 + i) - *w.get_unchecked(from.1 + i);
+            }
+        }
     }
 }
 
@@ -170,9 +250,12 @@ impl NNUEState {
         }
     }
 
-    /// Add a new accumulator to the stack by copying the previous top
+    /// Open a new accumulator slot on the stack. The new top is left
+    /// *uninitialized*; `apply_move` must be called next to populate it from the
+    /// previous slot (fused copy+update). Every `push()` in the search is
+    /// immediately followed by `apply_move`; the null-move case does not push
+    /// (the accumulator is unchanged, so the child reuses the parent's slot).
     pub fn push(&mut self) {
-        self.accumulator_stack[self.current_acc + 1] = self.accumulator_stack[self.current_acc];
         self.current_acc += 1;
     }
 
@@ -194,7 +277,11 @@ impl NNUEState {
         self.accumulator_stack[self.current_acc].add_sub_weights(from_idx, to_idx);
     }
 
-    /// Apply a move to the top accumulator, assuming the stack already reflects the pre-move board.
+    /// Apply a move, producing the new top accumulator from the previous slot.
+    /// `push()` must have been called first (it only bumped the index); this
+    /// fills `accumulator_stack[current_acc]` from `accumulator_stack[current_acc - 1]`.
+    /// The primary piece move is done with a single fused copy+add/sub pass; any
+    /// captured piece is then removed in place. No full-width copy is performed.
     pub fn apply_move(&mut self, board: &Board, mv: ChessMove) {
         let from = mv.get_source();
         let to = mv.get_dest();
@@ -206,12 +293,19 @@ impl NNUEState {
             .color_on(from)
             .expect("expected color on move source square");
 
+        // Borrow the previous (source) slot and the new (destination) slot as
+        // disjoint references so the update can read from one and write the other.
+        let cur = self.current_acc;
+        let (lower, upper) = self.accumulator_stack.split_at_mut(cur);
+        let prev = &lower[cur - 1];
+        let dst = &mut upper[0];
+
         let from_file = from.get_file().to_index() as i32;
         let to_file = to.get_file().to_index() as i32;
         let is_castling = piece == Piece::King && (from_file - to_file).abs() == 2;
         if is_castling {
-            self.manual_update::<OFF>(Piece::King, color, from);
-            self.manual_update::<ON>(Piece::King, color, to);
+            let king_from = nnue_index(Piece::King, color, from);
+            let king_to = nnue_index(Piece::King, color, to);
 
             let (rook_from, rook_to) = match (color, to) {
                 (Color::White, Square::G1) => (Square::H1, Square::F1),
@@ -220,9 +314,11 @@ impl NNUEState {
                 (Color::Black, Square::C8) => (Square::A8, Square::D8),
                 _ => panic!("unexpected castling destination"),
             };
+            let rook_from_idx = nnue_index(Piece::Rook, color, rook_from);
+            let rook_to_idx = nnue_index(Piece::Rook, color, rook_to);
 
-            self.manual_update::<OFF>(Piece::Rook, color, rook_from);
-            self.manual_update::<ON>(Piece::Rook, color, rook_to);
+            // Single fused pass: king move + rook move.
+            dst.add_add_sub_sub_from(prev, king_to, rook_to_idx, king_from, rook_from_idx);
             return;
         }
 
@@ -232,28 +328,34 @@ impl NNUEState {
             && dest_piece.is_none()
             && board.en_passant() == Some(to);
 
-        if promotion.is_none() && !is_en_passant && dest_piece.is_none() {
-            self.move_update(piece, color, from, to);
-            return;
-        }
+        // Primary feature change: move `piece` from `from` to `to`. A promotion
+        // swaps the destination piece type.
+        let target_piece = promotion.unwrap_or(piece);
+        let from_idx = nnue_index(piece, color, from);
+        let to_idx = nnue_index(target_piece, color, to);
 
-        if is_en_passant {
+        // Determine the captured feature (if any) and fold its removal into the
+        // same fused pass, so the new accumulator is written exactly once.
+        let captured_idx = if is_en_passant {
             let capture_sq = to.ubackward(color);
             let captured_color = match color {
                 Color::White => Color::Black,
                 Color::Black => Color::White,
             };
-            self.manual_update::<OFF>(Piece::Pawn, captured_color, capture_sq);
+            Some(nnue_index(Piece::Pawn, captured_color, capture_sq))
         } else if let Some(captured_piece) = dest_piece {
             let captured_color = board
                 .color_on(to)
                 .expect("expected color on captured square");
-            self.manual_update::<OFF>(captured_piece, captured_color, to);
-        }
+            Some(nnue_index(captured_piece, captured_color, to))
+        } else {
+            None
+        };
 
-        self.manual_update::<OFF>(piece, color, from);
-        let target_piece = promotion.unwrap_or(piece);
-        self.manual_update::<ON>(target_piece, color, to);
+        match captured_idx {
+            Some(cap) => dst.add_sub_sub_from(prev, to_idx, from_idx, cap),
+            None => dst.add_sub_from(prev, to_idx, from_idx),
+        }
     }
 
     /// Evaluate the nn from the current accumulator
