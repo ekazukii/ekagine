@@ -87,7 +87,7 @@ impl CompressedTTEntry {
     }
 }
 
-const TT_DEFAULT_MB: usize = 32;
+const TT_DEFAULT_MB: usize = 128;
 const TT_REPLACE_OFFSET: usize = 2;
 
 const MOVE_NONE: u16 = 0xFFFF;
@@ -428,7 +428,7 @@ impl KillerTable {
     }
 }
 
-const HISTORY_CAP: i32 = 1 << 20;
+const HISTORY_CAP: i32 = 16384;
 
 #[derive(Debug, Clone)]
 pub struct HistoryTable {
@@ -489,13 +489,17 @@ impl Default for HistoryTable {
 
 #[inline]
 fn history_bonus(depth: i16) -> i32 {
-    let d = depth.max(1).min(16) as i32;
-    d * d
+    // Stockfish-style: a meaningfully large bonus relative to the (now much
+    // smaller) gravity cap, so history actually accumulates a usable signal
+    // for both move ordering and history-based LMR.
+    let d = (depth.max(1) as i32).min(20);
+    (16 * d * d + 32 * d - 16).min(1536)
 }
 
 #[inline]
 fn history_malus(depth: i16) -> i32 {
-    history_bonus(depth).max(1) / 2
+    let d = (depth.max(1) as i32).min(20);
+    (16 * d * d + 32 * d - 16).min(1536)
 }
 
 /// Countermove Table - tracks the best quiet move response to opponent moves
@@ -592,6 +596,150 @@ impl CaptureHistoryTable {
 }
 
 impl Default for CaptureHistoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Continuation History
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Continuation history: quiet-move history conditioned on a previous move in
+/// the line. Indexed by (prev_piece, prev_to, cur_piece, cur_to). Two instances
+/// are used during search: one keyed on the move 1 ply back (the opponent's
+/// reply context) and one on the move 2 plies back (our own prior move). Each
+/// table is 6*64*6*64 = 147,456 i32 (~0.59 MB), heap-allocated to keep the
+/// search stack small.
+const CONT_LEN: usize = 6 * 64 * 6 * 64;
+
+pub struct ContHist {
+    e: Box<[i32]>,
+}
+
+impl ContHist {
+    pub fn new() -> Self {
+        Self {
+            e: vec![0i32; CONT_LEN].into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    fn idx(prev_piece: Piece, prev_to: Square, piece: Piece, to: Square) -> usize {
+        let pp = prev_piece.to_index();
+        let pt = prev_to.to_index();
+        let p = piece.to_index();
+        let t = to.to_index();
+        ((pp * 64 + pt) * 6 + p) * 64 + t
+    }
+
+    #[inline]
+    pub fn score(&self, prev_piece: Piece, prev_to: Square, piece: Piece, to: Square) -> i32 {
+        self.e[Self::idx(prev_piece, prev_to, piece, to)]
+    }
+
+    #[inline]
+    fn update(&mut self, prev_piece: Piece, prev_to: Square, piece: Piece, to: Square, delta: i32) {
+        let entry = &mut self.e[Self::idx(prev_piece, prev_to, piece, to)];
+        *entry += delta - *entry * delta.abs() / HISTORY_CAP;
+    }
+
+    pub fn reward(
+        &mut self,
+        prev_piece: Piece,
+        prev_to: Square,
+        piece: Piece,
+        to: Square,
+        depth: i16,
+    ) {
+        let bonus = history_bonus(depth);
+        if bonus > 0 {
+            self.update(prev_piece, prev_to, piece, to, bonus);
+        }
+    }
+
+    pub fn reward_soft(
+        &mut self,
+        prev_piece: Piece,
+        prev_to: Square,
+        piece: Piece,
+        to: Square,
+        depth: i16,
+    ) {
+        let bonus = history_bonus(depth) / 2;
+        if bonus > 0 {
+            self.update(prev_piece, prev_to, piece, to, bonus.max(1));
+        }
+    }
+
+    pub fn penalize(
+        &mut self,
+        prev_piece: Piece,
+        prev_to: Square,
+        piece: Piece,
+        to: Square,
+        depth: i16,
+    ) {
+        let malus = history_malus(depth);
+        if malus > 0 {
+            self.update(prev_piece, prev_to, piece, to, -malus);
+        }
+    }
+}
+
+impl Default for ContHist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Correction History
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Correction history: a per-(side, pawn-structure) running estimate of the
+/// systematic error of the static eval vs. the search result. The applied
+/// correction is bounded to a small centipawn range; the bucket is updated with
+/// a depth-weighted, gravity-bounded step toward the observed residual.
+const CORR_SIZE: usize = 16384;
+const CORR_MASK: usize = CORR_SIZE - 1;
+/// applied correction (cp) = bucket / CORR_GRAIN, clamped to ±CORR_MAX_CP.
+const CORR_GRAIN: i32 = 256;
+/// gravity bound on the bucket; equilibrium |bucket| ≈ CORR_LIMIT.
+const CORR_LIMIT: i32 = 16384;
+/// hard clamp on the applied correction in centipawns.
+const CORR_MAX_CP: i32 = 64;
+
+pub struct CorrHist {
+    e: Box<[i32]>,
+}
+
+impl CorrHist {
+    pub fn new() -> Self {
+        Self {
+            e: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    fn idx(side: Color, key: usize) -> usize {
+        side.to_index() * CORR_SIZE + (key & CORR_MASK)
+    }
+
+    #[inline]
+    pub fn correction(&self, side: Color, key: usize) -> i32 {
+        (self.e[Self::idx(side, key)] / CORR_GRAIN).clamp(-CORR_MAX_CP, CORR_MAX_CP)
+    }
+
+    pub fn update(&mut self, side: Color, key: usize, diff: i32, depth: i16) {
+        let weight = (depth as i32).clamp(1, 8);
+        let bonus = (diff * weight).clamp(-CORR_LIMIT / 4, CORR_LIMIT / 4);
+        let entry = &mut self.e[Self::idx(side, key)];
+        *entry += bonus - *entry * bonus.abs() / CORR_LIMIT;
+    }
+}
+
+impl Default for CorrHist {
     fn default() -> Self {
         Self::new()
     }
