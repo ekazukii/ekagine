@@ -1,5 +1,8 @@
+use crate::engine_core::{
+    for_each_capture_pseudo_legal, Board, ChessMove, Color, MoveGen, Piece, PinInfo, Square,
+};
 use crate::movegen::{
-    is_en_passant_capture, piece_value, see_for_sort, static_exchange_eval, IncrementalMoveGen,
+    is_en_passant_capture, see_for_sort, static_exchange_eval, IncrementalMoveGen,
 };
 use crate::nnue::NNUEState;
 use crate::tables::{
@@ -10,15 +13,10 @@ use crate::{
     board_do_move, board_pop, send_message, RepetitionTable, StopFlag, TTFlag, TranspositionTable,
     NEG_INFINITY, POS_INFINITY,
 };
-use crate::engine_core::{
-    for_each_capture_pseudo_legal, get_bishop_moves, get_king_moves, get_knight_moves,
-    get_rook_moves, BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, PinInfo, Square,
-};
 use lazy_static::lazy_static;
 use smallvec::SmallVec;
 use std::cmp;
 use std::io::Stdout;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,7 +78,9 @@ impl SearchStats {
             incremental_move_gen_capture_lists: self
                 .incremental_move_gen_capture_lists
                 .saturating_sub(other.incremental_move_gen_capture_lists),
-            singular_extensions: self.singular_extensions.saturating_sub(other.singular_extensions),
+            singular_extensions: self
+                .singular_extensions
+                .saturating_sub(other.singular_extensions),
             singular_checks: self.singular_checks.saturating_sub(other.singular_checks),
             effective_branching_factor: 0.0,
             depth: self.depth,
@@ -257,7 +257,7 @@ fn quiesce_negamax_it(
     ctx.stats.qnodes += 1;
 
     if ply_from_root >= MAX_SEARCH_PLY {
-        return ctx.nnue.evaluate(board.side_to_move());
+        return ctx.nnue.evaluate(board);
     }
 
     let zob = board.get_hash();
@@ -290,12 +290,12 @@ fn quiesce_negamax_it(
 
     if in_check {
         let pin_info = PinInfo::for_board(board);
-        let mut evasions = MoveGen::new_legal(board);
+        let evasions = MoveGen::new_legal(board);
         let alpha_orig = alpha;
         let mut best_move_opt: Option<ChessMove> = None;
         let mut any_legal = false;
 
-        while let Some(mv) = evasions.next() {
+        for mv in evasions {
             if !pin_info.move_is_legal(board, mv) {
                 continue;
             }
@@ -347,13 +347,9 @@ fn quiesce_negamax_it(
     }
 
     let static_eval = if let Some(ref tt_hit) = hit {
-        Some(
-            tt_hit
-                .eval
-                .unwrap_or_else(|| ctx.nnue.evaluate(board.side_to_move())),
-        )
+        Some(tt_hit.eval.unwrap_or_else(|| ctx.nnue.evaluate(board)))
     } else {
-        Some(ctx.nnue.evaluate(board.side_to_move()))
+        Some(ctx.nnue.evaluate(board))
     };
 
     // This path is only reached when not in check (the in-check case returns
@@ -363,8 +359,11 @@ fn quiesce_negamax_it(
     let stand_pat = if is_mate_score(raw_stand) {
         raw_stand
     } else {
-        (raw_stand + ctx.corrhist.correction(board.side_to_move(), pawn_structure_key(board)))
-            .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+        (raw_stand
+            + ctx
+                .corrhist
+                .correction(board.side_to_move(), pawn_structure_key(board)))
+        .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
     };
 
     let alpha_orig = alpha;
@@ -379,7 +378,7 @@ fn quiesce_negamax_it(
         alpha = stand_pat;
     }
 
-    let futility = stand_pat + QUIESCE_FUTILITY_MARGIN;
+    let futility = stand_pat + QUIESCE_FUTILITY_MARGIN.get();
     let pin_info = PinInfo::for_board(board);
     // Fast path: in non-check positions with no pinned pieces, only king
     // captures and EP captures need the per-move legality test.
@@ -464,9 +463,7 @@ fn has_non_pawn_material(board: &Board, side: Color) -> bool {
 fn pawn_structure_key(board: &Board) -> usize {
     let wp = (*board.pieces(Piece::Pawn) & *board.color_combined(Color::White)).0;
     let bp = (*board.pieces(Piece::Pawn) & *board.color_combined(Color::Black)).0;
-    let mut h = wp
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ bp.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let mut h = wp.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ bp.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     h ^= h >> 31;
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h ^= h >> 27;
@@ -497,24 +494,90 @@ const MVV_LVA_TABLE: [[u8; 6]; 6] = [
     [0, 0, 0, 0, 0, 0],
 ];
 
-const ASPIRATION_START_WINDOW: i32 = 25;
-const QUIESCE_FUTILITY_MARGIN: i32 = 200;
+// ─── SPSA-tunable search parameters ─────────────────────────────────────────
+// Runtime-adjustable via UCI `setoption`, so an external tuner (SPSA) can
+// optimise the eval-scale-sensitive margins without rebuilding the engine.
+pub struct Tunable {
+    pub name: &'static str,
+    atom: std::sync::atomic::AtomicI32,
+    pub default: i32,
+    pub min: i32,
+    pub max: i32,
+}
+
+impl Tunable {
+    pub const fn new(name: &'static str, default: i32, min: i32, max: i32) -> Self {
+        Self {
+            name,
+            atom: std::sync::atomic::AtomicI32::new(default),
+            default,
+            min,
+            max,
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self) -> i32 {
+        self.atom.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set(&self, value: i32) {
+        self.atom.store(
+            value.clamp(self.min, self.max),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Suppress root-search info logging (used by bulk rescoring).
+pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Optional node limit for the current search (0 = unlimited), set by
+/// `go nodes N` and by fixed-node workloads (datagen). Checked alongside the
+/// periodic stop test.
+pub static GO_MAX_NODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub static ASPIRATION_START_WINDOW: Tunable = Tunable::new("AspirationWindow", 25, 8, 80);
+pub static QUIESCE_FUTILITY_MARGIN: Tunable = Tunable::new("QFutilityMargin", 200, 60, 450);
+pub static FUTILITY_MARGIN_BASE: Tunable = Tunable::new("FutilityBase", 100, 30, 260);
+pub static FUTILITY_MARGIN_PER_DEPTH: Tunable = Tunable::new("FutilityPerDepth", 75, 25, 180);
+pub static RAZORING_MARGIN: Tunable = Tunable::new("RazoringMargin", 300, 100, 650);
+pub static PROBCUT_MARGIN: Tunable = Tunable::new("ProbcutMargin", 180, 60, 400);
+pub static SINGULAR_BETA_MARGIN_MULTIPLIER: Tunable = Tunable::new("SingularBetaMult", 2, 1, 6);
+pub static HIST_LMR_DIVISOR: Tunable = Tunable::new("HistLmrDivisor", 16384, 4096, 32768);
+
+pub static TUNABLES: [&Tunable; 8] = [
+    &ASPIRATION_START_WINDOW,
+    &QUIESCE_FUTILITY_MARGIN,
+    &FUTILITY_MARGIN_BASE,
+    &FUTILITY_MARGIN_PER_DEPTH,
+    &RAZORING_MARGIN,
+    &PROBCUT_MARGIN,
+    &SINGULAR_BETA_MARGIN_MULTIPLIER,
+    &HIST_LMR_DIVISOR,
+];
+
+/// Set a tunable by UCI option name (case-insensitive). Returns false if unknown.
+pub fn set_tunable(name: &str, value: i32) -> bool {
+    for t in TUNABLES {
+        if t.name.eq_ignore_ascii_case(name) {
+            t.set(value);
+            return true;
+        }
+    }
+    false
+}
 
 const FUTILITY_PRUNE_MAX_DEPTH: i16 = 6;
-const FUTILITY_MARGIN_BASE: i32 = 100;
-const FUTILITY_MARGIN_PER_DEPTH: i32 = 75;
 const REVERSE_FUTILITY_PRUNE_MAX_DEPTH: i16 = 4;
 
 const RAZORING_DEPTH: i16 = 1;
-const RAZORING_MARGIN: i32 = 300;
 
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
 const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
 const SINGULAR_EXTENSION_DEPTH_LIMIT: i16 = 12;
-const SINGULAR_BETA_MARGIN_MULTIPLIER: i32 = 2;
 const PROBCUT_MIN_DEPTH: i16 = 5;
-const PROBCUT_MARGIN: i32 = 180;
 const PROBCUT_REDUCTION: i16 = 4;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
 const LATE_MOVE_PRUNING_MAX_DEPTH: i16 = 5;
@@ -524,19 +587,20 @@ const LATE_MOVE_PRUNING_SCALE: usize = 2;
 #[inline]
 fn futility_margin(depth: i16, is_improving: bool) -> i32 {
     let d = depth as i32;
-    let base = FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * d.saturating_sub(1);
+    let (fb, fpd) = (FUTILITY_MARGIN_BASE.get(), FUTILITY_MARGIN_PER_DEPTH.get());
+    let base = fb + fpd * d.saturating_sub(1);
     // Tighter margin (more pruning) when the position is not improving.
     if is_improving {
         base
     } else {
-        (base - FUTILITY_MARGIN_PER_DEPTH / 2).max(FUTILITY_MARGIN_BASE / 2)
+        (base - fpd / 2).max(fb / 2)
     }
 }
 
 #[inline]
 fn reverse_futility_margin(depth: i16) -> i32 {
     let depth = depth as i32;
-    0 + FUTILITY_MARGIN_PER_DEPTH * depth
+    FUTILITY_MARGIN_PER_DEPTH.get() * depth
 }
 
 #[inline]
@@ -565,17 +629,12 @@ fn compute_lmr_table() -> [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] {
     let mut table = [[0i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH];
     for depth in 1..LMR_MAX_DEPTH {
         for move_idx in 1..LMR_MAX_MOVES {
-            let reduction = LMR_BASE +
-                (depth as f64).ln() * (move_idx as f64).ln() / LMR_DIVISOR;
+            let reduction = LMR_BASE + (depth as f64).ln() * (move_idx as f64).ln() / LMR_DIVISOR;
             table[depth][move_idx] = reduction.round() as i16;
         }
     }
     table
 }
-
-/// Divisor mapping the (butterfly + continuation) history score of a quiet move
-/// into an LMR reduction adjustment, clamped to ±2 plies.
-const HIST_LMR_DIVISOR: i32 = 16384;
 
 #[inline]
 fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool, hist: i32) -> i16 {
@@ -589,7 +648,7 @@ fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool, hist: i32) -> i1
         reduction = reduction.saturating_sub(1);
     }
     // Reduce less for moves with good history, more for bad history.
-    let hist_adj = (hist / HIST_LMR_DIVISOR).clamp(-2, 2) as i16;
+    let hist_adj = (hist / HIST_LMR_DIVISOR.get()).clamp(-2, 2) as i16;
     reduction -= hist_adj;
 
     // Ensure minimum reduction of 1 when LMR applies
@@ -654,8 +713,8 @@ fn get_captures(board: &Board) -> SmallVec<[(ChessMove, u8); 64]> {
     for_each_capture_pseudo_legal(board, |mv| {
         let score = if let Some(victim_piece) = board.piece_on(mv.get_dest()) {
             if let Some(attacker_piece) = board.piece_on(mv.get_source()) {
-                let victim_idx = victim_piece.to_index() as usize;
-                let attacker_idx = attacker_piece.to_index() as usize;
+                let victim_idx = victim_piece.to_index();
+                let attacker_idx = attacker_piece.to_index();
                 MVV_LVA_TABLE[victim_idx][attacker_idx]
             } else {
                 0
@@ -737,7 +796,7 @@ fn is_singular(
     ply_from_root: i32,
 ) -> bool {
     // Reduced beta: if other moves can't reach this, candidate is singular
-    let s_beta_margin = SINGULAR_BETA_MARGIN_MULTIPLIER * depth as i32;
+    let s_beta_margin = SINGULAR_BETA_MARGIN_MULTIPLIER.get() * depth as i32;
     let s_beta = beta - s_beta_margin;
 
     // Reduced depth for verification search (typically depth/2 - 1)
@@ -751,10 +810,10 @@ fn is_singular(
         ctx,
         board,
         s_depth,
-        s_beta - 1,      // alpha
-        s_beta,          // beta (null window)
+        s_beta - 1, // alpha
+        s_beta,     // beta (null window)
         ply_from_root,
-        false,           // Not a PV node
+        false,                // Not a PV node
         Some(candidate_move), // Exclude this move
     );
 
@@ -782,10 +841,18 @@ fn negamax_it(
     is_pv_node: bool,
     exclude_move: Option<ChessMove>,
 ) -> SearchScore {
+    if ctx.stats.nodes & 1023 == 0 {
+        let limit = GO_MAX_NODES.load(std::sync::atomic::Ordering::Relaxed);
+        if limit != 0 && ctx.stats.nodes >= limit {
+            ctx.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if ctx.stats.nodes & 2047 == 0 && should_stop(ctx.stop) {
-        let mut out = io::stdout();
-        let info_line = format!("info string break stop");
-        send_message(&mut out, &info_line);
+        if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut out = io::stdout();
+            let info_line = "info string break stop".to_string();
+            send_message(&mut out, &info_line);
+        }
         return SearchScore::CANCELLED;
     }
 
@@ -797,7 +864,7 @@ fn negamax_it(
     }
 
     if ply_from_root >= MAX_SEARCH_PLY {
-        return SearchScore::EVAL(ctx.nnue.evaluate(board.side_to_move()));
+        return SearchScore::EVAL(ctx.nnue.evaluate(board));
     }
 
     if depth <= 0 {
@@ -841,10 +908,10 @@ fn negamax_it(
         if let Some(tt_eval) = hit.eval {
             tt_eval
         } else {
-            ctx.nnue.evaluate(board.side_to_move())
+            ctx.nnue.evaluate(board)
         }
     } else {
-        ctx.nnue.evaluate(board.side_to_move())
+        ctx.nnue.evaluate(board)
     };
     let in_check = board.checkers().0 != 0;
     // Correction history: nudge the raw static eval toward observed search
@@ -868,7 +935,7 @@ fn negamax_it(
         && beta < POS_INFINITY - 1000
         && !is_mate_score(alpha)
         && !is_mate_score(beta)
-        && eval + RAZORING_MARGIN < alpha
+        && eval + RAZORING_MARGIN.get() < alpha
     {
         let razor_score = quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root);
         if razor_score <= alpha {
@@ -937,7 +1004,7 @@ fn negamax_it(
         && !is_mate_score(beta)
         && eval >= beta
     {
-        let pc_beta = beta.saturating_add(PROBCUT_MARGIN);
+        let pc_beta = beta.saturating_add(PROBCUT_MARGIN.get());
         let pin_info = PinInfo::for_board(board);
         let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
         let ep_sq = board.en_passant();
@@ -1033,7 +1100,14 @@ fn negamax_it(
         ) {
             ctx.stats.singular_checks += 1;
             if let Some(candidate_move) = tt_move {
-                if is_singular(ctx, board, candidate_move, depth_remaining, beta, ply_from_root) {
+                if is_singular(
+                    ctx,
+                    board,
+                    candidate_move,
+                    depth_remaining,
+                    beta,
+                    ply_from_root,
+                ) {
                     singular_extension = 1;
                     ctx.stats.singular_extensions += 1;
                 }
@@ -1102,11 +1176,10 @@ fn negamax_it(
             && !is_pv_node
             && !in_check
             && !is_first_move
+            && static_exchange_eval(board, mv) < 0
         {
-            if static_exchange_eval(board, mv) < 0 {
-                move_idx += 1;
-                continue;
-            }
+            move_idx += 1;
+            continue;
         }
 
         if can_fp
@@ -1132,7 +1205,8 @@ fn negamax_it(
         // Check if this move gets singular extension
         if Some(mv) == tt_move
             && singular_extension > 0
-            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT {
+            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT
+        {
             extension = cmp::max(extension, singular_extension);
         }
 
@@ -1205,7 +1279,11 @@ fn negamax_it(
         } else if is_capture {
             let cap_piece = board.piece_on(mv.get_source());
             let cap_victim = board.piece_on(mv.get_dest()).or_else(|| {
-                if is_en_passant_capture(board, mv) { Some(Piece::Pawn) } else { None }
+                if is_en_passant_capture(board, mv) {
+                    Some(Piece::Pawn)
+                } else {
+                    None
+                }
             });
             if let (Some(piece), Some(victim)) = (cap_piece, cap_victim) {
                 tried_captures.push((piece, mv.get_dest(), victim, mv));
@@ -1329,15 +1407,21 @@ fn negamax_it(
                 // Reward capture history on capture beta cutoff
                 let cap_piece = board.piece_on(mv.get_source());
                 let cap_victim = board.piece_on(mv.get_dest()).or_else(|| {
-                    if is_en_passant_capture(board, mv) { Some(Piece::Pawn) } else { None }
+                    if is_en_passant_capture(board, mv) {
+                        Some(Piece::Pawn)
+                    } else {
+                        None
+                    }
                 });
                 if let (Some(piece), Some(victim)) = (cap_piece, cap_victim) {
-                    ctx.cap_hist.reward(mover, piece, mv.get_dest(), victim, depth_remaining);
+                    ctx.cap_hist
+                        .reward(mover, piece, mv.get_dest(), victim, depth_remaining);
                 }
                 // Batch penalize all previously tried captures
                 for &(piece, dest, victim, tried_mv) in &tried_captures {
                     if tried_mv != mv {
-                        ctx.cap_hist.penalize(mover, piece, dest, victim, depth_remaining);
+                        ctx.cap_hist
+                            .penalize(mover, piece, dest, victim, depth_remaining);
                     }
                 }
             }
@@ -1349,17 +1433,15 @@ fn negamax_it(
             break;
         }
 
-        if was_new_best {
-            if is_quiet {
-                ctx.history.reward_soft(mover, mv, depth_remaining);
-                if let Some(p) = board.piece_on(mv.get_source()) {
-                    let to = mv.get_dest();
-                    if let Some((pp, pt)) = cont_ctx1 {
-                        ctx.cont1.reward_soft(pp, pt, p, to, depth_remaining);
-                    }
-                    if let Some((pp, pt)) = cont_ctx2 {
-                        ctx.cont2.reward_soft(pp, pt, p, to, depth_remaining);
-                    }
+        if was_new_best && is_quiet {
+            ctx.history.reward_soft(mover, mv, depth_remaining);
+            if let Some(p) = board.piece_on(mv.get_source()) {
+                let to = mv.get_dest();
+                if let Some((pp, pt)) = cont_ctx1 {
+                    ctx.cont1.reward_soft(pp, pt, p, to, depth_remaining);
+                }
+                if let Some((pp, pt)) = cont_ctx2 {
+                    ctx.cont2.reward_soft(pp, pt, p, to, depth_remaining);
                 }
             }
         }
@@ -1491,7 +1573,7 @@ fn collect_principal_variation(
     max_depth: usize,
 ) -> Vec<ChessMove> {
     let mut pv = Vec::new();
-    let mut current = board.clone();
+    let mut current = *board;
 
     for _ in 0..max_depth {
         let entry = match tt.probe(current.get_hash()) {
@@ -1633,7 +1715,9 @@ fn root_search_with_window(
                 let was_new_best = value > best_value;
 
                 if value > best_value {
-                    log_root_best_update(&mut out, max_depth, &mv, value, current_best);
+                    if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+                        log_root_best_update(&mut out, max_depth, &mv, value, current_best);
+                    }
                     best_value = value;
                     best_move = Some(mv);
 
@@ -1753,7 +1837,7 @@ fn aspiration_root_search(
         );
     }
 
-    let mut delta = ASPIRATION_START_WINDOW;
+    let mut delta = ASPIRATION_START_WINDOW.get();
     let guess = prev_score.unwrap();
 
     loop {
@@ -1896,6 +1980,63 @@ impl SearchStack {
     }
 }
 
+/// Reusable per-thread search tables for bulk workloads (rescoring) — avoids
+/// reallocating and zeroing ~2.3MB per `best_move` call. Move-ordering history
+/// intentionally carries over between positions (ordering/reduction effect
+/// only); state that influences returned scores (corrhist) or is strictly
+/// per-search (killers, stack) is reset by `reset_for_search`.
+pub struct ScratchTables {
+    history: HistoryTable,
+    countermove: CountermoveTable,
+    cap_hist: CaptureHistoryTable,
+    cont1: ContHist,
+    cont2: ContHist,
+    corrhist: CorrHist,
+    killers: KillerTable,
+    stack: SearchStack,
+}
+
+impl ScratchTables {
+    fn with_killer_depth(depth: usize) -> Self {
+        Self {
+            history: HistoryTable::new(),
+            countermove: CountermoveTable::new(),
+            cap_hist: CaptureHistoryTable::new(),
+            cont1: ContHist::new(),
+            cont2: ContHist::new(),
+            corrhist: CorrHist::new(),
+            killers: KillerTable::new(depth),
+            stack: SearchStack::new(),
+        }
+    }
+
+    pub fn new() -> Self {
+        Self::with_killer_depth(MAX_SEARCH_PLY as usize + 4)
+    }
+
+    fn reset_for_search(&mut self) {
+        self.corrhist.clear();
+        self.killers.reset_all();
+        self.stack = SearchStack::new();
+    }
+}
+
+/// Reusable full search state (tables + NNUE accumulator stack) for bulk
+/// rescoring via `best_move(..., Some(&mut scratch))`.
+pub struct SearchScratch {
+    tables: ScratchTables,
+    nnue: Box<NNUEState>,
+}
+
+impl SearchScratch {
+    pub fn new(board: &Board) -> Self {
+        Self {
+            tables: ScratchTables::new(),
+            nnue: NNUEState::from_board(board),
+        }
+    }
+}
+
 fn iterative_deepening_loop<F>(
     board: &Board,
     max_depth: usize,
@@ -1905,6 +2046,7 @@ fn iterative_deepening_loop<F>(
     stats: &mut SearchStats,
     nnue_state: &mut NNUEState,
     time_manager: Option<&TimeManagerHandle>,
+    scratch: Option<&mut ScratchTables>,
     mut on_iteration: F,
 ) -> (Option<ChessMove>, i32)
 where
@@ -1914,15 +2056,16 @@ where
     let mut best_score = 0;
     let mut prev_score: Option<i32> = None;
     let mut stats_prev = *stats;
-    let mut history_table = HistoryTable::new();
-    let mut countermove_table = CountermoveTable::new();
-    let mut cap_hist_table = CaptureHistoryTable::new();
-    let mut cont1_table = ContHist::new();
-    let mut cont2_table = ContHist::new();
-    let mut corrhist_table = CorrHist::new();
-    // Persist killers across iterative-deepening depths (was reset per depth).
-    let mut killer_table = KillerTable::new(max_depth + 4);
-    let mut search_stack = SearchStack::new();
+    // Fresh tables unless a reusable scratch is provided (bulk rescoring).
+    // Killers persist across iterative-deepening depths (was reset per depth).
+    let mut fresh: Option<ScratchTables> = None;
+    let tabs: &mut ScratchTables = match scratch {
+        Some(s) => {
+            s.reset_for_search();
+            s
+        }
+        None => fresh.insert(ScratchTables::with_killer_depth(max_depth + 4)),
+    };
 
     // Track best move stability for time management
     let mut best_move_changes = 0usize;
@@ -1942,14 +2085,14 @@ where
             stats,
             nnue_state,
             prev_score,
-            &mut history_table,
-            &mut countermove_table,
-            &mut cap_hist_table,
-            &mut cont1_table,
-            &mut cont2_table,
-            &mut corrhist_table,
-            &mut killer_table,
-            &mut search_stack,
+            &mut tabs.history,
+            &mut tabs.countermove,
+            &mut tabs.cap_hist,
+            &mut tabs.cont1,
+            &mut tabs.cont2,
+            &mut tabs.corrhist,
+            &mut tabs.killers,
+            &mut tabs.stack,
         );
 
         // Extract values we need before moving result
@@ -1960,10 +2103,8 @@ where
         let result_first_move_fail_high = result.first_move_fail_high;
 
         // Calculate score trend BEFORE updating prev_score
-        let score_trend_for_time = TimeScaleFactors::calculate_score_trend_factor(
-            prev_score,
-            result_score,
-        );
+        let score_trend_for_time =
+            TimeScaleFactors::calculate_score_trend_factor(prev_score, result_score);
 
         if let Some(bm) = result.best_move {
             // Track best move changes for time management
@@ -2047,7 +2188,7 @@ fn spawn_lazy_smp_helpers(
 
     let mut handles = Vec::with_capacity(worker_count);
     for worker_id in 1..=worker_count {
-        let board_clone = board.clone();
+        let board_clone = *board;
         let tt_clone = Arc::clone(transpo_table);
         let stop_clone = stop.clone();
         let mut repetition_clone = repetition_table.clone();
@@ -2068,6 +2209,7 @@ fn spawn_lazy_smp_helpers(
                 &stop_clone,
                 &mut local_stats,
                 nnue_state.as_mut(),
+                None,
                 None,
                 |_| {},
             );
@@ -2095,6 +2237,7 @@ pub fn best_move(
     time_plan: Option<TimePlan>,
     mut stdout_opt: Option<&mut Stdout>,
     threads: usize,
+    scratch: Option<&mut SearchScratch>,
 ) -> SearchOutcome {
     let stop = Arc::new(AtomicBool::new(false));
     let search_start = Instant::now();
@@ -2103,7 +2246,18 @@ pub fn best_move(
         .and_then(|plan| TimeManagerHandle::new(&stop, plan, search_start));
 
     let mut stats = SearchStats::default();
-    let mut nnue_state = NNUEState::from_board(board);
+    // Reuse the caller's scratch NNUE/table state when provided (bulk rescoring).
+    let mut fresh_nnue: Option<Box<NNUEState>> = None;
+    let (nnue_state, scratch_tables): (&mut NNUEState, Option<&mut ScratchTables>) = match scratch {
+        Some(s) => {
+            s.nnue.refresh(board);
+            (s.nnue.as_mut(), Some(&mut s.tables))
+        }
+        None => (
+            fresh_nnue.insert(NNUEState::from_board(board)).as_mut(),
+            None,
+        ),
+    };
     let mut local_repetition = repetition_table.clone();
 
     // One TT generation bump per search (not per depth) so that deep entries
@@ -2128,8 +2282,9 @@ pub fn best_move(
         &mut local_repetition,
         &stop,
         &mut stats,
-        nnue_state.as_mut(),
+        nnue_state,
         time_manager.as_ref(),
+        scratch_tables,
         |report| {
             if report.result.aborted {
                 return;
@@ -2156,7 +2311,7 @@ pub fn best_move(
                         "info depth {} score {} nodes {} nps {} time {} pv {}",
                         report.depth, score_str, nodes, nps, time_ms, pv_line
                     );
-                    send_message(&mut **out, &info_line);
+                    send_message(out, &info_line);
                 }
             }
         },
@@ -2164,7 +2319,7 @@ pub fn best_move(
 
     if let Some(out) = stdout_opt.as_mut() {
         let stats_line = format!("info string stats {}", stats.format_as_info());
-        send_message(&mut **out, &stats_line);
+        send_message(out, &stats_line);
     }
 
     stop.store(true, Ordering::Relaxed);
@@ -2219,7 +2374,10 @@ mod tests {
         }
         // A normal eval round-trips unchanged.
         for &cp in &[0, 37, -250, 2999, -3000] {
-            assert_eq!(tt_score_on_load((tt_score_on_store(cp, 5) as i16) as i32, 5), cp);
+            assert_eq!(
+                tt_score_on_load((tt_score_on_store(cp, 5) as i16) as i32, 5),
+                cp
+            );
         }
     }
 
@@ -2233,8 +2391,9 @@ mod tests {
 
     #[test]
     fn regression_no_phantom_mate_on_queen_sac_line() {
-        let board = Board::from_str("r3kb1r/ppq2ppp/4p1N1/1b1p4/8/2B5/PPPN1PPP/R2Q1RK1 b kq - 0 12")
-            .expect("valid FEN");
+        let board =
+            Board::from_str("r3kb1r/ppq2ppp/4p1N1/1b1p4/8/2B5/PPPN1PPP/R2Q1RK1 b kq - 0 12")
+                .expect("valid FEN");
         let tt = Arc::new(TranspositionTable::new());
         let outcome = best_move(
             &board,
@@ -2244,6 +2403,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         );
 
         assert!(

@@ -4,25 +4,20 @@ mod engine_core;
 mod eval;
 mod movegen;
 mod nnue;
+mod rescore;
 mod search;
 mod tables;
 mod time;
 
-use crate::engine_core::Color::{Black, White};
-use crate::engine_core::{
-    BitBoard, Board, BoardStatus, ChessMove, Color, MoveGen, Piece, Square,
-};
+use crate::engine_core::{Board, ChessMove, Piece};
 use crate::search::{best_move, uci_score_string, SearchStats};
 use crate::time::{plan_time_for_move, TimePlan};
-use lazy_static::lazy_static;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
-use std::fmt::format;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Stdout, Write};
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -169,6 +164,7 @@ struct ParsedGo {
     binc: Option<u64>,
     movestogo: Option<u64>,
     movetime: Option<u64>,
+    nodes: Option<u64>,
     ponder: bool,
     infinite: bool,
 }
@@ -191,6 +187,10 @@ fn parse_go_tokens(tokens: &[&str]) -> ParsedGo {
             "movetime" => {
                 i += 1;
                 parsed.movetime = tokens.get(i).and_then(|v| v.parse().ok());
+            }
+            "nodes" => {
+                i += 1;
+                parsed.nodes = tokens.get(i).and_then(|v| v.parse().ok());
             }
             "wtime" => {
                 i += 1;
@@ -232,7 +232,7 @@ fn uci_loop() {
 
     for line in stdin.lock().lines() {
         let input = line.unwrap();
-        let tokens: Vec<&str> = input.trim().split_whitespace().collect();
+        let tokens: Vec<&str> = input.split_whitespace().collect();
 
         if tokens.is_empty() {
             continue;
@@ -251,6 +251,16 @@ fn uci_loop() {
                     )
                     .as_str(),
                 );
+                for t in search::TUNABLES {
+                    send_message(
+                        &mut stdout,
+                        format!(
+                            "option name {} type spin default {} min {} max {}",
+                            t.name, t.default, t.min, t.max
+                        )
+                        .as_str(),
+                    );
+                }
                 send_message(&mut stdout, "uciok");
             }
             "isready" => {
@@ -280,6 +290,11 @@ fn uci_loop() {
                                         "info string invalid value '{}' for Threads",
                                         value_str
                                     );
+                                    send_message(&mut stdout, &warn);
+                                }
+                            } else if let Ok(parsed) = value_str.parse::<i32>() {
+                                if !search::set_tunable(&name, parsed) {
+                                    let warn = format!("info string unknown option '{}'", name);
                                     send_message(&mut stdout, &warn);
                                 }
                             }
@@ -315,6 +330,16 @@ fn uci_loop() {
                 }
             }
             "go" => {
+                // Optional node limit (`go nodes N`), used by fixed-node
+                // workloads (datagen). Reset on every `go`.
+                let node_limit = tokens
+                    .iter()
+                    .position(|&t| t == "nodes")
+                    .and_then(|i| tokens.get(i + 1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                search::GO_MAX_NODES.store(node_limit, std::sync::atomic::Ordering::Relaxed);
+
                 if let Some(depth_idx) = tokens.iter().position(|&t| t == "depth") {
                     if let Some(depth_token) = tokens.get(depth_idx + 1) {
                         match depth_token.parse::<usize>() {
@@ -328,6 +353,7 @@ fn uci_loop() {
                                     None,
                                     None,
                                     options.threads,
+                                    None,
                                 );
                                 let elapsed = search_start.elapsed();
 
@@ -407,6 +433,7 @@ fn uci_loop() {
                     time_plan.clone(),
                     Some(&mut stdout),
                     options.threads,
+                    None,
                 );
                 let elapsed = search_start.elapsed();
                 engine_state.last_think_time = Some(elapsed);
@@ -464,7 +491,7 @@ fn process_file(filepath: &str) -> io::Result<HashMap<Board, i32>> {
         match serde_json::from_str::<PositionEvaluation>(&line) {
             Ok(position_eval) => {
                 if let Some(best_eval) = position_eval.evals.iter().max_by_key(|e| e.depth) {
-                    if let Some(first_pv) = best_eval.pvs.get(0) {
+                    if let Some(first_pv) = best_eval.pvs.first() {
                         if let Some(cp_value) = first_pv.cp {
                             match Board::from_str(position_eval.fen.as_str()) {
                                 Ok(board) => {
@@ -517,7 +544,7 @@ fn compute_stats(data: &[f64]) -> (f64, f64, f64, f64, f64, f64, f64) {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let mean = sorted.iter().sum::<f64>() / n as f64;
-    let median = if n % 2 == 0 {
+    let median = if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]
@@ -549,6 +576,7 @@ fn benchmark_evaluation(fen_to_stockfish: &HashMap<Board, i32>) {
                 Some(TimePlan::fixed(Duration::from_millis(90))),
                 None,
                 1,
+                None,
             )
         });
 
@@ -623,6 +651,7 @@ pub fn compute_best_from_fen(
         None,
         None,
         EngineOptions::default().threads,
+        None,
     );
 
     Ok((outcome.best_move, outcome.score))
@@ -665,6 +694,26 @@ fn main() {
             match process_file(filepath) {
                 Ok(hash_map) => benchmark_evaluation(&hash_map),
                 Err(err) => eprintln!("Failed to open {}: {}", filepath, err),
+            }
+        }
+
+        "--rescore" => {
+            // --rescore <in.bin> <out.bin> [depth=6] [threads=8]
+            let (input, output) = match (args.get(2), args.get(3)) {
+                (Some(i), Some(o)) => (i.clone(), o.clone()),
+                _ => {
+                    eprintln!(
+                        "Usage: {} --rescore <in.bin> <out.bin> [depth] [threads]",
+                        args[0]
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let depth: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
+            let threads: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(8);
+            if let Err(e) = rescore::run_rescore(&input, &output, depth, threads) {
+                eprintln!("rescore failed: {e}");
+                std::process::exit(1);
             }
         }
 

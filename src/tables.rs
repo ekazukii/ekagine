@@ -1,17 +1,12 @@
 use crate::engine_core::{ChessMove, Color, File, Piece, Rank, Square};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TTFlag {
+    #[default]
     Exact,
     Lower,
     Upper,
-}
-
-impl Default for TTFlag {
-    fn default() -> Self {
-        TTFlag::Exact
-    }
 }
 
 /// Uncompressed representation of a single TTEntry
@@ -396,6 +391,13 @@ pub struct KillerTable {
 }
 
 impl KillerTable {
+    /// Clear all killer slots in place (reused between unrelated searches).
+    pub fn reset_all(&mut self) {
+        for m in self.moves.iter_mut() {
+            *m = [None; MAX_KILLER_MOVES];
+        }
+    }
+
     pub fn new(initial_depth: usize) -> Self {
         let depth = initial_depth.max(1);
         KillerTable {
@@ -417,7 +419,7 @@ impl KillerTable {
     pub fn record(&mut self, ply: usize, mv: ChessMove) {
         self.ensure_capacity(ply);
         let entry = &mut self.moves[ply];
-        if entry.iter().any(|existing| *existing == Some(mv)) {
+        if entry.contains(&Some(mv)) {
             if entry[1] == Some(mv) {
                 entry.swap(0, 1);
             }
@@ -445,16 +447,16 @@ impl HistoryTable {
     #[inline]
     pub fn score(&self, color: Color, mv: ChessMove) -> i32 {
         let color_idx = color.to_index();
-        let from = mv.get_source().to_index() as usize;
-        let to = mv.get_dest().to_index() as usize;
+        let from = mv.get_source().to_index();
+        let to = mv.get_dest().to_index();
         self.entries[color_idx][from][to]
     }
 
     #[inline]
     fn update(&mut self, color: Color, mv: ChessMove, delta: i32) {
         let color_idx = color.to_index();
-        let from = mv.get_source().to_index() as usize;
-        let to = mv.get_dest().to_index() as usize;
+        let from = mv.get_source().to_index();
+        let to = mv.get_dest().to_index();
         let entry = &mut self.entries[color_idx][from][to];
         *entry += delta - *entry * delta.abs() / HISTORY_CAP;
     }
@@ -519,8 +521,8 @@ impl CountermoveTable {
     #[inline]
     pub fn get(&self, prev_move: ChessMove, prev_color: Color) -> Option<ChessMove> {
         let color_idx = prev_color.to_index();
-        let from = prev_move.get_source().to_index() as usize;
-        let to = prev_move.get_dest().to_index() as usize;
+        let from = prev_move.get_source().to_index();
+        let to = prev_move.get_dest().to_index();
         self.entries[color_idx][from][to]
     }
 
@@ -528,8 +530,8 @@ impl CountermoveTable {
     #[inline]
     pub fn record(&mut self, prev_move: ChessMove, prev_color: Color, countermove: ChessMove) {
         let color_idx = prev_color.to_index();
-        let from = prev_move.get_source().to_index() as usize;
-        let to = prev_move.get_dest().to_index() as usize;
+        let from = prev_move.get_source().to_index();
+        let to = prev_move.get_dest().to_index();
         self.entries[color_idx][from][to] = Some(countermove);
     }
 }
@@ -719,6 +721,11 @@ impl CorrHist {
         Self {
             e: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
         }
+    }
+
+    /// Zero the table in place (reused between unrelated searches).
+    pub fn clear(&mut self) {
+        self.e.fill(0);
     }
 
     #[inline(always)]
