@@ -7,6 +7,7 @@ use crate::movegen::{
 use crate::nnue::NNUEState;
 use crate::tables::{
     CaptureHistoryTable, ContHist, CorrHist, CountermoveTable, HistoryTable, KillerTable,
+    PawnHistory,
 };
 use crate::time::{TimeManagerHandle, TimePlan, TimeScaleFactors};
 use crate::{
@@ -1124,6 +1125,8 @@ fn negamax_it(
         .and_then(|prev_move| ctx.countermoves.get(prev_move, !mover));
     let cont_ctx1 = ctx.search_stack.cont_context(ply_index, 1);
     let cont_ctx2 = ctx.search_stack.cont_context(ply_index, 2);
+    let cont_ctx3 = ctx.search_stack.cont_context(ply_index, 4);
+    let pawn_key = pawn_structure_key(board);
     let mut incremental_move_gen = IncrementalMoveGen::new(
         board,
         ctx.tt,
@@ -1131,6 +1134,8 @@ fn negamax_it(
         countermove,
         cont_ctx1,
         cont_ctx2,
+        cont_ctx3,
+        pawn_key,
     );
 
     if incremental_move_gen.is_over() {
@@ -1152,9 +1157,14 @@ fn negamax_it(
 
     let mut move_idx: usize = 0;
     let mut saw_legal_yield = false;
-    while let Some(mv) =
-        incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont1, &*ctx.cont2)
-    {
+    while let Some(mv) = incremental_move_gen.next(
+        &*ctx.history,
+        &*ctx.cap_hist,
+        &*ctx.cont1,
+        &*ctx.cont2,
+        &*ctx.cont3,
+        &*ctx.pawn_hist,
+    ) {
         saw_legal_yield = true;
         if incremental_move_gen.take_capture_generation_event() {
             ctx.stats.incremental_move_gen_capture_lists += 1;
@@ -1382,6 +1392,10 @@ fn negamax_it(
                     if let Some((pp, pt)) = cont_ctx2 {
                         ctx.cont2.reward(pp, pt, p, to, depth_remaining);
                     }
+                    if let Some((pp, pt)) = cont_ctx3 {
+                        ctx.cont3.reward(pp, pt, p, to, depth_remaining);
+                    }
+                    ctx.pawn_hist.reward(pawn_key, p, to, depth_remaining);
                 }
                 // Batch penalize all previously tried quiet moves
                 for &tried_mv in &tried_quiets {
@@ -1395,6 +1409,10 @@ fn negamax_it(
                             if let Some((pp, pt)) = cont_ctx2 {
                                 ctx.cont2.penalize(pp, pt, p, to, depth_remaining);
                             }
+                            if let Some((pp, pt)) = cont_ctx3 {
+                                ctx.cont3.penalize(pp, pt, p, to, depth_remaining);
+                            }
+                            ctx.pawn_hist.penalize(pawn_key, p, to, depth_remaining);
                         }
                     }
                 }
@@ -1443,6 +1461,10 @@ fn negamax_it(
                 if let Some((pp, pt)) = cont_ctx2 {
                     ctx.cont2.reward_soft(pp, pt, p, to, depth_remaining);
                 }
+                if let Some((pp, pt)) = cont_ctx3 {
+                    ctx.cont3.reward_soft(pp, pt, p, to, depth_remaining);
+                }
+                ctx.pawn_hist.reward_soft(pawn_key, p, to, depth_remaining);
             }
         }
 
@@ -1612,6 +1634,8 @@ fn root_search_with_window(
     cap_hist_table: &mut CaptureHistoryTable,
     cont1_table: &mut ContHist,
     cont2_table: &mut ContHist,
+    cont3_table: &mut ContHist,
+    pawn_hist_table: &mut PawnHistory,
     corrhist_table: &mut CorrHist,
     killer_table: &mut KillerTable,
     search_stack: &mut SearchStack,
@@ -1651,6 +1675,8 @@ fn root_search_with_window(
         cap_hist: cap_hist_table,
         cont1: cont1_table,
         cont2: cont2_table,
+        cont3: cont3_table,
+        pawn_hist: pawn_hist_table,
         corrhist: corrhist_table,
         nnue: nnue_state,
         search_stack,
@@ -1658,13 +1684,26 @@ fn root_search_with_window(
     let mut out = io::stdout();
 
     let killer_moves = ctx.killers.killers_for(0);
-    let mut incremental_move_gen =
-        IncrementalMoveGen::new(board, ctx.tt, killer_moves, None, None, None);
+    let mut incremental_move_gen = IncrementalMoveGen::new(
+        board,
+        ctx.tt,
+        killer_moves,
+        None,
+        None,
+        None,
+        None,
+        pawn_structure_key(board),
+    );
     let root_mover = board.side_to_move();
 
-    while let Some(mv) =
-        incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont1, &*ctx.cont2)
-    {
+    while let Some(mv) = incremental_move_gen.next(
+        &*ctx.history,
+        &*ctx.cap_hist,
+        &*ctx.cont1,
+        &*ctx.cont2,
+        &*ctx.cont3,
+        &*ctx.pawn_hist,
+    ) {
         if should_stop(ctx.stop) {
             aborted = true;
             break;
@@ -1811,6 +1850,8 @@ fn aspiration_root_search(
     cap_hist_table: &mut CaptureHistoryTable,
     cont1_table: &mut ContHist,
     cont2_table: &mut ContHist,
+    cont3_table: &mut ContHist,
+    pawn_hist_table: &mut PawnHistory,
     corrhist_table: &mut CorrHist,
     killer_table: &mut KillerTable,
     search_stack: &mut SearchStack,
@@ -1829,6 +1870,8 @@ fn aspiration_root_search(
             cap_hist_table,
             cont1_table,
             cont2_table,
+            cont3_table,
+            pawn_hist_table,
             corrhist_table,
             killer_table,
             search_stack,
@@ -1857,6 +1900,8 @@ fn aspiration_root_search(
             cap_hist_table,
             cont1_table,
             cont2_table,
+            cont3_table,
+            pawn_hist_table,
             corrhist_table,
             killer_table,
             search_stack,
@@ -1903,6 +1948,8 @@ struct ThreadContext<'a> {
     cap_hist: &'a mut CaptureHistoryTable,
     cont1: &'a mut ContHist,
     cont2: &'a mut ContHist,
+    cont3: &'a mut ContHist,
+    pawn_hist: &'a mut PawnHistory,
     corrhist: &'a mut CorrHist,
     nnue: &'a mut NNUEState,
     search_stack: &'a mut SearchStack,
@@ -1991,6 +2038,8 @@ pub struct ScratchTables {
     cap_hist: CaptureHistoryTable,
     cont1: ContHist,
     cont2: ContHist,
+    cont3: ContHist,
+    pawn_hist: PawnHistory,
     corrhist: CorrHist,
     killers: KillerTable,
     stack: SearchStack,
@@ -2004,6 +2053,8 @@ impl ScratchTables {
             cap_hist: CaptureHistoryTable::new(),
             cont1: ContHist::new(),
             cont2: ContHist::new(),
+            cont3: ContHist::new(),
+            pawn_hist: PawnHistory::new(),
             corrhist: CorrHist::new(),
             killers: KillerTable::new(depth),
             stack: SearchStack::new(),
@@ -2090,6 +2141,8 @@ where
             &mut tabs.cap_hist,
             &mut tabs.cont1,
             &mut tabs.cont2,
+            &mut tabs.cont3,
+            &mut tabs.pawn_hist,
             &mut tabs.corrhist,
             &mut tabs.killers,
             &mut tabs.stack,

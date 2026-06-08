@@ -2,7 +2,7 @@ use crate::engine_core::{
     for_each_capture_pseudo_legal, for_each_quiet_pseudo_legal, get_bishop_moves, get_king_moves,
     get_knight_moves, get_rook_moves, BitBoard, Board, ChessMove, Color, Piece, PinInfo, Square,
 };
-use crate::tables::{CaptureHistoryTable, ContHist, HistoryTable};
+use crate::tables::{CaptureHistoryTable, ContHist, HistoryTable, PawnHistory};
 use crate::TranspositionTable;
 use smallvec::SmallVec;
 use std::cmp;
@@ -28,6 +28,8 @@ pub struct IncrementalMoveGen<'a> {
     countermove: Option<ChessMove>,
     cont_ctx1: Option<(Piece, Square)>,
     cont_ctx2: Option<(Piece, Square)>,
+    cont_ctx3: Option<(Piece, Square)>,
+    pawn_key: usize,
     pin_info: PinInfo,
     phase: MoveGenPhase,
     side_to_move: Color,
@@ -54,6 +56,8 @@ impl<'a> IncrementalMoveGen<'a> {
         countermove: Option<ChessMove>,
         cont_ctx1: Option<(Piece, Square)>,
         cont_ctx2: Option<(Piece, Square)>,
+        cont_ctx3: Option<(Piece, Square)>,
+        pawn_key: usize,
     ) -> Self {
         let pin_info = PinInfo::for_board(board);
 
@@ -70,6 +74,8 @@ impl<'a> IncrementalMoveGen<'a> {
             countermove,
             cont_ctx1,
             cont_ctx2,
+            cont_ctx3,
+            pawn_key,
             phase: MoveGenPhase::TTMove,
             capture_gen_pending: false,
             captures_generated: false,
@@ -120,9 +126,10 @@ impl<'a> IncrementalMoveGen<'a> {
             }
 
             let see_val = see_for_sort(board, mv);
-            let ch_bonus = if let (Some(piece), Some(captured)) =
-                (board.piece_on(mv.get_source()), board.piece_on(mv.get_dest()))
-            {
+            let ch_bonus = if let (Some(piece), Some(captured)) = (
+                board.piece_on(mv.get_source()),
+                board.piece_on(mv.get_dest()),
+            ) {
                 cap_hist.score(side_to_move, piece, mv.get_dest(), captured)
             } else {
                 0
@@ -146,7 +153,14 @@ impl<'a> IncrementalMoveGen<'a> {
             .extend(bad_scored.into_iter().map(|(mv, _)| mv));
     }
 
-    fn ensure_quiet(&mut self, history: &HistoryTable, cont1: &ContHist, cont2: &ContHist) {
+    fn ensure_quiet(
+        &mut self,
+        history: &HistoryTable,
+        cont1: &ContHist,
+        cont2: &ContHist,
+        cont3: &ContHist,
+        pawn_hist: &PawnHistory,
+    ) {
         if self.quiet_generated {
             return;
         }
@@ -166,6 +180,8 @@ impl<'a> IncrementalMoveGen<'a> {
         let countermove = self.countermove;
         let cont_ctx1 = self.cont_ctx1;
         let cont_ctx2 = self.cont_ctx2;
+        let cont_ctx3 = self.cont_ctx3;
+        let pawn_key = self.pawn_key;
         let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
         for_each_quiet_pseudo_legal(board, |mv| {
             if Some(mv) == tt_move {
@@ -208,6 +224,10 @@ impl<'a> IncrementalMoveGen<'a> {
                 if let Some((pp, pt)) = cont_ctx2 {
                     score += cont2.score(pp, pt, piece, to);
                 }
+                if let Some((pp, pt)) = cont_ctx3 {
+                    score += cont3.score(pp, pt, piece, to);
+                }
+                score += pawn_hist.score(pawn_key, piece, to);
             }
             if mv.get_promotion().is_some() {
                 score += PROMOTION_HISTORY_BONUS;
@@ -249,6 +269,8 @@ impl<'a> IncrementalMoveGen<'a> {
         cap_hist: &CaptureHistoryTable,
         cont1: &ContHist,
         cont2: &ContHist,
+        cont3: &ContHist,
+        pawn_hist: &PawnHistory,
     ) -> Option<ChessMove> {
         loop {
             match self.phase {
@@ -268,7 +290,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::GoodQuiet;
                 }
                 MoveGenPhase::GoodQuiet => {
-                    self.ensure_quiet(history, cont1, cont2);
+                    self.ensure_quiet(history, cont1, cont2, cont3, pawn_hist);
                     if self.killer_quiet_idx < self.killer_quiet.len() {
                         let mv = self.killer_quiet[self.killer_quiet_idx];
                         self.killer_quiet_idx += 1;
@@ -291,7 +313,7 @@ impl<'a> IncrementalMoveGen<'a> {
                     self.phase = MoveGenPhase::BadQuiet;
                 }
                 MoveGenPhase::BadQuiet => {
-                    self.ensure_quiet(history, cont1, cont2);
+                    self.ensure_quiet(history, cont1, cont2, cont3, pawn_hist);
                     if self.bad_quiet_idx < self.bad_quiet.len() {
                         let mv = self.bad_quiet[self.bad_quiet_idx];
                         self.bad_quiet_idx += 1;
