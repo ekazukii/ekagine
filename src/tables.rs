@@ -604,6 +604,73 @@ impl Default for CaptureHistoryTable {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pawn History
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Pawn-structure-conditioned quiet history. Indexed by a hash of the pawn
+/// configuration (bucketed) and the moving piece's (piece, to). Captures the
+/// fact that the value of a quiet maneuver is strongly correlated with the
+/// pawn skeleton. Reused from the same gravity update as the other histories.
+const PAWN_HIST_BUCKETS: usize = 512;
+const PAWN_HIST_LEN: usize = PAWN_HIST_BUCKETS * 6 * 64;
+
+pub struct PawnHistory {
+    e: Box<[i32]>,
+}
+
+impl PawnHistory {
+    pub fn new() -> Self {
+        Self {
+            e: vec![0i32; PAWN_HIST_LEN].into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    fn idx(pawn_key: usize, piece: Piece, to: Square) -> usize {
+        let bucket = pawn_key & (PAWN_HIST_BUCKETS - 1);
+        (bucket * 6 + piece.to_index()) * 64 + to.to_index()
+    }
+
+    #[inline]
+    pub fn score(&self, pawn_key: usize, piece: Piece, to: Square) -> i32 {
+        self.e[Self::idx(pawn_key, piece, to)]
+    }
+
+    #[inline]
+    fn update(&mut self, pawn_key: usize, piece: Piece, to: Square, delta: i32) {
+        let entry = &mut self.e[Self::idx(pawn_key, piece, to)];
+        *entry += delta - *entry * delta.abs() / HISTORY_CAP;
+    }
+
+    pub fn reward(&mut self, pawn_key: usize, piece: Piece, to: Square, depth: i16) {
+        let bonus = history_bonus(depth);
+        if bonus > 0 {
+            self.update(pawn_key, piece, to, bonus);
+        }
+    }
+
+    pub fn reward_soft(&mut self, pawn_key: usize, piece: Piece, to: Square, depth: i16) {
+        let bonus = history_bonus(depth) / 2;
+        if bonus > 0 {
+            self.update(pawn_key, piece, to, bonus.max(1));
+        }
+    }
+
+    pub fn penalize(&mut self, pawn_key: usize, piece: Piece, to: Square, depth: i16) {
+        let malus = history_malus(depth);
+        if malus > 0 {
+            self.update(pawn_key, piece, to, -malus);
+        }
+    }
+}
+
+impl Default for PawnHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Continuation History
 // ─────────────────────────────────────────────────────────────────────────────
 
