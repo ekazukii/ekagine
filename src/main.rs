@@ -23,14 +23,25 @@ use std::time::{Duration, Instant};
 
 const MAX_THREADS: usize = 64;
 
+// Default must match `TranspositionTable::new()` (TT_DEFAULT_MB) so that, when a
+// GUI never sends `setoption name Hash`, the table size is byte-for-byte what it
+// was before the option existed — i.e. this option is inert on the default path.
+const DEFAULT_HASH_MB: usize = 128;
+const MIN_HASH_MB: usize = 1;
+const MAX_HASH_MB: usize = 4096;
+
 #[derive(Clone, Debug)]
 struct EngineOptions {
     threads: usize,
+    hash_mb: usize,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
-        Self { threads: 1 }
+        Self {
+            threads: 1,
+            hash_mb: DEFAULT_HASH_MB,
+        }
     }
 }
 
@@ -38,6 +49,10 @@ impl EngineOptions {
     fn set_threads(&mut self, value: usize) {
         let clamped = value.clamp(1, MAX_THREADS);
         self.threads = clamped;
+    }
+
+    fn set_hash(&mut self, value: usize) {
+        self.hash_mb = value.clamp(MIN_HASH_MB, MAX_HASH_MB);
     }
 }
 
@@ -225,7 +240,7 @@ fn uci_loop() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut board = Board::default();
-    let transpo_table = Arc::new(TranspositionTable::new());
+    let mut transpo_table = Arc::new(TranspositionTable::new());
     let mut repetition_table: RepetitionTable = RepetitionTable::new(board.get_hash());
     let mut options = EngineOptions::default();
     let mut engine_state = EngineState::default();
@@ -248,6 +263,14 @@ fn uci_loop() {
                         "option name Threads type spin default {} min 1 max {}",
                         EngineOptions::default().threads,
                         MAX_THREADS
+                    )
+                    .as_str(),
+                );
+                send_message(
+                    &mut stdout,
+                    format!(
+                        "option name Hash type spin default {} min {} max {}",
+                        DEFAULT_HASH_MB, MIN_HASH_MB, MAX_HASH_MB
                     )
                     .as_str(),
                 );
@@ -288,6 +311,21 @@ fn uci_loop() {
                                 } else {
                                     let warn = format!(
                                         "info string invalid value '{}' for Threads",
+                                        value_str
+                                    );
+                                    send_message(&mut stdout, &warn);
+                                }
+                            } else if name.eq_ignore_ascii_case("Hash") {
+                                if let Ok(parsed) = value_str.parse::<usize>() {
+                                    options.set_hash(parsed);
+                                    // Rebuild the shared table at the new size. Safe here:
+                                    // the UCI loop is single-threaded and no search is in
+                                    // flight while we process `setoption`.
+                                    transpo_table =
+                                        Arc::new(TranspositionTable::with_mb(options.hash_mb));
+                                } else {
+                                    let warn = format!(
+                                        "info string invalid value '{}' for Hash",
                                         value_str
                                     );
                                     send_message(&mut stdout, &warn);

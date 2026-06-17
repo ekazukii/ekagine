@@ -871,7 +871,7 @@ fn negamax_it(
         return SearchScore::EVAL(quiesce_negamax_it(ctx, board, alpha, beta, ply_from_root));
     }
 
-    let depth_remaining = depth;
+    let mut depth_remaining = depth;
     let zob = board.get_hash();
 
     let tt_hit = ctx.tt.probe(zob);
@@ -1113,6 +1113,15 @@ fn negamax_it(
                 }
             }
         }
+    }
+
+    // Internal Iterative Reduction (IIR): with no TT move to guide ordering, a
+    // full-depth search here is wasteful. Reduce one ply so a shallower search
+    // fills in the TT move; the better-ordered re-search happens on a later
+    // iteration / sibling. Placed after null-move/probcut/singular so those keep
+    // the full depth — only the move loop and child depths see the reduction.
+    if depth_remaining >= 4 && tt_move.is_none() && exclude_move.is_none() {
+        depth_remaining -= 1;
     }
 
     ctx.stats.incremental_move_gen_inits += 1;
@@ -2308,8 +2317,14 @@ pub fn best_move(
                         .join(" ");
                     let score_str = uci_score_string(report.best_score, board.side_to_move());
                     let info_line = format!(
-                        "info depth {} score {} nodes {} nps {} time {} pv {}",
-                        report.depth, score_str, nodes, nps, time_ms, pv_line
+                        "info depth {} score {} nodes {} nps {} time {} hashfull {} pv {}",
+                        report.depth,
+                        score_str,
+                        nodes,
+                        nps,
+                        time_ms,
+                        transpo_table.hashfull(),
+                        pv_line
                     );
                     send_message(out, &info_line);
                 }
