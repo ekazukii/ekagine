@@ -267,6 +267,24 @@ impl TranspositionTable {
         }
     }
 
+    /// Approximate fill level in permille (0..=1000), sampled over the first
+    /// 1000 slots — the standard UCI `hashfull` estimate. Used to confirm a
+    /// `Hash` resize actually took effect and to monitor TT pressure in-game.
+    pub fn hashfull(&self) -> usize {
+        let sample = self.table.len().min(1000);
+        if sample == 0 {
+            return 0;
+        }
+        let mut used = 0usize;
+        for slot in self.table.iter().take(sample) {
+            let (_, data) = slot.load();
+            if data != 0 {
+                used += 1;
+            }
+        }
+        used * 1000 / sample
+    }
+
     #[inline]
     fn get_key(&self, hash: u64) -> usize {
         let key = hash as u128;
