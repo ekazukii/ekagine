@@ -671,7 +671,13 @@ fn compute_lmr_table() -> [[i16; LMR_MAX_MOVES]; LMR_MAX_DEPTH] {
 }
 
 #[inline]
-fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool, hist: i32) -> i16 {
+fn lmr_reduction(
+    depth: i16,
+    move_idx: usize,
+    is_pv_node: bool,
+    is_improving: bool,
+    hist: i32,
+) -> i16 {
     let d = (depth as usize).min(LMR_MAX_DEPTH - 1);
     let m = move_idx.min(LMR_MAX_MOVES - 1);
 
@@ -680,6 +686,12 @@ fn lmr_reduction(depth: i16, move_idx: usize, is_pv_node: bool, hist: i32) -> i1
     // Reduce less in PV nodes.
     if is_pv_node {
         reduction = reduction.saturating_sub(1);
+    }
+    // Reduce one more ply when the side to move is not improving: the position
+    // is likely worse than a couple plies ago, so late quiets are less worth a
+    // full-depth search.
+    if !is_improving {
+        reduction += 1;
     }
     // Reduce less for moves with good history, more for bad history.
     let hist_adj = (hist / HIST_LMR_DIVISOR.get()).clamp(-2, 2) as i16;
@@ -1298,7 +1310,7 @@ fn negamax_it(
                     hist += ctx.cont2.score(pp, pt, p, to);
                 }
             }
-            lmr_reduction(depth_remaining, move_idx, is_pv_node, hist)
+            lmr_reduction(depth_remaining, move_idx, is_pv_node, is_improving, hist)
         } else {
             0
         };
