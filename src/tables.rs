@@ -727,23 +727,37 @@ const CORR_MASK: usize = CORR_SIZE - 1;
 const CORR_GRAIN: i32 = 256;
 /// gravity bound on the bucket; equilibrium |bucket| ≈ CORR_LIMIT.
 const CORR_LIMIT: i32 = 16384;
-/// hard clamp on the applied correction in centipawns.
+/// hard clamp on the applied pawn-structure correction in centipawns.
 const CORR_MAX_CP: i32 = 64;
+/// tighter clamp per non-pawn table: the two non-pawn tables stack on top of the
+/// pawn table, so each is bounded smaller to keep the summed correction in a
+/// sane range (max total ±128cp) and avoid over-correction in positions where
+/// every key is stable. Prime SPSA knob if this regresses.
+const CORR_MAX_CP_NP: i32 = 32;
 
 pub struct CorrHist {
-    e: Box<[i32]>,
+    /// keyed by (side-to-move, pawn-structure)
+    pawn: Box<[i32]>,
+    /// keyed by (side-to-move, white non-pawn piece placement)
+    nonpawn_w: Box<[i32]>,
+    /// keyed by (side-to-move, black non-pawn piece placement)
+    nonpawn_b: Box<[i32]>,
 }
 
 impl CorrHist {
     pub fn new() -> Self {
         Self {
-            e: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
+            pawn: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
+            nonpawn_w: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
+            nonpawn_b: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
         }
     }
 
-    /// Zero the table in place (reused between unrelated searches).
+    /// Zero the tables in place (reused between unrelated searches).
     pub fn clear(&mut self) {
-        self.e.fill(0);
+        self.pawn.fill(0);
+        self.nonpawn_w.fill(0);
+        self.nonpawn_b.fill(0);
     }
 
     #[inline(always)]
@@ -752,15 +766,42 @@ impl CorrHist {
     }
 
     #[inline]
-    pub fn correction(&self, side: Color, key: usize) -> i32 {
-        (self.e[Self::idx(side, key)] / CORR_GRAIN).clamp(-CORR_MAX_CP, CORR_MAX_CP)
+    fn read_one(table: &[i32], side: Color, key: usize, max_cp: i32) -> i32 {
+        (table[Self::idx(side, key)] / CORR_GRAIN).clamp(-max_cp, max_cp)
     }
 
-    pub fn update(&mut self, side: Color, key: usize, diff: i32, depth: i16) {
+    #[inline]
+    fn update_one(table: &mut [i32], side: Color, key: usize, diff: i32, depth: i16) {
         let weight = (depth as i32).clamp(1, 8);
         let bonus = (diff * weight).clamp(-CORR_LIMIT / 4, CORR_LIMIT / 4);
-        let entry = &mut self.e[Self::idx(side, key)];
+        let entry = &mut table[Self::idx(side, key)];
         *entry += bonus - *entry * bonus.abs() / CORR_LIMIT;
+    }
+
+    /// Combined correction (cp): pawn-structure plus per-color non-pawn
+    /// placement. Each sub-table is independently gravity-bounded to
+    /// ±CORR_MAX_CP and the three are summed (Viridithas/Stockfish style) so the
+    /// piece-placement signal stacks on the pawn signal. The caller clamps the
+    /// final (eval + correction) away from mate scores.
+    #[inline]
+    pub fn correction(&self, side: Color, pawn_key: usize, npw_key: usize, npb_key: usize) -> i32 {
+        Self::read_one(&self.pawn, side, pawn_key, CORR_MAX_CP)
+            + Self::read_one(&self.nonpawn_w, side, npw_key, CORR_MAX_CP_NP)
+            + Self::read_one(&self.nonpawn_b, side, npb_key, CORR_MAX_CP_NP)
+    }
+
+    pub fn update(
+        &mut self,
+        side: Color,
+        pawn_key: usize,
+        npw_key: usize,
+        npb_key: usize,
+        diff: i32,
+        depth: i16,
+    ) {
+        Self::update_one(&mut self.pawn, side, pawn_key, diff, depth);
+        Self::update_one(&mut self.nonpawn_w, side, npw_key, diff, depth);
+        Self::update_one(&mut self.nonpawn_b, side, npb_key, diff, depth);
     }
 }
 

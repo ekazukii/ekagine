@@ -359,10 +359,14 @@ fn quiesce_negamax_it(
     let stand_pat = if is_mate_score(raw_stand) {
         raw_stand
     } else {
+        let (npw, npb) = nonpawn_keys(board);
         (raw_stand
-            + ctx
-                .corrhist
-                .correction(board.side_to_move(), pawn_structure_key(board)))
+            + ctx.corrhist.correction(
+                board.side_to_move(),
+                pawn_structure_key(board),
+                npw,
+                npb,
+            ))
         .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
     };
 
@@ -468,6 +472,36 @@ fn pawn_structure_key(board: &Board) -> usize {
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h ^= h >> 27;
     h as usize
+}
+
+#[inline]
+fn corr_mix(mut h: u64) -> usize {
+    h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 31;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h as usize
+}
+
+/// Per-color non-pawn placement hashes (knights/bishops/rooks/queens/king of
+/// each color), used as extra correction-history keys. NNUE eval residual is
+/// dominated by piece placement, which the pawn-only key cannot capture.
+/// Returns (white-non-pawn key, black-non-pawn key).
+#[inline]
+fn nonpawn_keys(board: &Board) -> (usize, usize) {
+    let non_pawn = |c: Color| {
+        ((*board.pieces(Piece::Knight)
+            | *board.pieces(Piece::Bishop)
+            | *board.pieces(Piece::Rook)
+            | *board.pieces(Piece::Queen)
+            | *board.pieces(Piece::King))
+            & *board.color_combined(c))
+        .0
+    };
+    (
+        corr_mix(non_pawn(Color::White)),
+        corr_mix(non_pawn(Color::Black)),
+    )
 }
 
 /// Create a new board representing a null move using Board::null_move(),
@@ -918,11 +952,15 @@ fn negamax_it(
     // results for this pawn structure. Stored raw in the TT; corrected here for
     // pruning/improving decisions. Disabled in check / near mate.
     let corr_key = pawn_structure_key(board);
+    let (corr_npw, corr_npb) = nonpawn_keys(board);
     let eval = if in_check || is_mate_score(raw_eval) {
         raw_eval
     } else {
-        (raw_eval + ctx.corrhist.correction(board.side_to_move(), corr_key))
-            .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+        (raw_eval
+            + ctx
+                .corrhist
+                .correction(board.side_to_move(), corr_key, corr_npw, corr_npb))
+        .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
     };
     ctx.search_stack.set(ply_from_root as usize, eval);
     let is_improving = ctx.search_stack.is_improving(ply_from_root as usize, eval);
@@ -1517,6 +1555,8 @@ fn negamax_it(
                 ctx.corrhist.update(
                     board.side_to_move(),
                     corr_key,
+                    corr_npw,
+                    corr_npb,
                     best_value - eval,
                     depth_remaining,
                 );
