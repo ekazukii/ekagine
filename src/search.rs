@@ -1172,6 +1172,11 @@ fn negamax_it(
                                 1
                             };
                         ctx.stats.singular_extensions += 1;
+                    } else if !is_pv_node {
+                        // Verified NOT singular: other moves also reach s_beta,
+                        // so the TT move is less likely uniquely best — search it
+                        // one ply shallower (negative extension).
+                        singular_extension = -1;
                     }
                 }
             }
@@ -1274,9 +1279,11 @@ fn negamax_it(
 
         let mut extension: i16 = 0;
 
-        // Check if this move gets singular extension
-        if Some(mv) == tt_move && singular_extension > 0 {
-            extension = cmp::max(extension, singular_extension);
+        // Singular extension (+1/+2), or negative extension (-1) when the TT
+        // move was verified non-singular. Applies only to the TT move; a later
+        // check / passed-pawn extension can still raise a negative one via max.
+        if Some(mv) == tt_move && singular_extension != 0 {
+            extension = singular_extension;
         }
 
         if gives_check && depth_remaining <= CHECK_EXTENSION_DEPTH_LIMIT && depth_remaining > 0 {
