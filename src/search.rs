@@ -610,7 +610,6 @@ const RAZORING_DEPTH: i16 = 1;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
 const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
-const SINGULAR_EXTENSION_DEPTH_LIMIT: i16 = 12;
 const PROBCUT_MIN_DEPTH: i16 = 5;
 const PROBCUT_REDUCTION: i16 = 4;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
@@ -795,10 +794,9 @@ fn should_check_singular_extension(
         return false;
     }
 
-    // Don't check at depths where we won't apply the extension anyway
-    if depth > SINGULAR_EXTENSION_DEPTH_LIMIT {
-        return false;
-    }
+    // No upper depth cap: singular runs at every depth >= MIN_DEPTH, like
+    // Stockfish / Stormphrax / Berserk. Capping it discarded the extension in
+    // the deepest, most important nodes.
 
     // Singular checks now run at non-PV nodes too (the bulk of the tree); the
     // verification search is correct since the exclude_move TT cutoff/store
@@ -1262,10 +1260,7 @@ fn negamax_it(
         let mut extension: i16 = 0;
 
         // Check if this move gets singular extension
-        if Some(mv) == tt_move
-            && singular_extension > 0
-            && depth_remaining <= SINGULAR_EXTENSION_DEPTH_LIMIT
-        {
+        if Some(mv) == tt_move && singular_extension > 0 {
             extension = cmp::max(extension, singular_extension);
         }
 
