@@ -610,6 +610,10 @@ const RAZORING_DEPTH: i16 = 1;
 const CHECK_EXTENSION_DEPTH_LIMIT: i16 = 2;
 const PASSED_PAWN_EXTENSION_DEPTH_LIMIT: i16 = 6;
 const SINGULAR_EXTENSION_MIN_DEPTH: i16 = 8;
+// Double extension: when the singular verification score falls this far below
+// the singular beta, the candidate is *overwhelmingly* singular and we extend
+// by 2 plies instead of 1 (non-PV only). Prime SPSA knob. Larger = rarer.
+const DOUBLE_EXTENSION_MARGIN: i32 = 16;
 const PROBCUT_MIN_DEPTH: i16 = 5;
 const PROBCUT_REDUCTION: i16 = 4;
 const SEE_PRUNE_MAX_DEPTH: i16 = 6;
@@ -831,14 +835,18 @@ fn should_check_singular_extension(
     true
 }
 
-fn is_singular(
+/// Singular verification search for `candidate_move`: searches every other move
+/// with a null window around the reduced singular beta. Returns
+/// `(best_alternative_score, s_beta)` so the caller can decide the extension
+/// amount (single vs double), or `None` if the search was too shallow / cancelled.
+fn singular_verify(
     ctx: &mut ThreadContext,
     board: &Board,
     candidate_move: ChessMove,
     depth: i16,
     beta: i32,
     ply_from_root: i32,
-) -> bool {
+) -> Option<(i32, i32)> {
     // Reduced beta: if other moves can't reach this, candidate is singular
     let s_beta_margin = SINGULAR_BETA_MARGIN_MULTIPLIER.get() * depth as i32;
     let s_beta = beta - s_beta_margin;
@@ -846,7 +854,7 @@ fn is_singular(
     // Reduced depth for verification search (typically depth/2 - 1)
     let s_depth = (depth / 2) - 1;
     if s_depth <= 0 {
-        return false;
+        return None;
     }
 
     // Search all moves EXCEPT the candidate
@@ -862,11 +870,9 @@ fn is_singular(
     );
 
     match result {
-        SearchScore::CANCELLED => false,
-        SearchScore::EVAL(score) => {
-            // If no other move reached s_beta, the candidate is singular
-            score < s_beta
-        }
+        SearchScore::CANCELLED => None,
+        // best alternative score + the singular beta it was tested against
+        SearchScore::EVAL(score) => Some((score, s_beta)),
     }
 }
 
@@ -1148,7 +1154,7 @@ fn negamax_it(
         ) {
             ctx.stats.singular_checks += 1;
             if let Some(candidate_move) = tt_move {
-                if is_singular(
+                if let Some((s_score, s_beta)) = singular_verify(
                     ctx,
                     board,
                     candidate_move,
@@ -1156,8 +1162,17 @@ fn negamax_it(
                     beta,
                     ply_from_root,
                 ) {
-                    singular_extension = 1;
-                    ctx.stats.singular_extensions += 1;
+                    if s_score < s_beta {
+                        // Candidate is singular. Extend by 2 plies when it is
+                        // singular by a wide margin (non-PV only), else by 1.
+                        singular_extension =
+                            if !is_pv_node && s_score < s_beta - DOUBLE_EXTENSION_MARGIN {
+                                2
+                            } else {
+                                1
+                            };
+                        ctx.stats.singular_extensions += 1;
+                    }
                 }
             }
         }
