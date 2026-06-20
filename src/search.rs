@@ -655,7 +655,9 @@ fn late_move_pruning_threshold(depth: i16, is_improving: bool) -> usize {
 // Late Move Reduction (LMR) table and constants
 const LMR_MAX_DEPTH: usize = 64;
 const LMR_MAX_MOVES: usize = 64;
-const LMR_BASE: f64 = 0.75;
+// Lowered from 0.75 to recenter the average reduction after adding the cut-node
+// term (the table is otherwise un-retuned for it). See lmr_reduction.
+const LMR_BASE: f64 = 0.55;
 const LMR_DIVISOR: f64 = 2.25;
 
 lazy_static! {
@@ -691,9 +693,11 @@ fn lmr_reduction(
     if is_pv_node {
         reduction = reduction.saturating_sub(1);
     }
-    // Reduce one more ply at expected cut nodes (the bulk of the tree): they are
-    // expected to fail high quickly, so late quiets rarely deserve full depth.
-    if cut_node {
+    // Reduce one more ply at deeper expected cut nodes. Gated to depth>=5: at
+    // shallow depth the base reduction is tiny so a flat +1 over-reduces (a
+    // +50-100% relative jump). Paired with a lowered LMR_BASE so this is a shape
+    // change, not a global up-shift of every reduction.
+    if cut_node && depth >= 5 {
         reduction += 1;
     }
     // Reduce one more ply when the side to move is not improving: the position
