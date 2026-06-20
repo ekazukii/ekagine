@@ -678,6 +678,7 @@ fn lmr_reduction(
     depth: i16,
     move_idx: usize,
     is_pv_node: bool,
+    cut_node: bool,
     is_improving: bool,
     hist: i32,
 ) -> i16 {
@@ -689,6 +690,11 @@ fn lmr_reduction(
     // Reduce less in PV nodes.
     if is_pv_node {
         reduction = reduction.saturating_sub(1);
+    }
+    // Reduce one more ply at expected cut nodes (the bulk of the tree): they are
+    // expected to fail high quickly, so late quiets rarely deserve full depth.
+    if cut_node {
+        reduction += 1;
     }
     // Reduce one more ply when the side to move is not improving: the position
     // is likely worse than a couple plies ago, so late quiets are less worth a
@@ -846,6 +852,7 @@ fn singular_verify(
     depth: i16,
     beta: i32,
     ply_from_root: i32,
+    cut_node: bool,
 ) -> Option<(i32, i32)> {
     // Reduced beta: if other moves can't reach this, candidate is singular
     let s_beta_margin = SINGULAR_BETA_MARGIN_MULTIPLIER.get() * depth as i32;
@@ -865,7 +872,8 @@ fn singular_verify(
         s_beta - 1, // alpha
         s_beta,     // beta (null window)
         ply_from_root,
-        false,                // Not a PV node
+        false, // Not a PV node
+        cut_node,
         Some(candidate_move), // Exclude this move
     );
 
@@ -889,6 +897,9 @@ fn negamax_it(
     beta: i32,
     ply_from_root: i32,
     is_pv_node: bool,
+    // Expected node type (Knuth): true at nodes we expect to fail high (cut
+    // nodes). Used only to reduce more in LMR; never affects correctness.
+    cut_node: bool,
     exclude_move: Option<ChessMove>,
 ) -> SearchScore {
     if ctx.stats.nodes & 1023 == 0 {
@@ -1029,6 +1040,7 @@ fn negamax_it(
                 -beta + 1,
                 ply_from_root + 1,
                 false,
+                !cut_node,
                 None,
             );
             board_pop(&nboard, ctx.repetition);
@@ -1092,6 +1104,7 @@ fn negamax_it(
                 -pc_beta + 1,
                 ply_from_root + 1,
                 false,
+                !cut_node,
                 None,
             );
             ctx.nnue.pop();
@@ -1161,6 +1174,7 @@ fn negamax_it(
                     depth_remaining,
                     beta,
                     ply_from_root,
+                    cut_node,
                 ) {
                     if s_score < s_beta {
                         // Candidate is singular. Extend by 2 plies when it is
@@ -1327,10 +1341,14 @@ fn negamax_it(
                     hist += ctx.cont2.score(pp, pt, p, to);
                 }
             }
-            lmr_reduction(depth_remaining, move_idx, is_pv_node, is_improving, hist)
+            lmr_reduction(depth_remaining, move_idx, is_pv_node, cut_node, is_improving, hist)
         } else {
             0
         };
+
+        // Cut-node classification for the scout / null-window child: reduced
+        // searches and the children of all-nodes are expected cut nodes.
+        let scout_cut_node = reduction > 0 || !cut_node;
 
         let mut use_pvs = !is_first_move;
         let null_window_beta_candidate = alpha.saturating_add(1).min(beta);
@@ -1383,6 +1401,7 @@ fn negamax_it(
                 -alpha,
                 ply_from_root + 1,
                 false,
+                scout_cut_node,
                 None,
             ) {
                 SearchScore::CANCELLED => {}
@@ -1401,6 +1420,7 @@ fn negamax_it(
                             -alpha,
                             ply_from_root + 1,
                             is_pv_node,
+                            false,
                             None,
                         ) {
                             SearchScore::CANCELLED => {}
@@ -1423,6 +1443,7 @@ fn negamax_it(
                 -alpha,
                 ply_from_root + 1,
                 child_is_pv_node,
+                if child_is_pv_node { false } else { !cut_node },
                 None,
             ) {
                 SearchScore::CANCELLED => {}
@@ -1774,6 +1795,9 @@ fn root_search_with_window(
             -alpha,
             1,
             is_pv_node,
+            // root is a PV node: first move's child is PV (cut_node=false), the
+            // rest are null-window scouts → expected cut nodes.
+            !is_pv_node,
             None,
         );
 
