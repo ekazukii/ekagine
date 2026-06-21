@@ -571,14 +571,14 @@ pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// periodic stop test.
 pub static GO_MAX_NODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub static ASPIRATION_START_WINDOW: Tunable = Tunable::new("AspirationWindow", 25, 8, 80);
-pub static QUIESCE_FUTILITY_MARGIN: Tunable = Tunable::new("QFutilityMargin", 200, 60, 450);
-pub static FUTILITY_MARGIN_BASE: Tunable = Tunable::new("FutilityBase", 100, 30, 260);
-pub static FUTILITY_MARGIN_PER_DEPTH: Tunable = Tunable::new("FutilityPerDepth", 75, 25, 180);
-pub static RAZORING_MARGIN: Tunable = Tunable::new("RazoringMargin", 300, 100, 650);
-pub static PROBCUT_MARGIN: Tunable = Tunable::new("ProbcutMargin", 180, 60, 400);
+pub static ASPIRATION_START_WINDOW: Tunable = Tunable::new("AspirationWindow", 28, 8, 80);
+pub static QUIESCE_FUTILITY_MARGIN: Tunable = Tunable::new("QFutilityMargin", 196, 60, 450);
+pub static FUTILITY_MARGIN_BASE: Tunable = Tunable::new("FutilityBase", 92, 30, 260);
+pub static FUTILITY_MARGIN_PER_DEPTH: Tunable = Tunable::new("FutilityPerDepth", 76, 25, 180);
+pub static RAZORING_MARGIN: Tunable = Tunable::new("RazoringMargin", 290, 100, 650);
+pub static PROBCUT_MARGIN: Tunable = Tunable::new("ProbcutMargin", 188, 60, 400);
 pub static SINGULAR_BETA_MARGIN_MULTIPLIER: Tunable = Tunable::new("SingularBetaMult", 2, 1, 6);
-pub static HIST_LMR_DIVISOR: Tunable = Tunable::new("HistLmrDivisor", 16384, 4096, 32768);
+pub static HIST_LMR_DIVISOR: Tunable = Tunable::new("HistLmrDivisor", 15881, 4096, 32768);
 
 pub static TUNABLES: [&Tunable; 8] = [
     &ASPIRATION_START_WINDOW,

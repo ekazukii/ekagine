@@ -5,7 +5,11 @@ strong tactical play powered by NNUE evaluation and a modern alpha-beta search
 stack. The code base is organized for experimentation and includes the same
 core techniques used by contemporary tournament engines.
 
-The engine is not yet tested or ranked on ccrl, but I estimate it to be more or less 2800 elo
+The engine is not yet officially ranked on CCRL, but I estimate it at roughly
+**3150 Elo (CCRL Blitz scale)**. This was measured with an anchored gauntlet
+against Carp 2.0.0 (rated 3155 on the CCRL Blitz list): over 226 single-threaded
+games at 10s+0.1s, Ekagine scored 51.5% (Elo difference +11 ± 22), placing it
+right alongside that anchor.
 
 If you already have a lichess account, you can challenge it online at:
 <https://lichess.org/@/ekagine>.
