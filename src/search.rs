@@ -341,6 +341,7 @@ fn quiesce_negamax_it(
             bound,
             best_move_opt,
             None,
+            false,
         );
 
         return alpha;
@@ -445,6 +446,7 @@ fn quiesce_negamax_it(
         bound,
         best_move_opt,
         static_eval,
+        false,
     );
     alpha
 }
@@ -678,6 +680,7 @@ fn lmr_reduction(
     depth: i16,
     move_idx: usize,
     is_pv_node: bool,
+    tt_pv: bool,
     is_improving: bool,
     hist: i32,
 ) -> i16 {
@@ -688,6 +691,12 @@ fn lmr_reduction(
 
     // Reduce less in PV nodes.
     if is_pv_node {
+        reduction = reduction.saturating_sub(1);
+    }
+    // Reduce less on non-PV nodes that a previous search had on a principal
+    // variation: they proved important once, so they deserve a fuller look.
+    // Guarded by !is_pv_node to avoid double-counting with the PV term above.
+    if tt_pv && !is_pv_node {
         reduction = reduction.saturating_sub(1);
     }
     // Reduce one more ply when the side to move is not improving: the position
@@ -963,6 +972,10 @@ fn negamax_it(
     } else {
         ctx.nnue.evaluate(board)
     };
+    // Sticky "was on a PV" flag: true if this is a PV node now, or a previous
+    // search stored it as PV. Carried back into the TT on store and used to
+    // reduce LMR less. Cheap signal already living in the TT's free pv bit.
+    let tt_pv = is_pv_node || tt_hit.map_or(false, |e| e.pv);
     let in_check = board.checkers().0 != 0;
     // Correction history: nudge the raw static eval toward observed search
     // results for this pawn structure. Stored raw in the TT; corrected here for
@@ -1108,6 +1121,7 @@ fn negamax_it(
                             TTFlag::Lower,
                             Some(mv),
                             Some(raw_eval),
+                            tt_pv,
                         );
                         return SearchScore::EVAL(score);
                     }
@@ -1327,7 +1341,7 @@ fn negamax_it(
                     hist += ctx.cont2.score(pp, pt, p, to);
                 }
             }
-            lmr_reduction(depth_remaining, move_idx, is_pv_node, is_improving, hist)
+            lmr_reduction(depth_remaining, move_idx, is_pv_node, tt_pv, is_improving, hist)
         } else {
             0
         };
@@ -1569,6 +1583,7 @@ fn negamax_it(
             bound,
             best_move_opt,
             Some(raw_eval),
+            tt_pv,
         );
 
         // Correction-history update: only when the static eval is meaningful
@@ -1859,6 +1874,7 @@ fn root_search_with_window(
                 bound,
                 Some(best_mv),
                 None,
+                true,
             );
         }
     }

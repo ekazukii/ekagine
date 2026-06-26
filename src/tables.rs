@@ -313,13 +313,13 @@ impl TranspositionTable {
         flag: TTFlag,
         mut best_move: Option<ChessMove>,
         eval: Option<i32>,
+        pv: bool,
     ) {
         debug_assert!(!self.table.is_empty());
         let idx = self.get_key(key);
         let slot = &self.table[idx];
         let (stored_key, stored_data) = slot.load();
         let current_entry = TTEntry::from((stored_key, stored_data));
-        let pv = flag == TTFlag::Exact;
         let same_position = stored_key == key;
         let previous_entry = if same_position {
             Some(current_entry)
@@ -331,10 +331,14 @@ impl TranspositionTable {
 
         let old_depth = previous_entry.map_or(0, |entry| entry.depth.max(0) as usize);
 
+        // Replacement is kept keyed on exact-ness (unchanged from before the
+        // sticky-pv flag existed); the `pv` param is only carried into the
+        // stored entry for move-ordering / LMR, not for eviction decisions.
+        let exact = flag == TTFlag::Exact;
         let should_replace = age_now != previous_age
             || !same_position
-            || flag == TTFlag::Exact
-            || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(pv) > old_depth;
+            || exact
+            || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(exact) > old_depth;
 
         if !should_replace {
             return;
@@ -388,7 +392,7 @@ impl TranspositionTable {
             best_move: entry.best_move,
             eval: entry.eval,
             age: 0,
-            pv: false,
+            pv: entry.pv,
         }
     }
 }
