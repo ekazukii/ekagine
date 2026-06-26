@@ -360,14 +360,15 @@ fn quiesce_negamax_it(
         raw_stand
     } else {
         let (npw, npb) = nonpawn_keys(board);
-        (raw_stand
+        let corrected = (raw_stand
             + ctx.corrhist.correction(
                 board.side_to_move(),
                 pawn_structure_key(board),
                 npw,
                 npb,
             ))
-        .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
+        .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1);
+        rule50_damp(corrected, board.halfmove_clock())
     };
 
     let alpha_orig = alpha;
@@ -502,6 +503,19 @@ fn nonpawn_keys(board: &Board) -> (usize, usize) {
         corr_mix(non_pawn(Color::White)),
         corr_mix(non_pawn(Color::Black)),
     )
+}
+
+/// Base for the fifty-move eval damping. Factor is (BASE - clock) / BASE, i.e.
+/// exactly 1.0 at clock 0 (the common case, so tuned pruning margins are
+/// undisturbed) and ~0.5 at the 100-ply draw boundary.
+const HMC_DAMP_BASE: i32 = 200;
+
+/// Pull a (non-mate) static eval toward 0 as the fifty-move halfmove clock
+/// rises, so the engine does not over-value a position the rule will draw.
+#[inline]
+fn rule50_damp(eval: i32, halfmove_clock: u8) -> i32 {
+    let r = (halfmove_clock as i32).min(HMC_DAMP_BASE);
+    eval * (HMC_DAMP_BASE - r) / HMC_DAMP_BASE
 }
 
 /// Create a new board representing a null move using Board::null_move(),
@@ -972,6 +986,11 @@ fn negamax_it(
     let eval = if in_check || is_mate_score(raw_eval) {
         raw_eval
     } else {
+        // NOTE: deliberately NOT rule50-damped. This eval feeds is_improving and
+        // the pruning margins; damping it drifts down with depth (the clock
+        // rises along quiet lines) → is_improving reads as "worsening" → global
+        // over-pruning. The fifty-move damping is applied only to the qsearch
+        // stand-pat, the leaf value that actually carries the position score.
         (raw_eval
             + ctx
                 .corrhist

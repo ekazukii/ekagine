@@ -146,6 +146,13 @@ impl Board {
         &self.checkers_bb
     }
 
+    /// Half-move clock for the fifty-move rule (plies since the last pawn move
+    /// or capture). Reaches 100 at the draw boundary.
+    #[inline(always)]
+    pub fn halfmove_clock(&self) -> u8 {
+        self.halfmove_clock
+    }
+
     #[inline(always)]
     pub fn get_hash(&self) -> u64 {
         self.hash
