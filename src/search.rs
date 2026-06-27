@@ -2161,8 +2161,11 @@ where
         None => fresh.insert(ScratchTables::with_killer_depth(max_depth + 4)),
     };
 
-    // Track best move stability for time management
-    let mut best_move_changes = 0usize;
+    // Track best-move stability for time management: consecutive iterations the
+    // best move has held (resets to 0 on a change). Recency, not lifetime total —
+    // a lifetime count saturates at high depth and never recovers when the move
+    // settles, forcing the search to keep running at the "unstable" factor.
+    let mut stable_iters = 0usize;
     let mut prev_best_move: Option<ChessMove> = None;
 
     for depth in 1..=max_depth {
@@ -2201,10 +2204,12 @@ where
             TimeScaleFactors::calculate_score_trend_factor(prev_score, result_score);
 
         if let Some(bm) = result.best_move {
-            // Track best move changes for time management
+            // Recency-based stability: reset on a change, grow while it holds.
             if let Some(prev) = prev_best_move {
                 if prev != bm {
-                    best_move_changes += 1;
+                    stable_iters = 0;
+                } else {
+                    stable_iters += 1;
                 }
             }
             prev_best_move = Some(bm);
@@ -2244,7 +2249,7 @@ where
             // Only apply scaling after depth 4 to avoid instability in early search
             if depth >= 4 && !result_aborted {
                 factors.set_stability(TimeScaleFactors::calculate_stability_factor(
-                    best_move_changes,
+                    stable_iters,
                     depth,
                 ));
                 factors.set_node_fraction(TimeScaleFactors::calculate_node_fraction_factor(

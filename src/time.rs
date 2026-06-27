@@ -145,17 +145,20 @@ impl TimeScaleFactors {
         }
     }
 
-    pub fn calculate_stability_factor(best_move_changes: usize, depth: usize) -> f64 {
-        if best_move_changes == 0 && depth >= 6 {
+    /// `stable_iters` = consecutive iterations the best move has held (resets to
+    /// 0 when it changes). More consecutive stability ⇒ more confident ⇒ stop
+    /// earlier; a fresh change ⇒ search longer.
+    pub fn calculate_stability_factor(stable_iters: usize, depth: usize) -> f64 {
+        if stable_iters >= 4 && depth >= 6 {
             0.7 // Very stable - can stop earlier
-        } else if best_move_changes == 1 {
+        } else if stable_iters == 3 {
             0.85 // Stable
-        } else if best_move_changes == 2 {
+        } else if stable_iters == 2 {
             1.0 // Normal
-        } else if best_move_changes == 3 {
-            1.3 // Unstable - search longer
+        } else if stable_iters == 1 {
+            1.3 // Recently changed - search longer
         } else {
-            1.5 // Very unstable
+            1.5 // Just changed (stable_iters == 0) - very unstable
         }
     }
 
