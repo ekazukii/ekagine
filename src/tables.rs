@@ -229,12 +229,40 @@ fn encode_flag(flag: TTFlag) -> u8 {
     }
 }
 
-/// Direct-mapped transposition table.
+/// Number of entries per bucket. 4 × 16 B = 64 B = one cache line, so a probe
+/// touches a single line and scans all four independent lockless slots.
+const BUCKET_SLOTS: usize = 4;
+
+/// How heavily an entry's age (generations since it was stored) discounts its
+/// depth when choosing a victim: a one-generation-old entry is treated as this
+/// many plies shallower, so stale entries are evicted first.
+const TT_AGE_WEIGHT: i32 = 8;
+
+#[repr(align(64))]
+struct Bucket {
+    entries: [CompressedTTEntry; BUCKET_SLOTS],
+}
+
+impl Default for Bucket {
+    fn default() -> Self {
+        Bucket {
+            entries: std::array::from_fn(|_| CompressedTTEntry::default()),
+        }
+    }
+}
+
+// A bucket must be exactly one 64-byte cache line so a probe is a single miss.
+const _: () = assert!(std::mem::size_of::<Bucket>() == 64);
+
+/// 4-way set-associative transposition table.
 ///
-/// Each Zobrist key hashes to a single slot. Replacement is guided by the current search
-/// age, the node depth, and whether the stored value is part of the principal variation.
+/// The Zobrist key selects a bucket (one cache line); each bucket holds
+/// `BUCKET_SLOTS` independent lockless slots — the per-slot XOR scheme is
+/// unchanged, so bucketing adds no new atomicity concerns. A probe scans the
+/// slots for a key match; a store refreshes the same-position slot if present,
+/// otherwise evicts the least valuable slot (empty first, then shallow/old).
 pub struct TranspositionTable {
-    table: Vec<CompressedTTEntry>,
+    table: Vec<Bucket>,
     age: AtomicU8,
 }
 
@@ -244,21 +272,21 @@ impl TranspositionTable {
     }
 
     pub fn with_mb(size_mb: usize) -> Self {
-        let bytes_per_slot = std::mem::size_of::<CompressedTTEntry>().max(1);
-        let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_slot);
+        let bytes_per_bucket = std::mem::size_of::<Bucket>().max(1);
+        let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_bucket);
 
-        let mut slots = 1usize;
-        while slots.saturating_mul(bytes_per_slot) < requested_bytes {
-            slots <<= 1;
-            if slots == 0 {
-                slots = 1;
+        let mut buckets = 1usize;
+        while buckets.saturating_mul(bytes_per_bucket) < requested_bytes {
+            buckets <<= 1;
+            if buckets == 0 {
+                buckets = 1;
                 break;
             }
         }
 
-        let mut table = Vec::with_capacity(slots);
-        for _ in 0..slots {
-            table.push(CompressedTTEntry::default());
+        let mut table = Vec::with_capacity(buckets);
+        for _ in 0..buckets {
+            table.push(Bucket::default());
         }
 
         Self {
@@ -271,22 +299,26 @@ impl TranspositionTable {
     /// 1000 slots — the standard UCI `hashfull` estimate. Used to confirm a
     /// `Hash` resize actually took effect and to monitor TT pressure in-game.
     pub fn hashfull(&self) -> usize {
-        let sample = self.table.len().min(1000);
-        if sample == 0 {
+        let sample_buckets = self.table.len().min(1000 / BUCKET_SLOTS);
+        if sample_buckets == 0 {
             return 0;
         }
         let mut used = 0usize;
-        for slot in self.table.iter().take(sample) {
-            let (_, data) = slot.load();
-            if data != 0 {
-                used += 1;
+        let mut total = 0usize;
+        for bucket in self.table.iter().take(sample_buckets) {
+            for slot in &bucket.entries {
+                let (_, data) = slot.load();
+                if data != 0 {
+                    used += 1;
+                }
+                total += 1;
             }
         }
-        used * 1000 / sample
+        used * 1000 / total
     }
 
     #[inline]
-    fn get_key(&self, hash: u64) -> usize {
+    fn bucket_index(&self, hash: u64) -> usize {
         let key = hash as u128;
         let len = self.table.len() as u128;
 
@@ -294,15 +326,15 @@ impl TranspositionTable {
     }
 
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let idx = self.get_key(key);
-        let slot = &self.table[idx];
-        let (stored_key, stored_data) = slot.load();
-        if stored_key == key {
-            let stored_entry = TTEntry::from((stored_key, stored_data));
-            Some(Self::visible_entry(stored_entry))
-        } else {
-            None
+        let bucket = &self.table[self.bucket_index(key)];
+        for slot in &bucket.entries {
+            let (stored_key, stored_data) = slot.load();
+            if stored_key == key && !(stored_key == 0 && stored_data == 0) {
+                let stored_entry = TTEntry::from((stored_key, stored_data));
+                return Some(Self::visible_entry(stored_entry));
+            }
         }
+        None
     }
 
     pub fn store(
@@ -316,43 +348,59 @@ impl TranspositionTable {
         pv: bool,
     ) {
         debug_assert!(!self.table.is_empty());
-        let idx = self.get_key(key);
-        let slot = &self.table[idx];
-        let (stored_key, stored_data) = slot.load();
-        let current_entry = TTEntry::from((stored_key, stored_data));
-        let same_position = stored_key == key;
-        let previous_entry = if same_position {
-            Some(current_entry)
-        } else {
-            None
-        };
-        let previous_age = current_entry.age;
-        let age_now = self.age.load(Ordering::Relaxed) & 0x3F;
+        let bucket = &self.table[self.bucket_index(key)];
+        let age_now = self.age.load(Ordering::Relaxed) & (AGE_MASK as u8);
 
-        let old_depth = previous_entry.map_or(0, |entry| entry.depth.max(0) as usize);
-
-        // Replacement is kept keyed on exact-ness (unchanged from before the
-        // sticky-pv flag existed); the `pv` param is only carried into the
-        // stored entry for move-ordering / LMR, not for eviction decisions.
-        let exact = flag == TTFlag::Exact;
-        let should_replace = age_now != previous_age
-            || !same_position
-            || exact
-            || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(exact) > old_depth;
-
-        if !should_replace {
-            return;
+        // Pick the target slot: a slot already holding this position, otherwise
+        // the least valuable slot to evict (empty first, then shallow & old).
+        let mut target = 0usize;
+        let mut target_entry = TTEntry::default();
+        let mut same_position = false;
+        let mut best_victim = i32::MAX; // lower = better victim
+        for (i, slot) in bucket.entries.iter().enumerate() {
+            let (k, d) = slot.load();
+            let empty = k == 0 && d == 0;
+            if !empty && k == key {
+                target = i;
+                target_entry = TTEntry::from((k, d));
+                same_position = true;
+                break;
+            }
+            let victim_score = if empty {
+                i32::MIN
+            } else {
+                let entry = TTEntry::from((k, d));
+                let age_diff = (age_now as i32 - entry.age as i32) & (AGE_MASK as i32);
+                entry.depth as i32 - age_diff * TT_AGE_WEIGHT
+            };
+            if victim_score < best_victim {
+                best_victim = victim_score;
+                target = i;
+            }
         }
 
-        if best_move.is_none() {
-            if let Some(entry) = previous_entry {
-                best_move = entry.best_move;
+        // Depth-preferred replacement only gates the same-position refresh;
+        // evicting a victim (different/empty slot) always proceeds — that is the
+        // associativity win (we drop the least valuable of the bucket, not the
+        // single colliding slot). Same exact-ness rule as before bucketing.
+        let exact = flag == TTFlag::Exact;
+        if same_position {
+            let old_depth = target_entry.depth.max(0) as usize;
+            let should_replace = age_now != target_entry.age
+                || exact
+                || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(exact) > old_depth;
+            if !should_replace {
+                return;
+            }
+            if best_move.is_none() {
+                best_move = target_entry.best_move;
             }
         }
 
         let final_eval = match eval {
             Some(val) => Some(val),
-            None => previous_entry.and_then(|entry| entry.eval),
+            None if same_position => target_entry.eval,
+            None => None,
         };
 
         let new_entry = TTEntry {
@@ -366,7 +414,7 @@ impl TranspositionTable {
             pv,
         };
 
-        slot.store_entry(new_entry);
+        bucket.entries[target].store_entry(new_entry);
     }
 
     pub fn bump_generation(&self) {
@@ -374,8 +422,10 @@ impl TranspositionTable {
     }
 
     pub fn clear(&self) {
-        for slot in &self.table {
-            slot.store(0, 0);
+        for bucket in &self.table {
+            for slot in &bucket.entries {
+                slot.store(0, 0);
+            }
         }
         self.age.store(0, Ordering::Relaxed);
     }
