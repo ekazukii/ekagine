@@ -49,77 +49,78 @@ impl Default for TTEntry {
     }
 }
 
-pub struct CompressedTTEntry {
-    pub key: AtomicU64,
-    pub data: AtomicU64,
-}
-
-impl Default for CompressedTTEntry {
-    fn default() -> Self {
-        Self {
-            key: AtomicU64::new(0),
-            data: AtomicU64::new(0),
-        }
-    }
-}
-
-impl CompressedTTEntry {
-    fn load(&self) -> (u64, u64) {
-        let key_xor = self.key.load(Ordering::Relaxed);
-        let data = self.data.load(Ordering::Relaxed);
-        (key_xor ^ data, data)
-    }
-
-    fn store(&self, key: u64, data: u64) {
-        let key_xor = key ^ data;
-        self.data.store(data, Ordering::Relaxed);
-        self.key.store(key_xor, Ordering::Release);
-    }
-
-    fn store_entry(&self, entry: TTEntry) {
-        let (key, data) = entry.into();
-        self.store(key, data);
-    }
-}
-
 const TT_DEFAULT_MB: usize = 128;
 const TT_REPLACE_OFFSET: usize = 2;
 
 const MOVE_NONE: u16 = 0xFFFF;
-const EVAL_NONE: u16 = 0x8000;
 
-const SCORE_SHIFT: u64 = 16;
-const DEPTH_SHIFT: u64 = 32;
-const FLAG_SHIFT: u64 = 39;
-const EVAL_SHIFT: u64 = 41;
+// Single-u64 entry layout (8 bytes/slot, direct-mapped). The position is keyed
+// by a 16-bit checksum (the low bits of the Zobrist key — the slot index uses
+// the high bits, so the two are independent). Index + checksum give ~40 bits of
+// discrimination; the residual ~1/2^40 collision is caught by the TT-move
+// legality filter in the move generator. A single 64-bit atomic load/store is
+// never torn, so no lockless key/data XOR is needed. The static eval is NOT
+// stored (it doesn't fit in 8 bytes and is cheap to recompute incrementally).
+//
+//   checksum 16 | move 16 | score 16 | depth 7 | flag 2 | age 6 | pv 1  = 64
+const CHECKSUM_SHIFT: u64 = 0;
+const MOVE_SHIFT: u64 = 16;
+const SCORE_SHIFT: u64 = 32;
+const DEPTH_SHIFT: u64 = 48;
+const FLAG_SHIFT: u64 = 55;
 const AGE_SHIFT: u64 = 57;
 const PV_SHIFT: u64 = 63;
 
+const CHECKSUM_MASK: u64 = 0xFFFF;
 const MOVE_MASK: u64 = 0xFFFF;
 const SCORE_MASK: u64 = 0xFFFF;
 const DEPTH_MASK: u64 = 0x7F;
 const FLAG_MASK: u64 = 0x3;
-const EVAL_MASK: u64 = 0xFFFF;
 const AGE_MASK: u64 = 0x3F;
 
-impl From<(u64, u64)> for TTEntry {
-    fn from(raw: (u64, u64)) -> Self {
-        let (key, data) = raw;
-        if key == 0 && data == 0 {
-            return TTEntry::default();
-        }
+#[inline]
+fn key_checksum(key: u64) -> u16 {
+    (key & CHECKSUM_MASK) as u16
+}
 
-        let best_move_bits = (data & MOVE_MASK) as u16;
+#[allow(clippy::too_many_arguments)]
+fn pack_entry(
+    checksum: u16,
+    best_move: Option<ChessMove>,
+    score: i32,
+    depth: i16,
+    flag: TTFlag,
+    age: u8,
+    pv: bool,
+) -> u64 {
+    let score_clamped = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    let depth_clamped = (depth.clamp(-1, 126) + 1) as u64;
+    let mut data = 0u64;
+    data |= (checksum as u64) << CHECKSUM_SHIFT;
+    data |= (encode_move(best_move) as u64) << MOVE_SHIFT;
+    data |= (score_clamped as u16 as u64) << SCORE_SHIFT;
+    data |= (depth_clamped & DEPTH_MASK) << DEPTH_SHIFT;
+    data |= (encode_flag(flag) as u64) << FLAG_SHIFT;
+    data |= ((age as u64) & AGE_MASK) << AGE_SHIFT;
+    data |= (pv as u64) << PV_SHIFT;
+    data
+}
+
+impl From<u64> for TTEntry {
+    /// Unpack a stored 64-bit slot. Only called on non-empty slots (probe/store
+    /// guard `data != 0`). `key` is not recoverable (only the checksum is
+    /// stored) and `eval` is not stored, so both come back zeroed/None.
+    fn from(data: u64) -> Self {
+        let move_bits = ((data >> MOVE_SHIFT) & MOVE_MASK) as u16;
         let score_bits = ((data >> SCORE_SHIFT) & SCORE_MASK) as u16;
         let depth_bits = ((data >> DEPTH_SHIFT) & DEPTH_MASK) as u8;
         let flag_bits = ((data >> FLAG_SHIFT) & FLAG_MASK) as u8;
-        let eval_bits = ((data >> EVAL_SHIFT) & EVAL_MASK) as u16;
         let age_bits = ((data >> AGE_SHIFT) & AGE_MASK) as u8;
         let pv_bit = ((data >> PV_SHIFT) & 0x1) != 0;
 
         TTEntry {
-            key,
-            best_move: decode_move(best_move_bits),
+            key: 0,
+            best_move: decode_move(move_bits),
             score: (score_bits as i16) as i32,
             depth: depth_bits as i16 - 1,
             flag: match flag_bits {
@@ -128,40 +129,10 @@ impl From<(u64, u64)> for TTEntry {
                 2 => TTFlag::Upper,
                 _ => TTFlag::Exact,
             },
-            eval: if eval_bits == EVAL_NONE {
-                None
-            } else {
-                Some((eval_bits as i16) as i32)
-            },
+            eval: None,
             age: age_bits,
             pv: pv_bit,
         }
-    }
-}
-
-impl From<TTEntry> for (u64, u64) {
-    fn from(entry: TTEntry) -> Self {
-        let age_bits = entry.age & AGE_MASK as u8;
-        let score_clamped = entry.score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        let depth_clamped = entry.depth.clamp(-1, 126) + 1;
-        let eval_bits = match entry.eval {
-            Some(val) => {
-                let clamped = val.clamp(-32767, 32767) as i16;
-                clamped as u16
-            }
-            None => EVAL_NONE,
-        };
-
-        let mut data = 0u64;
-        data |= encode_move(entry.best_move) as u64;
-        data |= (score_clamped as u16 as u64) << SCORE_SHIFT;
-        data |= ((depth_clamped as u8 as u64) & DEPTH_MASK) << DEPTH_SHIFT;
-        data |= (encode_flag(entry.flag) as u64) << FLAG_SHIFT;
-        data |= (eval_bits as u64) << EVAL_SHIFT;
-        data |= ((age_bits as u64) & AGE_MASK) << AGE_SHIFT;
-        data |= (entry.pv as u64) << PV_SHIFT;
-
-        (entry.key, data)
     }
 }
 
@@ -231,10 +202,13 @@ fn encode_flag(flag: TTFlag) -> u8 {
 
 /// Direct-mapped transposition table.
 ///
-/// Each Zobrist key hashes to a single slot. Replacement is guided by the current search
-/// age, the node depth, and whether the stored value is part of the principal variation.
+/// Each Zobrist key maps to a single 8-byte slot (`AtomicU64`) storing a 16-bit
+/// checksum of the key. A single 64-bit atomic load/store is tear-free, so there
+/// is no lockless key/data XOR. Replacement keeps the recency policy that suits
+/// this engine: a colliding position always overwrites; a same-position store is
+/// depth-preferred.
 pub struct TranspositionTable {
-    table: Vec<CompressedTTEntry>,
+    table: Vec<AtomicU64>,
     age: AtomicU8,
 }
 
@@ -244,7 +218,7 @@ impl TranspositionTable {
     }
 
     pub fn with_mb(size_mb: usize) -> Self {
-        let bytes_per_slot = std::mem::size_of::<CompressedTTEntry>().max(1);
+        let bytes_per_slot = std::mem::size_of::<AtomicU64>().max(1);
         let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_slot);
 
         let mut slots = 1usize;
@@ -258,7 +232,7 @@ impl TranspositionTable {
 
         let mut table = Vec::with_capacity(slots);
         for _ in 0..slots {
-            table.push(CompressedTTEntry::default());
+            table.push(AtomicU64::new(0));
         }
 
         Self {
@@ -268,8 +242,7 @@ impl TranspositionTable {
     }
 
     /// Approximate fill level in permille (0..=1000), sampled over the first
-    /// 1000 slots — the standard UCI `hashfull` estimate. Used to confirm a
-    /// `Hash` resize actually took effect and to monitor TT pressure in-game.
+    /// 1000 slots — the standard UCI `hashfull` estimate.
     pub fn hashfull(&self) -> usize {
         let sample = self.table.len().min(1000);
         if sample == 0 {
@@ -277,8 +250,7 @@ impl TranspositionTable {
         }
         let mut used = 0usize;
         for slot in self.table.iter().take(sample) {
-            let (_, data) = slot.load();
-            if data != 0 {
+            if slot.load(Ordering::Relaxed) != 0 {
                 used += 1;
             }
         }
@@ -293,13 +265,15 @@ impl TranspositionTable {
         ((key * len) >> 64) as usize
     }
 
+    #[inline]
+    fn slot_checksum(data: u64) -> u16 {
+        ((data >> CHECKSUM_SHIFT) & CHECKSUM_MASK) as u16
+    }
+
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let idx = self.get_key(key);
-        let slot = &self.table[idx];
-        let (stored_key, stored_data) = slot.load();
-        if stored_key == key {
-            let stored_entry = TTEntry::from((stored_key, stored_data));
-            Some(Self::visible_entry(stored_entry))
+        let data = self.table[self.get_key(key)].load(Ordering::Relaxed);
+        if data != 0 && Self::slot_checksum(data) == key_checksum(key) {
+            Some(TTEntry::from(data))
         } else {
             None
         }
@@ -312,61 +286,38 @@ impl TranspositionTable {
         score: i32,
         flag: TTFlag,
         mut best_move: Option<ChessMove>,
-        eval: Option<i32>,
+        _eval: Option<i32>,
         pv: bool,
     ) {
         debug_assert!(!self.table.is_empty());
-        let idx = self.get_key(key);
-        let slot = &self.table[idx];
-        let (stored_key, stored_data) = slot.load();
-        let current_entry = TTEntry::from((stored_key, stored_data));
-        let same_position = stored_key == key;
-        let previous_entry = if same_position {
-            Some(current_entry)
-        } else {
-            None
-        };
-        let previous_age = current_entry.age;
-        let age_now = self.age.load(Ordering::Relaxed) & 0x3F;
-
-        let old_depth = previous_entry.map_or(0, |entry| entry.depth.max(0) as usize);
-
-        // Replacement is kept keyed on exact-ness (unchanged from before the
-        // sticky-pv flag existed); the `pv` param is only carried into the
-        // stored entry for move-ordering / LMR, not for eviction decisions.
+        let slot = &self.table[self.get_key(key)];
+        let checksum = key_checksum(key);
+        let current = slot.load(Ordering::Relaxed);
+        let same_position = current != 0 && Self::slot_checksum(current) == checksum;
+        let age_now = self.age.load(Ordering::Relaxed) & (AGE_MASK as u8);
         let exact = flag == TTFlag::Exact;
-        let should_replace = age_now != previous_age
-            || !same_position
-            || exact
-            || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(exact) > old_depth;
 
-        if !should_replace {
-            return;
-        }
-
-        if best_move.is_none() {
-            if let Some(entry) = previous_entry {
-                best_move = entry.best_move;
+        if same_position {
+            // Depth-preferred only for the same position; a colliding or empty
+            // slot is always overwritten (recency) — this engine's existing
+            // direct-mapped policy.
+            let prev = TTEntry::from(current);
+            let old_depth = prev.depth.max(0) as usize;
+            let should_replace = age_now != prev.age
+                || exact
+                || depth.max(0) as usize + TT_REPLACE_OFFSET + 2 * usize::from(exact) > old_depth;
+            if !should_replace {
+                return;
+            }
+            if best_move.is_none() {
+                best_move = prev.best_move;
             }
         }
 
-        let final_eval = match eval {
-            Some(val) => Some(val),
-            None => previous_entry.and_then(|entry| entry.eval),
-        };
-
-        let new_entry = TTEntry {
-            depth,
-            score,
-            flag,
-            best_move,
-            eval: final_eval,
-            key,
-            age: age_now,
-            pv,
-        };
-
-        slot.store_entry(new_entry);
+        slot.store(
+            pack_entry(checksum, best_move, score, depth, flag, age_now, pv),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn bump_generation(&self) {
@@ -375,25 +326,9 @@ impl TranspositionTable {
 
     pub fn clear(&self) {
         for slot in &self.table {
-            slot.store(0, 0);
+            slot.store(0, Ordering::Relaxed);
         }
         self.age.store(0, Ordering::Relaxed);
-    }
-}
-
-impl TranspositionTable {
-    #[inline]
-    fn visible_entry(entry: TTEntry) -> TTEntry {
-        TTEntry {
-            key: 0,
-            depth: entry.depth,
-            score: entry.score,
-            flag: entry.flag,
-            best_move: entry.best_move,
-            eval: entry.eval,
-            age: 0,
-            pv: entry.pv,
-        }
     }
 }
 
