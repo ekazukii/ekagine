@@ -1,5 +1,5 @@
 use crate::engine_core::{ChessMove, Color, File, Piece, Rank, Square};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI16, AtomicU64, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TTFlag {
@@ -53,6 +53,9 @@ const TT_DEFAULT_MB: usize = 128;
 const TT_REPLACE_OFFSET: usize = 2;
 
 const MOVE_NONE: u16 = 0xFFFF;
+// Sentinel for "no static eval cached" in the parallel eval array. -32768 is
+// outside the clamped eval range (±32767), so it never collides with a real eval.
+const EVAL_NONE_I16: i16 = i16::MIN;
 
 // Single-u64 entry layout (8 bytes/slot, direct-mapped). The position is keyed
 // by a 16-bit checksum (the low bits of the Zobrist key — the slot index uses
@@ -202,13 +205,16 @@ fn encode_flag(flag: TTFlag) -> u8 {
 
 /// Direct-mapped transposition table.
 ///
-/// Each Zobrist key maps to a single 8-byte slot (`AtomicU64`) storing a 16-bit
-/// checksum of the key. A single 64-bit atomic load/store is tear-free, so there
-/// is no lockless key/data XOR. Replacement keeps the recency policy that suits
+/// Each Zobrist key maps to a single 8-byte main slot (`AtomicU64`) storing a
+/// 16-bit checksum of the key, plus a parallel 2-byte static-eval cache (10 B
+/// per slot total). A single 64-bit atomic load/store is tear-free, so there is
+/// no lockless key/data XOR. Replacement keeps the recency policy that suits
 /// this engine: a colliding position always overwrites; a same-position store is
-/// depth-preferred.
+/// depth-preferred. Keeping the eval out of the main entry lets the entry stay
+/// 8 B (more capacity) while still caching the eval (no NNUE recompute per hit).
 pub struct TranspositionTable {
     table: Vec<AtomicU64>,
+    evals: Vec<AtomicI16>,
     age: AtomicU8,
 }
 
@@ -218,25 +224,24 @@ impl TranspositionTable {
     }
 
     pub fn with_mb(size_mb: usize) -> Self {
-        let bytes_per_slot = std::mem::size_of::<AtomicU64>().max(1);
+        // 8 B main entry + 2 B side eval per slot. The multiply-shift index works
+        // for any slot count, so we size exactly to the requested bytes (no
+        // power-of-two rounding / overshoot).
+        let bytes_per_slot =
+            (std::mem::size_of::<AtomicU64>() + std::mem::size_of::<AtomicI16>()).max(1);
         let requested_bytes = size_mb.saturating_mul(1024 * 1024).max(bytes_per_slot);
-
-        let mut slots = 1usize;
-        while slots.saturating_mul(bytes_per_slot) < requested_bytes {
-            slots <<= 1;
-            if slots == 0 {
-                slots = 1;
-                break;
-            }
-        }
+        let slots = (requested_bytes / bytes_per_slot).max(1);
 
         let mut table = Vec::with_capacity(slots);
+        let mut evals = Vec::with_capacity(slots);
         for _ in 0..slots {
             table.push(AtomicU64::new(0));
+            evals.push(AtomicI16::new(EVAL_NONE_I16));
         }
 
         Self {
             table,
+            evals,
             age: AtomicU8::new(0),
         }
     }
@@ -271,9 +276,15 @@ impl TranspositionTable {
     }
 
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let data = self.table[self.get_key(key)].load(Ordering::Relaxed);
+        let idx = self.get_key(key);
+        let data = self.table[idx].load(Ordering::Relaxed);
         if data != 0 && Self::slot_checksum(data) == key_checksum(key) {
-            Some(TTEntry::from(data))
+            let mut entry = TTEntry::from(data);
+            let cached_eval = self.evals[idx].load(Ordering::Relaxed);
+            if cached_eval != EVAL_NONE_I16 {
+                entry.eval = Some(cached_eval as i32);
+            }
+            Some(entry)
         } else {
             None
         }
@@ -286,11 +297,12 @@ impl TranspositionTable {
         score: i32,
         flag: TTFlag,
         mut best_move: Option<ChessMove>,
-        _eval: Option<i32>,
+        eval: Option<i32>,
         pv: bool,
     ) {
         debug_assert!(!self.table.is_empty());
-        let slot = &self.table[self.get_key(key)];
+        let idx = self.get_key(key);
+        let slot = &self.table[idx];
         let checksum = key_checksum(key);
         let current = slot.load(Ordering::Relaxed);
         let same_position = current != 0 && Self::slot_checksum(current) == checksum;
@@ -318,6 +330,14 @@ impl TranspositionTable {
             pack_entry(checksum, best_move, score, depth, flag, age_now, pv),
             Ordering::Relaxed,
         );
+        // Side eval cache: store the provided eval. On a no-eval store keep the
+        // previous value only when refreshing the same position; a new position
+        // with no eval clears it (so we never read a prior occupant's eval).
+        match eval {
+            Some(v) => self.evals[idx].store(v.clamp(-32767, 32767) as i16, Ordering::Relaxed),
+            None if !same_position => self.evals[idx].store(EVAL_NONE_I16, Ordering::Relaxed),
+            None => {}
+        }
     }
 
     pub fn bump_generation(&self) {
@@ -327,6 +347,9 @@ impl TranspositionTable {
     pub fn clear(&self) {
         for slot in &self.table {
             slot.store(0, Ordering::Relaxed);
+        }
+        for e in &self.evals {
+            e.store(EVAL_NONE_I16, Ordering::Relaxed);
         }
         self.age.store(0, Ordering::Relaxed);
     }
