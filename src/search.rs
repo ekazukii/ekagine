@@ -367,6 +367,7 @@ fn quiesce_negamax_it(
                 pawn_structure_key(board),
                 npw,
                 npb,
+                None,
             ))
         .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
     };
@@ -982,13 +983,22 @@ fn negamax_it(
     // pruning/improving decisions. Disabled in check / near mate.
     let corr_key = pawn_structure_key(board);
     let (corr_npw, corr_npb) = nonpawn_keys(board);
+    // Continuation key = the previous move's (piece, dest); None at root / after
+    // a null move. Reused for the corrhist update below.
+    let corr_cont = ctx
+        .search_stack
+        .cont_context(ply_from_root.max(0) as usize, 1);
     let eval = if in_check || is_mate_score(raw_eval) {
         raw_eval
     } else {
         (raw_eval
-            + ctx
-                .corrhist
-                .correction(board.side_to_move(), corr_key, corr_npw, corr_npb))
+            + ctx.corrhist.correction(
+                board.side_to_move(),
+                corr_key,
+                corr_npw,
+                corr_npb,
+                corr_cont,
+            ))
         .clamp(-MATE_THRESHOLD + 1, MATE_THRESHOLD - 1)
     };
     ctx.search_stack.set(ply_from_root as usize, eval);
@@ -1601,6 +1611,7 @@ fn negamax_it(
                     corr_key,
                     corr_npw,
                     corr_npb,
+                    corr_cont,
                     best_value - eval,
                     depth_remaining,
                 );
