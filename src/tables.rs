@@ -696,6 +696,8 @@ const CORR_MAX_CP: i32 = 64;
 /// sane range (max total ±128cp) and avoid over-correction in positions where
 /// every key is stable. Prime SPSA knob if this regresses.
 const CORR_MAX_CP_NP: i32 = 32;
+/// continuation correction-history size, per side: previous move's piece × dest.
+const CONT_CORR_SIZE: usize = 6 * 64;
 
 pub struct CorrHist {
     /// keyed by (side-to-move, pawn-structure)
@@ -704,6 +706,8 @@ pub struct CorrHist {
     nonpawn_w: Box<[i32]>,
     /// keyed by (side-to-move, black non-pawn piece placement)
     nonpawn_b: Box<[i32]>,
+    /// keyed by (side-to-move, previous move's piece & destination square)
+    cont: Box<[i32]>,
 }
 
 impl CorrHist {
@@ -712,6 +716,7 @@ impl CorrHist {
             pawn: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
             nonpawn_w: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
             nonpawn_b: vec![0i32; 2 * CORR_SIZE].into_boxed_slice(),
+            cont: vec![0i32; 2 * CONT_CORR_SIZE].into_boxed_slice(),
         }
     }
 
@@ -720,11 +725,17 @@ impl CorrHist {
         self.pawn.fill(0);
         self.nonpawn_w.fill(0);
         self.nonpawn_b.fill(0);
+        self.cont.fill(0);
     }
 
     #[inline(always)]
     fn idx(side: Color, key: usize) -> usize {
         side.to_index() * CORR_SIZE + (key & CORR_MASK)
+    }
+
+    #[inline(always)]
+    fn cont_idx(side: Color, piece: Piece, to: Square) -> usize {
+        side.to_index() * CONT_CORR_SIZE + piece.to_index() * 64 + to.to_index()
     }
 
     #[inline]
@@ -740,30 +751,49 @@ impl CorrHist {
         *entry += bonus - *entry * bonus.abs() / CORR_LIMIT;
     }
 
-    /// Combined correction (cp): pawn-structure plus per-color non-pawn
-    /// placement. Each sub-table is independently gravity-bounded to
-    /// ±CORR_MAX_CP and the three are summed (Viridithas/Stockfish style) so the
-    /// piece-placement signal stacks on the pawn signal. The caller clamps the
-    /// final (eval + correction) away from mate scores.
+    /// Combined correction (cp): pawn-structure + per-color non-pawn placement +
+    /// (when there is a previous move) the continuation key. Each sub-table is
+    /// gravity-bounded and summed (Viridithas/Stockfish style); the caller clamps
+    /// the final (eval + correction) away from mate scores.
     #[inline]
-    pub fn correction(&self, side: Color, pawn_key: usize, npw_key: usize, npb_key: usize) -> i32 {
-        Self::read_one(&self.pawn, side, pawn_key, CORR_MAX_CP)
+    pub fn correction(
+        &self,
+        side: Color,
+        pawn_key: usize,
+        npw_key: usize,
+        npb_key: usize,
+        cont: Option<(Piece, Square)>,
+    ) -> i32 {
+        let mut c = Self::read_one(&self.pawn, side, pawn_key, CORR_MAX_CP)
             + Self::read_one(&self.nonpawn_w, side, npw_key, CORR_MAX_CP_NP)
-            + Self::read_one(&self.nonpawn_b, side, npb_key, CORR_MAX_CP_NP)
+            + Self::read_one(&self.nonpawn_b, side, npb_key, CORR_MAX_CP_NP);
+        if let Some((piece, to)) = cont {
+            c += (self.cont[Self::cont_idx(side, piece, to)] / CORR_GRAIN)
+                .clamp(-CORR_MAX_CP_NP, CORR_MAX_CP_NP);
+        }
+        c
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         side: Color,
         pawn_key: usize,
         npw_key: usize,
         npb_key: usize,
+        cont: Option<(Piece, Square)>,
         diff: i32,
         depth: i16,
     ) {
         Self::update_one(&mut self.pawn, side, pawn_key, diff, depth);
         Self::update_one(&mut self.nonpawn_w, side, npw_key, diff, depth);
         Self::update_one(&mut self.nonpawn_b, side, npb_key, diff, depth);
+        if let Some((piece, to)) = cont {
+            let weight = (depth as i32).clamp(1, 8);
+            let bonus = (diff * weight).clamp(-CORR_LIMIT / 4, CORR_LIMIT / 4);
+            let i = Self::cont_idx(side, piece, to);
+            self.cont[i] += bonus - self.cont[i] * bonus.abs() / CORR_LIMIT;
+        }
     }
 }
 
