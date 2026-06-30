@@ -170,6 +170,11 @@ pub const MATE_VALUE: i32 = 1_000_000;
 // Threshold to detect mate-encoded scores
 pub const MATE_THRESHOLD: i32 = 999_000;
 
+/// Score band for Syzygy WDL hits: just below the mate threshold so a real
+/// forced mate still outranks a tablebase win, and above any NNUE eval. The
+/// caller subtracts `ply` so a closer win scores higher (a progress gradient).
+const TB_WIN_SCORE: i32 = MATE_THRESHOLD - MAX_SEARCH_PLY - 1;
+
 #[inline]
 fn is_mate_score(score: i32) -> bool {
     score.abs() >= MATE_THRESHOLD
@@ -960,6 +965,26 @@ fn negamax_it(
                     }
                 }
             }
+        }
+    }
+
+    // Syzygy WDL probe: at <= TB_LARGEST men, away from the root, with no
+    // castling rights and a zeroed fifty-move clock (Fathom requires the latter
+    // two). Win/loss map to the TB score band (with -ply for a progress
+    // gradient); draw / cursed-win / blessed-loss (50-move draws) -> 0.
+    if crate::syzygy::enabled()
+        && ply_from_root > 0
+        && exclude_move.is_none()
+        && board.castling_rights() == 0
+        && crate::syzygy::man_count(board) <= crate::syzygy::largest()
+    {
+        if let Some(wdl) = crate::syzygy::probe_wdl(board) {
+            let score = match wdl {
+                crate::syzygy::Wdl::Win => TB_WIN_SCORE - ply_from_root,
+                crate::syzygy::Wdl::Loss => -(TB_WIN_SCORE - ply_from_root),
+                _ => 0,
+            };
+            return SearchScore::EVAL(score);
         }
     }
 

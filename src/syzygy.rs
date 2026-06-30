@@ -162,7 +162,12 @@ pub fn probe_wdl(board: &Board) -> Option<Wdl> {
             a.bishops,
             a.knights,
             a.pawns,
-            a.rule50,
+            // Fathom's WDL probe requires rule50 == 0: it returns the
+            // 50-move-IGNORANT WDL (no cursed/blessed), which is exactly what we
+            // want in search. The real clock / cursed-win handling belongs to a
+            // root DTZ probe (follow-up). Passing the real clock would just make
+            // Fathom reject the probe.
+            0,
             a.castling as c_uint,
             a.ep,
             a.white_to_move as c_int,
