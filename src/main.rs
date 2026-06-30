@@ -6,6 +6,7 @@ mod movegen;
 mod nnue;
 mod rescore;
 mod search;
+mod syzygy;
 mod tables;
 mod time;
 
