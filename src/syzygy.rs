@@ -13,6 +13,9 @@
 //! the oracle data below are compiled; the FFI/probe is wired in a follow-up.
 
 use crate::engine_core::{Board, Color, Piece};
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int, c_uint};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// A position encoded the way Fathom expects it: per-colour and per-piece
 /// bitboards plus the fifty-move clock, castling mask, en-passant square and the
@@ -61,6 +64,111 @@ pub fn position_args(board: &Board) -> SyzygyArgs {
         ep: board.en_passant().map_or(0, |sq| sq.to_index() as u32),
         white_to_move: board.side_to_move() == Color::White,
     }
+}
+
+// ─── FFI to the vendored Fathom prober (compiled by build.rs) ───────────────
+extern "C" {
+    fn ek_tb_init(path: *const c_char) -> c_int;
+    #[allow(dead_code)]
+    fn ek_tb_free();
+    fn ek_tb_largest() -> c_uint;
+    #[allow(clippy::too_many_arguments)]
+    fn ek_tb_probe_wdl(
+        white: u64,
+        black: u64,
+        kings: u64,
+        queens: u64,
+        rooks: u64,
+        bishops: u64,
+        knights: u64,
+        pawns: u64,
+        rule50: c_uint,
+        castling: c_uint,
+        ep: c_uint,
+        turn: c_int,
+    ) -> c_uint;
+}
+
+static TB_ENABLED: AtomicBool = AtomicBool::new(false);
+static TB_LARGEST: AtomicU32 = AtomicU32::new(0);
+
+/// Win/Draw/Loss from the side-to-move's perspective. Cursed-win / blessed-loss
+/// are the fifty-move-rule edge cases (a win / loss that the rule draws).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Wdl {
+    Loss,
+    BlessedLoss,
+    Draw,
+    CursedWin,
+    Win,
+}
+
+fn wdl_from_raw(r: c_uint) -> Option<Wdl> {
+    match r {
+        0 => Some(Wdl::Loss),
+        1 => Some(Wdl::BlessedLoss),
+        2 => Some(Wdl::Draw),
+        3 => Some(Wdl::CursedWin),
+        4 => Some(Wdl::Win),
+        _ => None, // TB_RESULT_FAILED
+    }
+}
+
+/// Load Syzygy tablebases from `path`. Returns true and enables probing if any
+/// tables were found. Call once (single-threaded) before searching.
+#[allow(dead_code)]
+pub fn init(path: &str) -> bool {
+    let cpath = match CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let ok = unsafe { ek_tb_init(cpath.as_ptr()) != 0 };
+    let largest = unsafe { ek_tb_largest() };
+    let enabled = ok && largest > 0;
+    TB_LARGEST.store(largest, Ordering::Relaxed);
+    TB_ENABLED.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+#[allow(dead_code)]
+#[inline]
+pub fn enabled() -> bool {
+    TB_ENABLED.load(Ordering::Relaxed)
+}
+
+#[allow(dead_code)]
+#[inline]
+pub fn largest() -> u32 {
+    TB_LARGEST.load(Ordering::Relaxed)
+}
+
+/// WDL probe for use in search. `None` if probing is disabled, the position has
+/// too many men / castling rights / a non-zero fifty-move clock (Fathom rejects
+/// the latter two), or the probe otherwise fails. Thread-safe.
+#[allow(dead_code)]
+pub fn probe_wdl(board: &Board) -> Option<Wdl> {
+    if !enabled() || man_count(board) > largest() {
+        return None;
+    }
+    let a = position_args(board);
+    let r = unsafe {
+        ek_tb_probe_wdl(
+            a.white,
+            a.black,
+            a.kings,
+            a.queens,
+            a.rooks,
+            a.bishops,
+            a.knights,
+            a.pawns,
+            a.rule50,
+            a.castling as c_uint,
+            a.ep,
+            a.white_to_move as c_int,
+        )
+    };
+    wdl_from_raw(r)
 }
 
 /// WDL validation oracle: `(FEN, expected WDL from the side-to-move's view)`.
@@ -119,5 +227,48 @@ mod tests {
                 man_count(&b)
             );
         }
+    }
+
+    fn wdl_oracle_value(w: Wdl) -> i32 {
+        match w {
+            Wdl::Win => 2,
+            Wdl::CursedWin => 1,
+            Wdl::Draw => 0,
+            Wdl::BlessedLoss => -1,
+            Wdl::Loss => -2,
+        }
+    }
+
+    /// Correctness gate: probe the oracle FENs against loaded tablebases and
+    /// assert the WDL matches. Skips cleanly if no tablebases are present;
+    /// individual positions whose table is missing are skipped, but a wrong WDL
+    /// fails, and we require at least a few positions to actually validate (so a
+    /// broken prober that returns only failures can't pass silently).
+    #[test]
+    fn wdl_agreement() {
+        if !init("tables") {
+            eprintln!("syzygy: no tablebases under tables/, skipping WDL agreement");
+            return;
+        }
+        let mut checked = 0;
+        for (fen, expected) in WDL_ORACLE {
+            let b = Board::from_str(fen).expect("oracle FEN parses");
+            match probe_wdl(&b) {
+                Some(got) => {
+                    assert_eq!(
+                        wdl_oracle_value(got),
+                        *expected,
+                        "WDL mismatch for {fen}: got {got:?} = {}, expected {expected}",
+                        wdl_oracle_value(got)
+                    );
+                    checked += 1;
+                }
+                None => eprintln!("syzygy: probe failed for {fen} (table missing?), skipping"),
+            }
+        }
+        assert!(
+            checked >= 3,
+            "only {checked} oracle positions validated — prober likely broken"
+        );
     }
 }
