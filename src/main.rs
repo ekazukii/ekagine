@@ -6,6 +6,7 @@ mod movegen;
 mod nnue;
 mod rescore;
 mod search;
+mod syzygy;
 mod tables;
 mod time;
 
@@ -274,6 +275,10 @@ fn uci_loop() {
                     )
                     .as_str(),
                 );
+                send_message(
+                    &mut stdout,
+                    "option name SyzygyPath type string default <empty>",
+                );
                 for t in search::TUNABLES {
                     send_message(
                         &mut stdout,
@@ -329,6 +334,21 @@ fn uci_loop() {
                                         value_str
                                     );
                                     send_message(&mut stdout, &warn);
+                                }
+                            } else if name.eq_ignore_ascii_case("SyzygyPath") {
+                                // Empty / "<empty>" disables; otherwise load the
+                                // tablebases from the given path.
+                                let path = value_str.trim();
+                                if path.is_empty() || path == "<empty>" {
+                                    send_message(&mut stdout, "info string SyzygyPath cleared");
+                                } else {
+                                    let ok = syzygy::init(path);
+                                    let msg = format!(
+                                        "info string SyzygyPath {} (largest {} men)",
+                                        if ok { "loaded" } else { "no tablebases found" },
+                                        syzygy::largest()
+                                    );
+                                    send_message(&mut stdout, &msg);
                                 }
                             } else if let Ok(parsed) = value_str.parse::<i32>() {
                                 if !search::set_tunable(&name, parsed) {

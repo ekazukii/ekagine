@@ -2,6 +2,7 @@
 name = "chess_engine"
 version = "2.11.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 once_cell = "1.18.0"
@@ -9,6 +10,9 @@ lazy_static = "1.5.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 smallvec = "1.15.1"
+
+[build-dependencies]
+cc = "1"
 
 [build]
 target = "aarch64-apple-darwin"

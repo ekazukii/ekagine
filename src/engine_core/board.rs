@@ -156,6 +156,13 @@ impl Board {
         self.castling
     }
 
+    /// Half-move clock for the fifty-move rule (plies since the last pawn move
+    /// or capture). Reaches 100 at the draw boundary.
+    #[inline(always)]
+    pub fn halfmove_clock(&self) -> u8 {
+        self.halfmove_clock
+    }
+
     pub fn status(&self) -> BoardStatus {
         let has_legal = super::movegen::any_legal_move(self);
         if has_legal {
