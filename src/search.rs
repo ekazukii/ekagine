@@ -246,7 +246,7 @@ fn quiesce_negamax_it(
     ctx: &mut ThreadContext,
     board: &Board,
     mut alpha: i32,
-    beta: i32,
+    mut beta: i32,
     ply_from_root: i32,
 ) -> i32 {
     if ctx.repetition.is_in_threefold_scenario(board) {
@@ -895,7 +895,7 @@ fn negamax_it(
     board: &Board,
     depth: i16,
     mut alpha: i32,
-    beta: i32,
+    mut beta: i32,
     ply_from_root: i32,
     is_pv_node: bool,
     exclude_move: Option<ChessMove>,
@@ -917,6 +917,12 @@ fn negamax_it(
 
     ctx.stats.record_depth(ply_from_root);
     ctx.stats.nodes += 1;
+
+    alpha = alpha.max(mated_in_plies(ply_from_root));
+    beta = beta.min(mate_in_plies(ply_from_root + 1));
+    if alpha >= beta {
+        return SearchScore::EVAL(alpha);
+    }
 
     if ctx.repetition.is_in_threefold_scenario(board) {
         return SearchScore::EVAL(0);
