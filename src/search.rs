@@ -383,14 +383,15 @@ fn quiesce_negamax_it(
         alpha = stand_pat;
     }
 
-    let futility = stand_pat + QUIESCE_FUTILITY_MARGIN.get();
     let pin_info = PinInfo::for_board(board);
     // Fast path: in non-check positions with no pinned pieces, only king
     // captures and EP captures need the per-move legality test.
     let fast_path = pin_info.num_checkers == 0 && pin_info.pinned == 0;
     let ep_sq = board.en_passant();
     for (mv, _val) in get_captures(board) {
-        if !in_check && futility <= alpha && see_for_sort(board, mv) < 0 {
+        // Outside check, losing captures cannot improve stand pat, regardless
+        // of whether the futility margin fires.
+        if !in_check && see_for_sort(board, mv) < 0 {
             continue;
         }
 
@@ -1231,7 +1232,7 @@ fn negamax_it(
         return SearchScore::EVAL(0);
     }
 
-    let can_fp = !in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH;
+    let can_fp = !is_pv_node && !in_check && depth_remaining <= FUTILITY_PRUNE_MAX_DEPTH;
     let fp_val = if can_fp {
         eval + futility_margin(depth_remaining, is_improving)
     } else {
@@ -1242,6 +1243,7 @@ fn negamax_it(
     let mut tried_captures: SmallVec<[(Piece, Square, Piece, ChessMove); 16]> = SmallVec::new();
 
     let mut move_idx: usize = 0;
+    let mut quiet_move_count: usize = 0;
     let mut saw_legal_yield = false;
     while let Some(mv) =
         incremental_move_gen.next(&*ctx.history, &*ctx.cap_hist, &*ctx.cont1, &*ctx.cont2)
@@ -1259,6 +1261,9 @@ fn negamax_it(
         let is_capture =
             board.piece_on(mv.get_dest()).is_some() || is_en_passant_capture(board, mv);
         let is_quiet = !is_capture;
+        if is_quiet {
+            quiet_move_count += 1;
+        }
         let is_first_move = move_idx == 0;
         let is_promotion = mv.get_promotion().is_some();
 
@@ -1319,7 +1324,7 @@ fn negamax_it(
             && depth_remaining <= LATE_MOVE_PRUNING_MAX_DEPTH
         {
             let lmp_limit = late_move_pruning_threshold(depth_remaining, is_improving);
-            if move_idx >= lmp_limit {
+            if quiet_move_count > lmp_limit {
                 ctx.stats.late_move_prunes += 1;
                 ctx.repetition.pop();
                 move_idx += 1;
@@ -1341,7 +1346,12 @@ fn negamax_it(
                     hist += ctx.cont2.score(pp, pt, p, to);
                 }
             }
-            lmr_reduction(depth_remaining, move_idx, is_pv_node, tt_pv, is_improving, hist)
+            let mut reduction =
+                lmr_reduction(depth_remaining, move_idx, is_pv_node, tt_pv, is_improving, hist);
+            if killer_moves.contains(&Some(mv)) || countermove == Some(mv) {
+                reduction = reduction.saturating_sub(1).max(1);
+            }
+            reduction
         } else {
             0
         };
@@ -1487,6 +1497,11 @@ fn negamax_it(
                             }
                         }
                     }
+                }
+                // A quiet cutoff also refutes captures searched before it.
+                for &(piece, dest, victim, _) in &tried_captures {
+                    ctx.cap_hist
+                        .penalize(mover, piece, dest, victim, depth_remaining);
                 }
                 // Update countermove: if opponent's last move exists, record this as the best response
                 if let Some(prev_move) = ctx.search_stack.get_prev_move(ply_index) {
