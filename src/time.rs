@@ -130,7 +130,6 @@ impl Drop for TimeManagerHandle {
 /// Time scaling factors for intelligent time management
 pub struct TimeScaleFactors {
     stability: f64,          // Based on best move changes
-    node_fraction: f64,      // Based on nodes spent on best move
     score_trend: f64,        // Based on score improvement/drop
     fail_high_early: bool,   // First move caused beta cutoff
 }
@@ -139,7 +138,6 @@ impl TimeScaleFactors {
     pub fn new() -> Self {
         Self {
             stability: 1.0,
-            node_fraction: 1.0,
             score_trend: 1.0,
             fail_high_early: false,
         }
@@ -159,26 +157,6 @@ impl TimeScaleFactors {
             1.3 // Recently changed - search longer
         } else {
             1.5 // Just changed (stable_iters == 0) - very unstable
-        }
-    }
-
-    pub fn calculate_node_fraction_factor(best_move_nodes: u64, total_nodes: u64) -> f64 {
-        if total_nodes == 0 {
-            return 1.0;
-        }
-
-        let fraction = best_move_nodes as f64 / total_nodes as f64;
-
-        if fraction < 0.2 {
-            0.7 // Very clear best move - stop earlier
-        } else if fraction < 0.3 {
-            0.85 // Clear
-        } else if fraction < 0.5 {
-            1.0 // Normal
-        } else if fraction < 0.6 {
-            1.2 // Unclear - search longer
-        } else {
-            1.5 // Very unclear position
         }
     }
 
@@ -212,10 +190,6 @@ impl TimeScaleFactors {
         self.stability = value;
     }
 
-    pub fn set_node_fraction(&mut self, value: f64) {
-        self.node_fraction = value;
-    }
-
     pub fn set_score_trend(&mut self, value: f64) {
         self.score_trend = value;
     }
@@ -225,7 +199,7 @@ impl TimeScaleFactors {
     }
 
     pub fn compute_scale(&self) -> f64 {
-        let mut scale = self.stability * self.node_fraction * self.score_trend;
+        let mut scale = self.stability * self.score_trend;
 
         // Fail-high on first move means position is likely good for us
         if self.fail_high_early {
