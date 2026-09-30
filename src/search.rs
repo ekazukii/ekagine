@@ -1656,8 +1656,6 @@ struct RootSearchResult {
     fail_low: bool,
     fail_high: bool,
     aborted: bool,
-    best_move_nodes: u64,
-    total_nodes: u64,
     first_move_fail_high: bool,
 }
 
@@ -1728,9 +1726,6 @@ fn root_search_with_window(
     let mut best_move = None;
     let mut aborted = false;
 
-    // Node tracking for time management
-    let mut best_move_nodes = 0u64;
-    let mut total_nodes = 0u64;
     let mut first_move_fail_high = false;
     let mut move_count = 0usize;
 
@@ -1765,7 +1760,6 @@ fn root_search_with_window(
         }
 
         move_count += 1;
-        let nodes_before = ctx.stats.nodes;
 
         let current_best = best_move.map(|bm| (bm, best_value));
         let is_capture =
@@ -1795,9 +1789,6 @@ fn root_search_with_window(
 
         ctx.nnue.pop();
 
-        let nodes_spent = ctx.stats.nodes - nodes_before;
-        total_nodes += nodes_spent;
-
         match result {
             SearchScore::CANCELLED => {
                 ctx.repetition.pop();
@@ -1814,9 +1805,6 @@ fn root_search_with_window(
                     }
                     best_value = value;
                     best_move = Some(mv);
-
-                    // Transfer node accounting: previous best moves become non-best
-                    best_move_nodes = nodes_spent;
                 }
 
                 if value > alpha {
@@ -1886,8 +1874,6 @@ fn root_search_with_window(
         fail_low,
         fail_high,
         aborted,
-        best_move_nodes,
-        total_nodes,
         first_move_fail_high,
     }
 }
@@ -2196,8 +2182,6 @@ where
         // Extract values we need before moving result
         let result_aborted = result.aborted;
         let result_score = result.score;
-        let result_best_move_nodes = result.best_move_nodes;
-        let result_total_nodes = result.total_nodes;
         let result_first_move_fail_high = result.first_move_fail_high;
 
         // Calculate score trend BEFORE updating prev_score
@@ -2252,10 +2236,6 @@ where
                 factors.set_stability(TimeScaleFactors::calculate_stability_factor(
                     stable_iters,
                     depth,
-                ));
-                factors.set_node_fraction(TimeScaleFactors::calculate_node_fraction_factor(
-                    result_best_move_nodes,
-                    result_total_nodes,
                 ));
                 factors.set_score_trend(score_trend_for_time);
                 factors.set_fail_high_early(result_first_move_fail_high);
