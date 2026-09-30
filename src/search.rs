@@ -1011,6 +1011,26 @@ fn negamax_it(
         }
     }
 
+    // Reverse futility pruning: checked before null move since it needs no search.
+    if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
+        && !in_check
+        && !is_pv_node
+        && alpha != NEG_INFINITY
+        && beta != POS_INFINITY
+        && !is_mate_score(beta)
+        && !is_mate_score(eval)
+    {
+        let mut margin = reverse_futility_margin(depth_remaining);
+        if is_improving {
+            margin /= 2;
+        }
+
+        if eval.saturating_sub(margin) >= beta {
+            ctx.stats.reverse_futility_prunes += 1;
+            return SearchScore::EVAL(beta);
+        }
+    }
+
     if !is_pv_node
         && !in_check
         && depth_remaining >= 2
@@ -1134,25 +1154,6 @@ fn negamax_it(
     let mut best_move_opt: Option<ChessMove> = None;
     let alpha_orig = alpha;
     let mover = board.side_to_move();
-
-    if depth_remaining <= REVERSE_FUTILITY_PRUNE_MAX_DEPTH
-        && !in_check
-        && !is_pv_node
-        && alpha != NEG_INFINITY
-        && beta != POS_INFINITY
-        && !is_mate_score(beta)
-        && !is_mate_score(eval)
-    {
-        let mut margin = reverse_futility_margin(depth_remaining);
-        if is_improving {
-            margin /= 2;
-        }
-
-        if eval.saturating_sub(margin) >= beta {
-            ctx.stats.reverse_futility_prunes += 1;
-            return SearchScore::EVAL(beta);
-        }
-    }
 
     // Singular extension check
     let tt_move = tt_hit.and_then(|e| e.best_move);
