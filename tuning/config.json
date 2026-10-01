@@ -1,0 +1,89 @@
+{
+  "binary": "/Users/ekazuki/RustroverProjects/untitled1/target/aarch64-apple-darwin/release/chess_engine",
+  "cutechess": "/opt/cutechess/build/cutechess-cli",
+  "book": "/Users/ekazuki/Downloads/8moves_v3.pgn",
+  "engine_arg": "--uci",
+  "st": 0.2,
+  "concurrency": 10,
+  "batch_games": 10,
+  "book_plies": 8,
+  "resign_movecount": 4,
+  "resign_score": 600,
+  "draw_movenumber": 30,
+  "draw_movecount": 8,
+  "draw_score": 10,
+  "alpha": 0.602,
+  "gamma": 0.101,
+  "A": 200.0,
+  "a0": 0.15,
+  "c0": 1.0,
+  "max_iters": 0,
+  "checkpoint_interval": 50,
+  "checkpoint_games": 60,
+  "sprt_elo0": 0.0,
+  "sprt_elo1": 4.0,
+  "sprt_alpha": 0.05,
+  "sprt_beta": 0.05,
+  "sprt_max_games": 5000,
+  "sprt_batch": 16,
+  "sprt_st": 0.2,
+  "params": [
+    {
+      "name": "AspirationWindow",
+      "default": 25,
+      "min": 8,
+      "max": 80,
+      "C": 6
+    },
+    {
+      "name": "QFutilityMargin",
+      "default": 200,
+      "min": 60,
+      "max": 450,
+      "C": 32
+    },
+    {
+      "name": "FutilityBase",
+      "default": 100,
+      "min": 30,
+      "max": 260,
+      "C": 19
+    },
+    {
+      "name": "FutilityPerDepth",
+      "default": 75,
+      "min": 25,
+      "max": 180,
+      "C": 13
+    },
+    {
+      "name": "RazoringMargin",
+      "default": 300,
+      "min": 100,
+      "max": 650,
+      "C": 46
+    },
+    {
+      "name": "ProbcutMargin",
+      "default": 180,
+      "min": 60,
+      "max": 400,
+      "C": 28
+    },
+    {
+      "name": "SingularBetaMult",
+      "default": 2,
+      "min": 1,
+      "max": 6,
+      "C": 1
+    },
+    {
+      "name": "HistLmrDivisor",
+      "default": 16384,
+      "min": 4096,
+      "max": 32768,
+      "C": 2389
+    }
+  ],
+  "timemargin": 400
+}
